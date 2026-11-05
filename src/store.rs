@@ -390,7 +390,7 @@ fn default_observe() -> ObserveView {
             },
             SmartscapeNode {
                 id: "host:node-a".into(),
-                label: "node-a (192.168.###.101)".into(),
+                label: "node-a (192.0.2.101)".into(),
                 layer: SmartscapeLayer::Host,
                 req_per_sec_bp: 9_400,
                 error_rate_bp: 0,
@@ -399,7 +399,7 @@ fn default_observe() -> ObserveView {
             },
             SmartscapeNode {
                 id: "host:node-b".into(),
-                label: "node-b (192.168.###.102)".into(),
+                label: "node-b (192.0.2.102)".into(),
                 layer: SmartscapeLayer::Host,
                 req_per_sec_bp: 6_200,
                 error_rate_bp: 0,
@@ -408,7 +408,7 @@ fn default_observe() -> ObserveView {
             },
             SmartscapeNode {
                 id: "host:worker-riscv64".into(),
-                label: "worker-riscv64 (192.168.###.117)".into(),
+                label: "worker-riscv64 (192.0.2.117)".into(),
                 layer: SmartscapeLayer::Host,
                 req_per_sec_bp: 3_050,
                 error_rate_bp: 0,
@@ -583,7 +583,7 @@ fn default_observe() -> ObserveView {
                         self_time_us: 180_000,
                         critical_path: true,
                         error: false,
-                        hardware_class: "worker-riscv64 (192.168.###.117)".into(),
+                        hardware_class: "worker-riscv64 (192.0.2.117)".into(),
                     },
                     TraceSpan {
                         span_id: "sp-cd-02".into(),
@@ -666,7 +666,7 @@ fn default_observe() -> ObserveView {
                 span_id: Some("sp-taint-02".into()),
                 trace_id: "tr-reg-taint-01".into(),
                 message: sanitize_public_log(
-                    "IT gate failure on 192.168.1.117 (/var/lib/muconde/slots/b/verify.rs): digest mismatch -> taint cny-041",
+                    "IT gate failure on 192.0.2.117 (/var/lib/muconde/slots/b/verify.rs): digest mismatch -> taint cny-041",
                 ),
             },
             OtelLogEntry {
@@ -676,7 +676,7 @@ fn default_observe() -> ObserveView {
                 span_id: Some("sp-obs-02".into()),
                 trace_id: "tr-obs-p99-07".into(),
                 message: sanitize_public_log(
-                    "K3 benchmark delta on worker-riscv64 (192.168.1.117): X100 VLEN=256 p99=2110ms vs A100 VLEN=1024",
+                    "K3 benchmark delta on worker-riscv64 (192.0.2.117): X100 VLEN=256 p99=2110ms vs A100 VLEN=1024",
                 ),
             },
             OtelLogEntry {
@@ -696,7 +696,7 @@ fn default_observe() -> ObserveView {
                 span_id: Some("sp-cd-02".into()),
                 trace_id: "tr-cd-0042".into(),
                 message: sanitize_public_log(
-                    "Promoted deployment dep-042 to active slot B on 192.168.1.117",
+                    "Promoted deployment dep-042 to active slot B on 192.0.2.117",
                 ),
             },
         ],
