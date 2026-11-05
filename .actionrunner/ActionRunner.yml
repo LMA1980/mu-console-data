@@ -1,0 +1,173 @@
+version: "3"
+name: "mu-console-data CI: Hygiene, Build, Test, Coverage & WASM32"
+
+env:
+  CARGO_TERM_COLOR: "always"
+
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--all", "--", "--check"]
+    timeout_seconds: 120
+    sandbox_profile: "default_ci"
+
+  docs-task:
+    tool: "mdformat"
+    args: ["--check", "--wrap", "keep", "README.md", "skills/mu-console-data/SKILL.md"]
+    timeout_seconds: 120
+    sandbox_profile: "default_ci"
+
+  clippy-task:
+    tool: "cargo-clippy"
+    args: ["--all-targets", "--", "-D", "warnings"]
+    timeout_seconds: 600
+    sandbox_profile: "default_ci"
+
+  audit-task:
+    tool: "cargo-audit"
+    args: []
+    timeout_seconds: 180
+    sandbox_profile: "default_ci"
+
+  build-task:
+    tool: "cargo-build"
+    args: ["--all-targets"]
+    timeout_seconds: 900
+    sandbox_profile: "default_ci"
+
+  test-task:
+    tool: "cargo-test"
+    args: ["--all-targets"]
+    timeout_seconds: 1200
+    sandbox_profile: "default_ci"
+
+  coverage-task:
+    tool: "cargo-llvm-cov"
+    args: ["--summary-only"]
+    timeout_seconds: 1800
+    sandbox_profile: "default_ci"
+
+  wasm-build-task:
+    tool: "cargo-build"
+    args: ["--target", "wasm32-unknown-unknown"]
+    timeout_seconds: 900
+    sandbox_profile: "default_ci"
+
+stages:
+  - id: fmt-check
+    name: "Verify Rust Formatting (cargo fmt)"
+    tasks: ["fmt-task"]
+    tags: ["fmt"]
+    threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: docs-check
+    name: "Verify Markdown Formatting (mdformat-gfm)"
+    tasks: ["docs-task"]
+    depends_on: ["fmt-check"]
+    tags: ["fmt"]
+    threads: 1
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: clippy-check
+    name: "Verify Rust Linter & Clippy Rules (cargo clippy)"
+    tasks: ["clippy-task"]
+    depends_on: ["fmt-check", "docs-check"]
+    tags: ["clippy"]
+    threads: 4
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: audit-check
+    name: "Verify Dependencies Security Advisories (cargo audit)"
+    tasks: ["audit-task"]
+    depends_on: ["fmt-check"]
+    tags: ["audit"]
+    threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: build-check
+    name: "Build All Targets (cargo build)"
+    tasks: ["build-task"]
+    depends_on: ["clippy-check"]
+    tags: ["build"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: test-check
+    name: "Execute Test Suite (cargo test)"
+    tasks: ["test-task"]
+    depends_on: ["build-check"]
+    tags: ["test"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: coverage-check
+    name: "Evaluate Line Code Coverage (cargo llvm-cov)"
+    tasks: ["coverage-task"]
+    depends_on: ["test-check", "audit-check"]
+    tags: ["test"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: wasm32-build
+    name: "Validate WASM32 Compilation (cargo build --target wasm32-unknown-unknown)"
+    tasks: ["wasm-build-task"]
+    depends_on: ["build-check"]
+    tags: ["build"]
+    threads: 4
+    exclusive: false
+    max_concurrent_per_node: 1
+
+on_action:
+  push:
+    - fmt-check
+    - docs-check
+    - clippy-check
+    - audit-check
+    - build-check
+    - test-check
+    - coverage-check
+    - wasm32-build
+  pull_request:
+    - fmt-check
+    - docs-check
+    - clippy-check
+    - audit-check
+    - build-check
+    - test-check
+    - coverage-check
+    - wasm32-build
+  pullrequest:
+    - fmt-check
+    - docs-check
+    - clippy-check
+    - audit-check
+    - build-check
+    - test-check
+    - coverage-check
+    - wasm32-build
+  merge:
+    - fmt-check
+    - docs-check
+    - clippy-check
+    - audit-check
+    - build-check
+    - test-check
+    - coverage-check
+    - wasm32-build
+  tag:
+    - fmt-check
+    - docs-check
+    - clippy-check
+    - audit-check
+    - build-check
+    - test-check
+    - coverage-check
+    - wasm32-build
