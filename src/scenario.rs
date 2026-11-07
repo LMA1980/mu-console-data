@@ -262,6 +262,7 @@ fn repo_dto(name: &str, status: RepoStatus, score: u32) -> RepoDto {
         visibility: Visibility::Public,
         default_branch: "main".into(),
         latest_job_id: Some(1_000),
+        commit_sha: String::new(),
         score,
         coverage: f64::from(score) - 7.5,
         bench_delta: 0.4,
@@ -318,6 +319,7 @@ fn train(job_id: u64, r: &str, stage: usize, current: StageState, node: Option<&
     TrainDto {
         job_id,
         ref_name: r.into(),
+        commit_sha: String::new(),
         stage: STATIONS[stage].0.into(),
         stage_states: states(stage, current),
         node_id: node.map(Into::into),
@@ -687,10 +689,12 @@ fn empty() -> Vec<Step> {
 /// ten minutes before the fixture epoch.
 #[must_use]
 pub fn offline_snapshot() -> OfflineSnapshot {
-    let mut store = crate::store::Store::new(mu_console_protocol::DataSource::Live);
+    let mut store =
+        crate::store::Store::new(mu_console_protocol::DataSource::Scenario("offline".into()));
     for s in base() {
         store.apply(s.input, FIXTURE_EPOCH_MS);
     }
+    store.set_source(mu_console_protocol::DataSource::Live);
     let view: ViewModel = store.view();
     OfflineSnapshot {
         saved_epoch_ms: FIXTURE_EPOCH_MS - 600_000,

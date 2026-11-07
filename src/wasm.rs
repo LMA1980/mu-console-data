@@ -157,13 +157,14 @@ async fn fetch_json(kind: FetchKind, url: String) {
                 .to_string();
                 post_json_request(&url, &payload)
             }
-            FetchKind::RestartJob(job_id) => {
+            FetchKind::RestartJob(job_id) | FetchKind::ResumeJob(job_id) => {
                 let payload = serde_json::json!({
                     "job_id": job_id,
                 })
                 .to_string();
                 post_json_request(&url, &payload)
             }
+            FetchKind::JobLog(_) => request(&url, "text/plain, */*", None),
             _ => request(&url, "application/json", None),
         }
         .map_err(|e| HttpError {

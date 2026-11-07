@@ -3,13 +3,13 @@
 
 use mu_console_protocol::dto::{
     AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
-    ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseDto,
-    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
+    CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto,
+    LeaseDto, LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
     PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoListResponseDto, RepoSummaryDto,
     RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto, TopologyDto,
     TraceDto,
 };
-use mu_console_protocol::{CanaryBundleState, CdLease, RepoId};
+use mu_console_protocol::{sanitize_ansi_log_lines, CanaryBundleState, CdLease, RepoId};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
@@ -39,6 +39,9 @@ pub enum FetchKind {
     AuthSession,
     AuthRedeem(String),
     RestartJob(u64),
+    ResumeJob(u64),
+    JobDetail(u64),
+    JobLog(u64),
 }
 
 /// Alias for [`FetchKind`] used by protocol consumers.
@@ -349,6 +352,14 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             Input::AuthSession(parse_auth_session(body.as_bytes())?)
         }
         FetchKind::RestartJob(job_id) => Input::JobRestarted(*job_id),
+        FetchKind::ResumeJob(job_id) => Input::JobResumed(*job_id),
+        FetchKind::JobDetail(_) => {
+            Input::JobDetail(json::<CiQueueJobRecordDto>(body)?.into_unwrapped())
+        }
+        FetchKind::JobLog(job_id) => Input::JobLog {
+            job_id: *job_id,
+            lines: sanitize_ansi_log_lines(body, 120),
+        },
     })
 }
 

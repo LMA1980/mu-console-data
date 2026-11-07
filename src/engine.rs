@@ -311,6 +311,26 @@ impl Engine {
                     })));
                 }
             }
+            UiCommand::ResumeJob { job_id } => {
+                if self.store.auth().is_operator() {
+                    self.store.apply(Input::JobResumed(job_id), now_ms);
+                    if self.mode == Mode::Live {
+                        self.fetch(FetchKind::ResumeJob(job_id), &mut fx);
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                    }
+                } else {
+                    fx.push(Effect::Post(DataEvent::Error(UiError::Http {
+                        status: 403,
+                        message: "Operator session required to resume jobs".into(),
+                    })));
+                }
+            }
+            UiCommand::SelectJob { job_id } => {
+                if self.mode == Mode::Live && job_id > 0 {
+                    self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                    self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                }
+            }
         }
         fx
     }
@@ -452,7 +472,16 @@ impl Engine {
             FetchKind::ObsStoreStatus => paths::OBS_STORE_STATUS.to_owned(),
             FetchKind::AuthSession => paths::AUTH_SESSION.to_owned(),
             FetchKind::AuthRedeem(_) => paths::AUTH_REDEEM.to_owned(),
-            FetchKind::RestartJob(job_id) => paths::job_restart(*job_id),
+            FetchKind::RestartJob(job_id) => {
+                paths::job_restart_id(&self.store.resolve_job_id_str(*job_id))
+            }
+            FetchKind::ResumeJob(job_id) => {
+                paths::job_resume_id(&self.store.resolve_job_id_str(*job_id))
+            }
+            FetchKind::JobDetail(job_id) => {
+                paths::job_detail_id(&self.store.resolve_job_id_str(*job_id))
+            }
+            FetchKind::JobLog(job_id) => paths::job_log_id(&self.store.resolve_job_id_str(*job_id)),
         };
         fx.push(Effect::Fetch {
             kind,
@@ -595,8 +624,15 @@ impl Engine {
                         | FetchKind::ObsMetrics
                         | FetchKind::ObsStoreStatus
                         | FetchKind::RestartJob(_)
+                        | FetchKind::ResumeJob(_)
+                        | FetchKind::JobDetail(_)
+                        | FetchKind::JobLog(_)
                 );
-                if !(is_optional_probe && matches!(e.status, 404 | 502 | 503)) {
+                let is_auth_gated_log =
+                    matches!(kind, FetchKind::JobLog(_)) && matches!(e.status, 401 | 403);
+                if !((is_optional_probe && matches!(e.status, 404 | 502 | 503))
+                    || is_auth_gated_log)
+                {
                     fx.push(Effect::Post(DataEvent::Error(UiError::Http {
                         status: e.status,
                         message: e.message,
@@ -629,6 +665,21 @@ impl Engine {
                     }
                 }
                 self.update_conn(now_ms, &mut fx);
+            }
+            FetchKind::CiQueue => {
+                let first_job = self
+                    .store
+                    .view()
+                    .ci_jobs
+                    .first()
+                    .filter(|j| j.raw_log_lines.is_empty())
+                    .map(|j| j.job_id);
+                if let Some(job_id) = first_job {
+                    self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                    if self.store.auth().is_operator() {
+                        self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                    }
+                }
             }
             FetchKind::Deployments(repo) => self.fetch_latest_gate(repo, &mut fx),
             FetchKind::ObsTraces => {

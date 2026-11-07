@@ -9,21 +9,21 @@
 use std::collections::BTreeMap;
 
 use mu_console_protocol::dto::{
-    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
-    ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseExpiredDto,
-    MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto, PrStateChangedDto,
-    ProblemDto, PromotedDto, RepoDto, RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto,
-    TaintedDto, TopologyDto, TraceDto,
+    parse_job_id_str, AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto,
+    CasStatusDto, CiQueueDto, CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto,
+    ItProgressDto, JobStageChangedDto, LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto,
+    OtelLogDto, PackageDto, PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoSummaryDto,
+    RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
     format_job_id, sanitize_public_log, AreaBadges, AuthState, Branch, CanaryBundle,
-    CanaryBundleState, CasHealth, CdLease, CdScore, DataSource, DataStoreHealth, DeploymentGate,
-    DeploymentSummary, FabricNode, FadeReason, GateOutcome, GateTest, HardwareMetricSeries,
-    LogSeverity, ObserveView, OtelLogEntry, PackageEcosystem, ParentRef, PrState, ProblemCategory,
-    PurePathTrace, RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology,
-    RollbackReason, SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot,
-    SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState,
-    TraceSpan, Train, ViewModel,
+    CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage, CiJobSummary, DataSource,
+    DataStoreHealth, DeploymentGate, DeploymentSummary, FabricNode, FadeReason, GateOutcome,
+    GateTest, HardwareMetricSeries, LogSeverity, ObserveView, OtelLogEntry, PackageEcosystem,
+    ParentRef, PrState, ProblemCategory, PurePathTrace, RegistryPackage, RegistryView, RepoId,
+    RepoScore, RepoStatus, RepoTopology, RollbackReason, SandboxProfileSummary, Selection,
+    SidingPhase, SloProblem, Slot, SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState,
+    Station, SubmoduleRef, TraceSpan, Train, ViewModel,
 };
 
 /// A merged or deleted siding is removed this long after it starts fading.
@@ -70,6 +70,15 @@ pub enum Input {
     AuthSession(AuthSessionDto),
     /// Operator restarted a CI job (`POST /api/jobs/{job_id}/restart`).
     JobRestarted(u64),
+    /// Operator resumed a CI job (`POST /api/jobs/{job_id}/resume`).
+    JobResumed(u64),
+    /// Structured job detail & per-stage statuses (`GET /api/jobs/{job_id}`).
+    JobDetail(CiQueueJobRecordDto),
+    /// Sanitized raw build log lines (`GET /api/jobs/{job_id}/log`).
+    JobLog {
+        job_id: u64,
+        lines: Vec<String>,
+    },
     /// Offline snapshot restored from CacheStorage (`saved_epoch_ms`, view).
     Restore {
         saved_epoch_ms: u64,
@@ -97,6 +106,9 @@ pub struct Store {
     sandboxes: Vec<SandboxProfileSummary>,
     registry: RegistryView,
     observe: ObserveView,
+    ci_jobs: Vec<CiJobSummary>,
+    job_id_strings: BTreeMap<u64, String>,
+    job_logs: BTreeMap<u64, Vec<String>>,
     selection: Option<Selection>,
     auth: AuthState,
     /// Offline snapshot shown until live data arrives.
@@ -846,18 +858,45 @@ impl Store {
         }
     }
 
-    fn ensure_aux_defaults(&mut self) {
-        if self.leases.is_empty() {
-            self.leases = default_leases();
+    /// Resolve a `u64` `job_id` back to its canonical string identifier
+    /// (`"job-{ts}-{sha8}"` when known, or decimal fallback).
+    #[must_use]
+    pub fn resolve_job_id_str(&self, job_id: u64) -> String {
+        self.job_id_strings
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_else(|| job_id.to_string())
+    }
+
+    fn record_job_id_str(&mut self, job_id: u64, raw_id: &str, commit_sha: &str) {
+        if job_id == 0 {
+            return;
         }
+        if !raw_id.is_empty() {
+            self.job_id_strings.insert(job_id, raw_id.to_owned());
+        } else if (job_id >> 24) >= 1_000_000_000 && commit_sha.len() >= 8 {
+            let ts = job_id >> 24;
+            let sha8: String = commit_sha.chars().take(8).collect();
+            self.job_id_strings
+                .entry(job_id)
+                .or_insert_with(|| format!("job-{ts}-{sha8}"));
+        }
+    }
+
+    fn ensure_aux_defaults(&mut self) {
         if self.sandboxes.is_empty() {
             self.sandboxes = default_sandboxes();
         }
-        if self.registry.packages.is_empty() {
-            self.registry = default_registry();
-        }
-        if self.observe.smartscape_nodes.is_empty() {
-            self.observe = default_observe();
+        if matches!(self.source, DataSource::Scenario(_)) {
+            if self.leases.is_empty() {
+                self.leases = default_leases();
+            }
+            if self.registry.packages.is_empty() {
+                self.registry = default_registry();
+            }
+            if self.observe.smartscape_nodes.is_empty() {
+                self.observe = default_observe();
+            }
         }
     }
 
@@ -941,7 +980,7 @@ impl Store {
             Input::Leases(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                if self.source == DataSource::Live || !list.is_empty() {
                     self.leases = list
                         .into_iter()
                         .map(|mut l| {
@@ -963,7 +1002,7 @@ impl Store {
             Input::RegPackages(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                if self.source == DataSource::Live || !list.is_empty() {
                     self.registry.packages = list
                         .into_iter()
                         .map(|d| {
@@ -997,7 +1036,7 @@ impl Store {
             Input::RegCanaries(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                if self.source == DataSource::Live || !list.is_empty() {
                     self.registry.canaries = list
                         .into_iter()
                         .map(|d| {
@@ -1093,7 +1132,7 @@ impl Store {
             Input::ObsProblems(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                if self.source == DataSource::Live || !list.is_empty() {
                     self.observe.problems = list
                         .into_iter()
                         .map(|p| {
@@ -1177,7 +1216,7 @@ impl Store {
             Input::ObsMetrics(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                if self.source == DataSource::Live || !list.is_empty() {
                     self.observe.metrics = list
                         .into_iter()
                         .map(|m| HardwareMetricSeries {
@@ -1261,7 +1300,7 @@ impl Store {
                 self.auth = next;
                 changed
             }
-            Input::JobRestarted(job_id) => {
+            Input::JobRestarted(job_id) | Input::JobResumed(job_id) => {
                 let mut any = false;
                 for topo in self.topologies.values_mut() {
                     let mut tr_changed = false;
@@ -1286,7 +1325,51 @@ impl Store {
                         any = true;
                     }
                 }
+                if let Some(j) = self.ci_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                    j.queue_state = "Active".into();
+                    for st in &mut j.stages {
+                        if st.state == StageState::Failed {
+                            st.state = StageState::Running;
+                        }
+                    }
+                    any = true;
+                }
                 any
+            }
+            Input::JobDetail(rec) => {
+                self.loaded = true;
+                let Some(summary) = self.ci_job_from_record(rec, None) else {
+                    return false;
+                };
+                if let Some(existing) = self.ci_jobs.iter_mut().find(|j| j.job_id == summary.job_id)
+                {
+                    if !summary.stages.is_empty() {
+                        existing.stages = summary.stages;
+                    }
+                    existing.commit_sha = summary.commit_sha;
+                    existing.job_id_str = summary.job_id_str;
+                    existing.elapsed_secs = existing.elapsed_secs.max(summary.elapsed_secs);
+                    if summary.quality_score > 0 || summary.tests_total > 0 {
+                        existing.quality_score = summary.quality_score;
+                        existing.coverage_bp = summary.coverage_bp;
+                        existing.tests_passed = summary.tests_passed;
+                        existing.tests_total = summary.tests_total;
+                    }
+                    if existing.queue_state != "Active" && existing.queue_state != "Queued" {
+                        existing.queue_state = summary.queue_state;
+                    }
+                } else {
+                    self.ci_jobs.insert(0, summary);
+                }
+                true
+            }
+            Input::JobLog { job_id, lines } => {
+                self.loaded = true;
+                self.job_logs.insert(job_id, lines.clone());
+                if let Some(j) = self.ci_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                    j.raw_log_lines = lines;
+                }
+                true
             }
             Input::Restore {
                 saved_epoch_ms,
@@ -1340,7 +1423,34 @@ impl Store {
         let mut next = BTreeMap::new();
         for d in list {
             let id = RepoId::new(&d.owner, &d.repo);
-            let cd = self.repos.get(&id).and_then(|r| r.cd.clone());
+            if let Some(job_id) = d.latest_job_id {
+                self.record_job_id_str(job_id, "", &d.commit_sha);
+            }
+            let prev = self.repos.get(&id);
+            let cd = prev.and_then(|r| r.cd.clone());
+            let submodules: Vec<SubmoduleRef> = if d.submodules.is_empty() {
+                prev.map(|r| r.submodules.clone()).unwrap_or_default()
+            } else {
+                d.submodules
+                    .into_iter()
+                    .map(|s| SubmoduleRef {
+                        path: s.path,
+                        repo: RepoId::new(&s.owner, &s.repo),
+                        pinned_sha: s.pinned_sha,
+                    })
+                    .collect()
+            };
+            let parents: Vec<ParentRef> = if d.parents.is_empty() {
+                prev.map(|r| r.parents.clone()).unwrap_or_default()
+            } else {
+                d.parents
+                    .into_iter()
+                    .map(|p| ParentRef {
+                        repo: RepoId::new(&p.owner, &p.repo),
+                        path: p.path,
+                    })
+                    .collect()
+            };
             let score = RepoScore {
                 id: id.clone(),
                 visibility: d.visibility,
@@ -1350,160 +1460,150 @@ impl Store {
                 coverage_bp: pct_to_bp(d.coverage),
                 bench_delta_bp: signed_pct_to_bp(d.bench_delta),
                 latest_job_id: d.latest_job_id,
-                submodules: d
-                    .submodules
-                    .into_iter()
-                    .map(|s| SubmoduleRef {
-                        path: s.path,
-                        repo: RepoId::new(&s.owner, &s.repo),
-                        pinned_sha: s.pinned_sha,
-                    })
-                    .collect(),
-                parents: d
-                    .parents
-                    .into_iter()
-                    .map(|p| ParentRef {
-                        repo: RepoId::new(&p.owner, &p.repo),
-                        path: p.path,
-                    })
-                    .collect(),
+                submodules,
+                parents,
                 cd,
             };
             next.insert(id, score);
         }
         self.repos = next;
-        if self.source == DataSource::Live {
-            let ids: Vec<RepoId> = self
-                .repos
-                .keys()
-                .filter(|id| id.owner != "fixture")
-                .cloned()
-                .collect();
-            for id in &ids {
-                self.ensure_baseline_cd(id);
-            }
-        }
         true
     }
 
-    fn ensure_baseline_cd(&mut self, repo: &RepoId) {
-        if self.latest.contains_key(repo) {
-            return;
+    fn ci_job_from_record(
+        &mut self,
+        rec: CiQueueJobRecordDto,
+        queue_state_hint: Option<&str>,
+    ) -> Option<CiJobSummary> {
+        let rec = rec.into_unwrapped();
+        let job_id = parse_job_id_str(&rec.job.id);
+        if job_id == 0 {
+            return None;
         }
-        let Some(r) = self.repos.get(repo) else {
-            return;
+        self.record_job_id_str(job_id, &rec.job.id, &rec.job.commit_sha);
+        let job_id_str = self.resolve_job_id_str(job_id);
+        let repo = if let Some((owner, name)) = rec.job.repo_name.split_once('/') {
+            RepoId::new(owner, name)
+        } else if rec.job.repo_name.is_empty() {
+            RepoId::new("LMA1980", "unknown")
+        } else {
+            RepoId::new("LMA1980", &rec.job.repo_name)
         };
-        let status = r.status;
-        let job_tag = r.latest_job_id.map_or_else(|| "0042".into(), format_job_id);
-        let short_tag: String = job_tag.chars().take(6).collect();
-        let dep_id = format!("dep-{short_tag}");
-        let digest = format!("sha256:{short_tag}a0c41e");
-        let service = repo.repo.to_ascii_lowercase();
-        let outcome = match status {
-            RepoStatus::Failing => GateOutcome::RolledBack,
-            RepoStatus::Running => GateOutcome::Pending,
-            RepoStatus::Passing | RepoStatus::Unknown => GateOutcome::Promoted,
-        };
-        let gate = DeploymentGate {
-            deployment_id: dep_id.clone(),
-            repo: repo.clone(),
-            service: service.clone(),
-            artifact_digest: digest.clone(),
-            target_node: "worker-riscv64".into(),
-            staged_slot: Slot::B,
-            restore_slot: Slot::A,
-            lease_expires_epoch_ms: 1_793_491_800_000,
-            outcome,
-            rollback_reason: (status == RepoStatus::Failing)
-                .then_some(RollbackReason::CriticalTestFailed),
-            tainted: false,
-            tests: vec![
-                GateTest {
-                    name: "it_unit_and_doc_gate".into(),
-                    critical: true,
-                    state: TestState::Passed,
-                    duration_ms: 1_120,
-                    crate_name: Some(service.clone()),
-                    log_excerpt: None,
-                },
-                GateTest {
-                    name: "it_clippy_and_audit".into(),
-                    critical: true,
-                    state: TestState::Passed,
-                    duration_ms: 1_840,
-                    crate_name: Some(service.clone()),
-                    log_excerpt: None,
-                },
-                GateTest {
-                    name: "it_sandbox_smoke_verify".into(),
-                    critical: true,
-                    state: if status == RepoStatus::Running {
-                        TestState::Running
+        let ref_name = rec
+            .job
+            .ref_name
+            .trim_start_matches("refs/heads/")
+            .to_owned();
+        let stages: Vec<CiJobStage> = rec
+            .stages
+            .iter()
+            .map(|st| {
+                let state =
+                    StageState::from_status_str(&st.status.state, st.status.details.exit_code);
+                CiJobStage {
+                    id: st.id.clone(),
+                    name: if st.name.is_empty() {
+                        st.id.clone()
                     } else {
-                        TestState::Passed
+                        st.name.clone()
                     },
-                    duration_ms: 2_310,
-                    crate_name: Some(service.clone()),
-                    log_excerpt: None,
-                },
-                GateTest {
-                    name: "it_canary_slot_health".into(),
-                    critical: true,
-                    state: match status {
-                        RepoStatus::Failing => TestState::Failed,
-                        RepoStatus::Running => TestState::Pending,
-                        RepoStatus::Passing | RepoStatus::Unknown => TestState::Passed,
-                    },
-                    duration_ms: 940,
-                    crate_name: Some(service),
-                    log_excerpt: (status == RepoStatus::Failing)
-                        .then(|| "canary health check failed on staged slot B".into()),
-                },
-            ],
+                    assigned_node: st.assigned_node.as_deref().map(sanitize_public_log),
+                    threads: st.threads,
+                    state,
+                    duration_secs: st.status.details.duration_secs,
+                    exit_code: st.status.details.exit_code,
+                }
+            })
+            .collect();
+        let any_failed = stages.iter().any(|s| s.state == StageState::Failed);
+        let any_running = stages.iter().any(|s| s.state == StageState::Running);
+        let all_passed = !stages.is_empty() && stages.iter().all(|s| s.state == StageState::Passed);
+        let queue_state = match queue_state_hint {
+            Some("Active") => "Active".into(),
+            Some("Queued") => "Queued".into(),
+            _ if any_failed => "Failed".into(),
+            _ if any_running => "Active".into(),
+            _ if all_passed => "Passed".into(),
+            Some(other) => other.to_owned(),
+            None => "Passed".into(),
         };
-        let summary = gate.summary();
-        let prev_summary = DeploymentSummary {
-            deployment_id: "dep-prev01".into(),
-            artifact_digest: "sha256:09080706a1b2".into(),
-            it_passed: 4,
-            it_total: 4,
-            outcome: GateOutcome::Promoted,
-        };
-        self.gates.insert(dep_id.clone(), gate);
-        self.latest.insert(repo.clone(), dep_id.clone());
-        self.history
-            .insert(repo.clone(), vec![summary.clone(), prev_summary]);
-        if let Some(r_mut) = self.repos.get_mut(repo) {
-            r_mut.cd = Some(CdScore {
-                deployment_id: dep_id,
-                active_slot: if outcome == GateOutcome::Promoted {
-                    Slot::B
-                } else {
-                    Slot::A
-                },
-                outcome: summary.outcome,
-                it_passed: summary.it_passed,
-                it_total: summary.it_total,
+        let stage_dur_sum: u64 = stages.iter().map(|s| s.duration_secs).sum();
+        let elapsed_secs = rec.elapsed_secs.max(stage_dur_sum);
+        let (quality_score, coverage_bp, tests_passed, tests_total, benchmark_summary) = rec
+            .metrics
+            .as_ref()
+            .map_or((0, 0, 0, 0, String::new()), |m| {
+                (
+                    m.quality_score.min(100),
+                    pct_to_bp(m.coverage_pct),
+                    m.tests_passed,
+                    m.tests_total,
+                    sanitize_public_log(&m.benchmark_summary),
+                )
             });
-        }
+        let raw_log_lines = self.job_logs.get(&job_id).cloned().unwrap_or_default();
+        Some(CiJobSummary {
+            job_id,
+            job_id_str,
+            repo,
+            ref_name,
+            commit_sha: rec.job.commit_sha,
+            queue_state,
+            elapsed_secs,
+            wait_secs: rec.wait_secs,
+            quality_score,
+            coverage_bp,
+            tests_passed,
+            tests_total,
+            benchmark_summary,
+            stages,
+            raw_log_lines,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
     fn apply_ci_queue(&mut self, dto: CiQueueDto) -> bool {
         self.loaded = true;
         self.ensure_aux_defaults();
-        let all_jobs: Vec<_> = dto
+        let tagged_jobs: Vec<(&str, CiQueueJobRecordDto)> = dto
             .active_jobs
             .into_iter()
-            .chain(dto.queued_jobs)
-            .chain(dto.recent_jobs)
+            .map(|r| ("Active", r.into_unwrapped()))
+            .chain(
+                dto.queued_jobs
+                    .into_iter()
+                    .map(|r| ("Queued", r.into_unwrapped())),
+            )
+            .chain(
+                dto.recent_jobs
+                    .into_iter()
+                    .map(|r| ("Completed", r.into_unwrapped())),
+            )
             .take(24)
             .collect();
-        if all_jobs.is_empty() {
+        if tagged_jobs.is_empty() {
             return false;
         }
-        let mut live_traces = Vec::with_capacity(all_jobs.len());
-        for (job_idx, rec) in all_jobs.into_iter().enumerate() {
+        let prev_jobs = std::mem::take(&mut self.ci_jobs);
+        let mut next_jobs = Vec::with_capacity(tagged_jobs.len());
+        let mut live_traces = Vec::with_capacity(tagged_jobs.len());
+        for (job_idx, (q_hint, rec)) in tagged_jobs.into_iter().enumerate() {
+            if let Some(mut summary) = self.ci_job_from_record(rec.clone(), Some(q_hint)) {
+                if let Some(prev) = prev_jobs.iter().find(|p| p.job_id == summary.job_id) {
+                    if summary.stages.is_empty() && !prev.stages.is_empty() {
+                        summary.stages.clone_from(&prev.stages);
+                    }
+                    if summary.raw_log_lines.is_empty() && !prev.raw_log_lines.is_empty() {
+                        summary.raw_log_lines.clone_from(&prev.raw_log_lines);
+                    }
+                }
+                if !next_jobs
+                    .iter()
+                    .any(|j: &CiJobSummary| j.job_id == summary.job_id)
+                {
+                    next_jobs.push(summary);
+                }
+            }
             let short_job: String = if rec.job.commit_sha.len() >= 6 {
                 rec.job.commit_sha.chars().take(6).collect()
             } else if !rec.job.id.is_empty() {
@@ -1598,7 +1698,15 @@ impl Store {
                     )
                 },
             );
-            let status_label = if is_err { "FAILED" } else { "PASSED" };
+            let status_label = if is_err {
+                "FAILED"
+            } else if q_hint == "Active" {
+                "RUNNING"
+            } else if q_hint == "Queued" {
+                "QUEUED"
+            } else {
+                "PASSED"
+            };
             let log_msg = sanitize_public_log(&format!(
                 "{repo_label} @{ref_clean} [{status_label}] stages={} tests={passed_t}/{total_t} cov={cov_str} on {node_hw}",
                 rec.stages.len(),
@@ -1624,6 +1732,7 @@ impl Store {
                 });
             }
         }
+        self.ci_jobs = next_jobs;
         for existing in std::mem::take(&mut self.observe.traces) {
             if !live_traces.iter().any(|t| t.trace_id == existing.trace_id) {
                 live_traces.push(existing);
@@ -1634,7 +1743,31 @@ impl Store {
     }
 
     fn summary(&mut self, s: &RepoSummaryDto) -> bool {
-        let Some(r) = self.repos.get_mut(&RepoId::new(&s.owner, &s.repo)) else {
+        let repo_id = RepoId::new(&s.owner, &s.repo);
+        if let Some(job_id) = s.latest_job_id {
+            self.record_job_id_str(job_id, "", &s.commit_sha);
+        }
+        for h in &s.history {
+            self.record_job_id_str(h.job_id, "", &h.commit_sha);
+        }
+        let subs: Vec<SubmoduleRef> = s
+            .submodules
+            .iter()
+            .map(|sub| SubmoduleRef {
+                path: sub.path.clone(),
+                repo: RepoId::new(&sub.owner, &sub.repo),
+                pinned_sha: sub.pinned_sha.clone(),
+            })
+            .collect();
+        let parents: Vec<ParentRef> = s
+            .parents
+            .iter()
+            .map(|p| ParentRef {
+                repo: RepoId::new(&p.owner, &p.repo),
+                path: p.path.clone(),
+            })
+            .collect();
+        let Some(r) = self.repos.get_mut(&repo_id) else {
             return false;
         };
         r.status = s.status;
@@ -1642,6 +1775,29 @@ impl Store {
         r.coverage_bp = pct_to_bp(s.coverage);
         r.bench_delta_bp = signed_pct_to_bp(s.bench_delta);
         r.latest_job_id = s.latest_job_id.or(r.latest_job_id);
+        if !subs.is_empty() {
+            r.submodules.clone_from(&subs);
+        }
+        if !parents.is_empty() {
+            r.parents = parents;
+        }
+        if let Some(topo) = self.topologies.get_mut(&repo_id) {
+            if !subs.is_empty() {
+                topo.t.submodules.clone_from(&subs);
+            }
+        }
+        // Populate reverse parent pointers on child submodule repos so C5/C3 show parent links.
+        for sub in subs {
+            if let Some(child_repo) = self.repos.get_mut(&sub.repo) {
+                let pref = ParentRef {
+                    repo: repo_id.clone(),
+                    path: sub.path,
+                };
+                if !child_repo.parents.contains(&pref) {
+                    child_repo.parents.push(pref);
+                }
+            }
+        }
         true
     }
 
@@ -1673,23 +1829,82 @@ impl Store {
             .collect();
         branches.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
         branches.dedup_by(|a, b| a.ref_name == b.ref_name);
-        let mut trains: Vec<Train> = d
-            .trains
-            .into_iter()
-            .map(|t| {
-                let mut states = t.stage_states;
-                states.resize(n, StageState::Pending);
-                let clean_node = t.node_id.map(|id| sanitize_public_log(&id));
-                Train {
-                    job_id: t.job_id,
-                    stage: station_index(&stations, &t.stage),
-                    node_lost: self.node_offline(clean_node.as_deref()),
-                    ref_name: t.ref_name,
-                    stage_states: states,
-                    node_id: clean_node,
-                }
-            })
-            .collect();
+        let mut trains: Vec<Train> = Vec::with_capacity(d.trains.len());
+        for t in d.trains {
+            self.record_job_id_str(t.job_id, "", &t.commit_sha);
+            let mut states = t.stage_states;
+            states.resize(n, StageState::Pending);
+            let clean_node = t.node_id.map(|id| sanitize_public_log(&id));
+            let tr = Train {
+                job_id: t.job_id,
+                stage: station_index(&stations, &t.stage),
+                node_lost: self.node_offline(clean_node.as_deref()),
+                ref_name: t.ref_name,
+                stage_states: states,
+                node_id: clean_node,
+            };
+            if tr.job_id > 0 && !self.ci_jobs.iter().any(|j| j.job_id == tr.job_id) {
+                let job_id_str = if self.job_id_strings.contains_key(&tr.job_id) {
+                    self.resolve_job_id_str(tr.job_id)
+                } else {
+                    format!("job-{}", format_job_id(tr.job_id))
+                };
+                let repo_score = self.repos.get(&repo);
+                let stages: Vec<CiJobStage> = stations
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, st)| {
+                        let state = tr
+                            .stage_states
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(StageState::Pending);
+                        CiJobStage {
+                            id: st.id.clone(),
+                            name: st.label.clone(),
+                            assigned_node: tr.node_id.clone(),
+                            threads: 6,
+                            state,
+                            duration_secs: if state == StageState::Passed { 12 } else { 0 },
+                            exit_code: i32::from(state == StageState::Failed),
+                        }
+                    })
+                    .collect();
+                let queue_state = if tr.failed() {
+                    "Failed".into()
+                } else if stages.iter().any(|s| s.state == StageState::Running) {
+                    "Active".into()
+                } else {
+                    "Passed".into()
+                };
+                let elapsed_secs: u64 = stages.iter().map(|s| s.duration_secs).sum();
+                self.ci_jobs.push(CiJobSummary {
+                    job_id: tr.job_id,
+                    job_id_str,
+                    repo: repo.clone(),
+                    ref_name: tr.ref_name.clone(),
+                    commit_sha: t.commit_sha,
+                    queue_state,
+                    elapsed_secs,
+                    wait_secs: 0,
+                    quality_score: repo_score.map_or(95, |r| r.score),
+                    coverage_bp: repo_score.map_or(9_000, |r| r.coverage_bp),
+                    tests_passed: u32::try_from(
+                        stages
+                            .iter()
+                            .filter(|s| s.state == StageState::Passed)
+                            .count()
+                            * 10,
+                    )
+                    .unwrap_or(0),
+                    tests_total: u32::try_from(stages.len().max(1) * 10).unwrap_or(10),
+                    benchmark_summary: String::new(),
+                    stages,
+                    raw_log_lines: self.job_logs.get(&tr.job_id).cloned().unwrap_or_default(),
+                });
+            }
+            trains.push(tr);
+        }
         trains.sort_by_key(|t| t.job_id);
         trains.dedup_by_key(|t| t.job_id);
         let prev_rev = self.topologies.get(&repo).map_or(0, |t| t.t.fabric_rev);
@@ -1907,10 +2122,6 @@ impl Store {
     fn deployments(&mut self, repo: &RepoId, list: &[DeploymentDto]) -> bool {
         self.loaded = true;
         self.ensure_aux_defaults();
-        if list.is_empty() && self.source == DataSource::Live && repo.owner != "fixture" {
-            self.ensure_baseline_cd(repo);
-            return true;
-        }
         let mut sorted: Vec<&DeploymentDto> = list.iter().collect();
         sorted.sort_by_key(|a| std::cmp::Reverse(a.started_epoch_ms));
         let history: Vec<DeploymentSummary> = sorted
@@ -2152,6 +2363,7 @@ impl Store {
             sandboxes: self.sandboxes.clone(),
             registry: self.registry.clone(),
             observe: self.observe.clone(),
+            ci_jobs: self.ci_jobs.clone(),
             auth: self.auth.clone(),
         }
     }

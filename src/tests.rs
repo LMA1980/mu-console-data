@@ -673,11 +673,33 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     let queue_json = r#"{
         "queue_depth": 0,
         "concurrency": 1,
-        "active_jobs": [],
+        "active_jobs": [{
+            "elapsed_secs": 18,
+            "wait_secs": 2,
+            "position": 0,
+            "record": {
+                "job": {
+                    "id": "job-1794054805-5cec9056",
+                    "repo_name": "LMA1980/mu-console",
+                    "ref_name": "refs/heads/feat/live-workflow-parity",
+                    "commit_sha": "5cec90561234",
+                    "event_type": "push"
+                },
+                "stages": [
+                    {
+                        "id": "fmt-check",
+                        "name": "fmt-check",
+                        "assigned_node": "worker-riscv64",
+                        "threads": 6,
+                        "status": { "state": "Running", "details": { "duration_secs": 4, "exit_code": 0 } }
+                    }
+                ]
+            }
+        }],
         "queued_jobs": [],
         "recent_jobs": [{
             "job": {
-                "id": "69af1f1d-0001",
+                "id": "job-1794054497-af7344e0",
                 "repo_name": "mu-console",
                 "ref_name": "refs/heads/main",
                 "commit_sha": "af7344e01234",
@@ -697,28 +719,49 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
                     "name": "fmt-check",
                     "assigned_node": "worker-riscv64",
                     "threads": 6,
-                    "status": { "state": "passed", "details": { "duration_secs": 3, "exit_code": 0 } }
+                    "status": { "state": "Completed", "details": { "duration_secs": 3, "exit_code": 0 } }
                 },
                 {
                     "id": "clippy",
                     "name": "clippy-check",
                     "assigned_node": "worker-riscv64",
                     "threads": 6,
-                    "status": { "state": "passed", "details": { "duration_secs": 8, "exit_code": 0 } }
+                    "status": { "state": "Completed", "details": { "duration_secs": 8, "exit_code": 0 } }
                 }
             ]
         }]
     }"#;
     eng.on_fetch_gen(gen0, &FetchKind::CiQueue, Ok(queue_json.into()), 25);
 
+    // Hydrate submodules from /api/repos/{owner}/{repo}/summary when /api/repos had none.
+    let summary_json = r#"{
+        "owner": "LMA1980",
+        "repo": "engine",
+        "status": "passing",
+        "score": 96,
+        "coverage": 91.5,
+        "bench_delta": 0.2,
+        "latest_job_id": 29612437286333911,
+        "commit_sha": "62add75b8019",
+        "submodules": [
+            { "path": "code/core", "owner": "LMA1980", "repo": "core", "pinned_sha": "a1b2c3d4" }
+        ]
+    }"#;
+    let repo_a = RepoId::new("LMA1980", "engine");
+    eng.on_fetch_gen(
+        eng.selection_gen(),
+        &FetchKind::Summary(repo_a.clone()),
+        Ok(summary_json.into()),
+        28,
+    );
+
     // Empty arrays from RegPackages, RegCanaries, Leases, ObsProblems, and Deployments
-    // in Live mode must preserve defaults and baseline CD gate rather than wiping views empty.
+    // in Live mode must produce explicit empty-state vectors rather than synthetic fixtures.
     eng.on_fetch_gen(gen0, &FetchKind::RegPackages, Ok("[]".into()), 30);
     eng.on_fetch_gen(gen0, &FetchKind::RegCanaries, Ok("[]".into()), 31);
     eng.on_fetch_gen(gen0, &FetchKind::Leases, Ok("[]".into()), 32);
     eng.on_fetch_gen(gen0, &FetchKind::ObsProblems, Ok("[]".into()), 33);
-    let repo_a = RepoId::new("LMA1980", "engine");
-    eng.on_fetch(&FetchKind::Deployments(repo_a), Ok("[]".into()), 35);
+    eng.on_fetch(&FetchKind::Deployments(repo_a.clone()), Ok("[]".into()), 35);
 
     let v = eng.store().view();
     let k3 = v
@@ -734,18 +777,55 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     assert!(k3.exclusive_locked);
     assert_eq!(k3.tags, vec!["riscv64", "spacemit-k3"]);
 
-    assert!(v
+    assert_eq!(v.ci_jobs.len(), 2);
+    assert_eq!(v.ci_jobs[0].job_id_str, "job-1794054805-5cec9056");
+    assert_eq!(v.ci_jobs[0].queue_state, "Active");
+    assert_eq!(v.ci_jobs[0].elapsed_secs, 18);
+    assert_eq!(v.ci_jobs[1].job_id_str, "job-1794054497-af7344e0");
+    assert_eq!(v.ci_jobs[1].queue_state, "Passed");
+
+    // Verify SelectJob + JobLog hydration and string job_id resolution for RestartJob / ResumeJob.
+    let active_u64 = v.ci_jobs[0].job_id;
+    let sel_fx = eng.handle(UiCommand::SelectJob { job_id: active_u64 }, 36);
+    assert!(sel_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind: FetchKind::JobDetail(id), url }
+        if *id == active_u64 && url == "/api/jobs/job-1794054805-5cec9056"
+    )));
+    assert!(sel_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind: FetchKind::JobLog(id), url }
+        if *id == active_u64 && url == "/api/jobs/job-1794054805-5cec9056/log"
+    )));
+    eng.on_fetch(
+        &FetchKind::JobLog(active_u64),
+        Ok("\u{1b}[32mCompiling\u{1b}[0m mu-console (/var/lib/action-runner/work/mu-console)\nFinished release".into()),
+        37,
+    );
+    let v_after_log = eng.store().view();
+    assert_eq!(v_after_log.ci_jobs[0].raw_log_lines.len(), 2);
+    assert!(v_after_log.ci_jobs[0].raw_log_lines[0].contains(".../work/mu-console"));
+
+    let engine_repo = v_after_log
+        .repos
+        .iter()
+        .find(|r| r.id == repo_a)
+        .expect("LMA1980/engine repo");
+    assert_eq!(engine_repo.submodules.len(), 1);
+    assert_eq!(engine_repo.submodules[0].path, "code/core");
+
+    assert!(v_after_log
         .observe
         .traces
         .iter()
         .any(|t| t.trace_id == "tr-ci-af7344"));
-    assert!(!v.registry.packages.is_empty());
-    assert!(!v.registry.canaries.is_empty());
-    assert!(!v.leases.is_empty());
-    assert!(!v.observe.problems.is_empty());
+    assert!(v_after_log.registry.packages.is_empty());
+    assert!(v_after_log.registry.canaries.is_empty());
+    assert!(v_after_log.leases.is_empty());
+    assert!(v_after_log.observe.problems.is_empty());
     assert!(
-        v.gate.is_some(),
-        "Live mode must keep baseline CD gate when deployments list is empty"
+        v_after_log.gate.is_none(),
+        "Live mode must show explicit empty state when deployments list is empty"
     );
 }
 
