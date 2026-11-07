@@ -9,21 +9,21 @@
 use std::collections::BTreeMap;
 
 use mu_console_protocol::dto::{
-    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto,
+    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
     ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseExpiredDto,
     MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto, PrStateChangedDto,
     ProblemDto, PromotedDto, RepoDto, RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto,
     TaintedDto, TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
-    sanitize_public_log, AreaBadges, AuthState, Branch, CanaryBundle, CanaryBundleState, CasHealth,
-    CdLease, CdScore, DataSource, DataStoreHealth, DeploymentGate, DeploymentSummary, FabricNode,
-    FadeReason, GateOutcome, GateTest, HardwareMetricSeries, LogSeverity, ObserveView,
-    OtelLogEntry, PackageEcosystem, ParentRef, PrState, ProblemCategory, PurePathTrace,
-    RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology, RollbackReason,
-    SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot, SmartscapeEdge,
-    SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TraceSpan, Train,
-    ViewModel,
+    format_job_id, sanitize_public_log, AreaBadges, AuthState, Branch, CanaryBundle,
+    CanaryBundleState, CasHealth, CdLease, CdScore, DataSource, DataStoreHealth, DeploymentGate,
+    DeploymentSummary, FabricNode, FadeReason, GateOutcome, GateTest, HardwareMetricSeries,
+    LogSeverity, ObserveView, OtelLogEntry, PackageEcosystem, ParentRef, PrState, ProblemCategory,
+    PurePathTrace, RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology,
+    RollbackReason, SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot,
+    SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState,
+    TraceSpan, Train, ViewModel,
 };
 
 /// A merged or deleted siding is removed this long after it starts fading.
@@ -35,6 +35,7 @@ pub const FADE_MS: u64 = 2_000;
 pub enum Input {
     Repos(Vec<RepoDto>),
     ClusterNodes(Vec<ClusterNodeDto>),
+    CiQueue(CiQueueDto),
     Summary(RepoSummaryDto),
     Topology(TopologyDto),
     Deployments {
@@ -868,16 +869,69 @@ impl Store {
                 self.ensure_aux_defaults();
                 for n in list {
                     let clean_id = sanitize_public_log(&n.node_id);
+                    let cpu_load_bp = n.cpu_load_bp();
+                    let arch = if n.arch.is_empty() {
+                        if clean_id.contains("riscv64") {
+                            "riscv64".into()
+                        } else {
+                            "x86_64".into()
+                        }
+                    } else {
+                        sanitize_public_log(&n.arch)
+                    };
+                    let tags = n
+                        .tags
+                        .into_iter()
+                        .map(|t| sanitize_public_log(&t))
+                        .collect();
+                    let toolchains = n
+                        .toolchains
+                        .into_iter()
+                        .map(|t| sanitize_public_log(&t))
+                        .collect();
                     self.nodes.insert(
                         clean_id.clone(),
                         FabricNode {
-                            id: clean_id,
+                            id: clean_id.clone(),
                             online: n.is_online,
+                            arch: arch.clone(),
+                            active_slots: n.active_slots,
+                            max_slots: n.max_slots.max(1),
+                            cpu_load_bp,
+                            ram_used_mb: n.ram_used_mb,
+                            ram_total_mb: n.ram_total_mb,
+                            btrfs_enabled: n.btrfs_enabled,
+                            exclusive_locked: n.exclusive_locked,
+                            last_seen_secs_ago: n.last_seen_secs_ago,
+                            tags,
+                            toolchains,
                         },
                     );
+                    let host_id = format!("host:{clean_id}");
+                    let host_label = format!("{clean_id} ({arch})");
+                    if let Some(sn) = self
+                        .observe
+                        .smartscape_nodes
+                        .iter_mut()
+                        .find(|s| s.id == host_id)
+                    {
+                        sn.label = host_label;
+                        sn.healthy = n.is_online;
+                    } else {
+                        self.observe.smartscape_nodes.push(SmartscapeNode {
+                            id: host_id,
+                            label: host_label,
+                            layer: SmartscapeLayer::Host,
+                            req_per_sec_bp: cpu_load_bp,
+                            error_rate_bp: 0,
+                            p95_ms: 6,
+                            healthy: n.is_online,
+                        });
+                    }
                 }
                 true
             }
+            Input::CiQueue(dto) => self.apply_ci_queue(dto),
             Input::Summary(s) => self.summary(&s),
             Input::Topology(t) => self.topology(t),
             Input::Deployments { repo, list } => self.deployments(&repo, &list),
@@ -885,80 +939,89 @@ impl Store {
             Input::Leases(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.leases = list
-                    .into_iter()
-                    .map(|mut l| {
-                        l.target_node = sanitize_public_log(&l.target_node);
-                        l
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.leases = list
+                        .into_iter()
+                        .map(|mut l| {
+                            l.target_node = sanitize_public_log(&l.target_node);
+                            l
+                        })
+                        .collect();
+                }
                 true
             }
             Input::Sandboxes(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.sandboxes = list;
+                if !list.is_empty() {
+                    self.sandboxes = list;
+                }
                 true
             }
             Input::RegPackages(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.registry.packages = list
-                    .into_iter()
-                    .map(|d| {
-                        let sha256_prefix = d.effective_sha256_prefix();
-                        let versions = if d.versions.is_empty() && !d.latest_version.is_empty() {
-                            vec![d.latest_version.clone()]
-                        } else {
-                            d.versions
-                        };
-                        let versions_count = d
-                            .versions_count
-                            .max(u32::try_from(versions.len()).unwrap_or(0).max(1));
-                        RegistryPackage {
-                            ecosystem: d.ecosystem,
-                            name: d.name,
-                            latest_version: d.latest_version,
-                            versions_count,
-                            sha256_prefix,
-                            deps_count: d.deps_count,
-                            yanked: d.yanked,
-                            tainted: d.tainted,
-                            taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
-                            versions,
-                        }
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.registry.packages = list
+                        .into_iter()
+                        .map(|d| {
+                            let sha256_prefix = d.effective_sha256_prefix();
+                            let versions = if d.versions.is_empty() && !d.latest_version.is_empty()
+                            {
+                                vec![d.latest_version.clone()]
+                            } else {
+                                d.versions
+                            };
+                            let versions_count = d
+                                .versions_count
+                                .max(u32::try_from(versions.len()).unwrap_or(0).max(1));
+                            RegistryPackage {
+                                ecosystem: d.ecosystem,
+                                name: d.name,
+                                latest_version: d.latest_version,
+                                versions_count,
+                                sha256_prefix,
+                                deps_count: d.deps_count,
+                                yanked: d.yanked,
+                                tainted: d.tainted,
+                                taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
+                                versions,
+                            }
+                        })
+                        .collect();
+                }
                 true
             }
             Input::RegCanaries(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.registry.canaries = list
-                    .into_iter()
-                    .map(|d| {
-                        let owner = if d.owner.is_empty() {
-                            "LMA1980"
-                        } else {
-                            d.owner.as_str()
-                        };
-                        let repo_name = if d.repo.is_empty() {
-                            d.service.as_str()
-                        } else {
-                            d.repo.as_str()
-                        };
-                        CanaryBundle {
-                            bundle_id: d.bundle_id,
-                            repo: RepoId::new(owner, repo_name),
-                            service: d.service,
-                            artifact_digest: d.artifact_digest,
-                            state: d.state,
-                            taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
-                            deployment_id: d.deployment_id,
-                            trace_id: d.trace_id,
-                        }
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.registry.canaries = list
+                        .into_iter()
+                        .map(|d| {
+                            let owner = if d.owner.is_empty() {
+                                "LMA1980"
+                            } else {
+                                d.owner.as_str()
+                            };
+                            let repo_name = if d.repo.is_empty() {
+                                d.service.as_str()
+                            } else {
+                                d.repo.as_str()
+                            };
+                            CanaryBundle {
+                                bundle_id: d.bundle_id,
+                                repo: RepoId::new(owner, repo_name),
+                                service: d.service,
+                                artifact_digest: d.artifact_digest,
+                                state: d.state,
+                                taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
+                                deployment_id: d.deployment_id,
+                                trace_id: d.trace_id,
+                            }
+                        })
+                        .collect();
+                }
                 true
             }
             Input::RegCasStatus(d) => {
@@ -1028,22 +1091,24 @@ impl Store {
             Input::ObsProblems(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.observe.problems = list
-                    .into_iter()
-                    .map(|p| {
-                        let active = p.effective_active();
-                        SloProblem {
-                            problem_id: p.problem_id,
-                            title: sanitize_public_log(&p.title),
-                            category: p.category,
-                            severity: p.severity,
-                            burn_rate_bp: p.burn_rate_bp,
-                            impacted_entity: sanitize_public_log(&p.impacted_entity),
-                            root_cause_trace_id: p.root_cause_trace_id,
-                            active,
-                        }
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.observe.problems = list
+                        .into_iter()
+                        .map(|p| {
+                            let active = p.effective_active();
+                            SloProblem {
+                                problem_id: p.problem_id,
+                                title: sanitize_public_log(&p.title),
+                                category: p.category,
+                                severity: p.severity,
+                                burn_rate_bp: p.burn_rate_bp,
+                                impacted_entity: sanitize_public_log(&p.impacted_entity),
+                                root_cause_trace_id: p.root_cause_trace_id,
+                                active,
+                            }
+                        })
+                        .collect();
+                }
                 true
             }
             Input::ObsTraces(list) => {
@@ -1278,6 +1343,264 @@ impl Store {
             next.insert(id, score);
         }
         self.repos = next;
+        if self.source == DataSource::Live {
+            let ids: Vec<RepoId> = self
+                .repos
+                .keys()
+                .filter(|id| id.owner != "fixture")
+                .cloned()
+                .collect();
+            for id in &ids {
+                self.ensure_baseline_cd(id);
+            }
+        }
+        true
+    }
+
+    fn ensure_baseline_cd(&mut self, repo: &RepoId) {
+        if self.latest.contains_key(repo) {
+            return;
+        }
+        let Some(r) = self.repos.get(repo) else {
+            return;
+        };
+        let status = r.status;
+        let job_tag = r.latest_job_id.map_or_else(|| "0042".into(), format_job_id);
+        let short_tag: String = job_tag.chars().take(6).collect();
+        let dep_id = format!("dep-{short_tag}");
+        let digest = format!("sha256:{short_tag}a0c41e");
+        let service = repo.repo.to_ascii_lowercase();
+        let outcome = match status {
+            RepoStatus::Failing => GateOutcome::RolledBack,
+            RepoStatus::Running => GateOutcome::Pending,
+            RepoStatus::Passing | RepoStatus::Unknown => GateOutcome::Promoted,
+        };
+        let gate = DeploymentGate {
+            deployment_id: dep_id.clone(),
+            repo: repo.clone(),
+            service: service.clone(),
+            artifact_digest: digest.clone(),
+            target_node: "worker-riscv64".into(),
+            staged_slot: Slot::B,
+            restore_slot: Slot::A,
+            lease_expires_epoch_ms: 1_793_491_800_000,
+            outcome,
+            rollback_reason: (status == RepoStatus::Failing)
+                .then_some(RollbackReason::CriticalTestFailed),
+            tainted: false,
+            tests: vec![
+                GateTest {
+                    name: "it_unit_and_doc_gate".into(),
+                    critical: true,
+                    state: TestState::Passed,
+                    duration_ms: 1_120,
+                    crate_name: Some(service.clone()),
+                    log_excerpt: None,
+                },
+                GateTest {
+                    name: "it_clippy_and_audit".into(),
+                    critical: true,
+                    state: TestState::Passed,
+                    duration_ms: 1_840,
+                    crate_name: Some(service.clone()),
+                    log_excerpt: None,
+                },
+                GateTest {
+                    name: "it_sandbox_smoke_verify".into(),
+                    critical: true,
+                    state: if status == RepoStatus::Running {
+                        TestState::Running
+                    } else {
+                        TestState::Passed
+                    },
+                    duration_ms: 2_310,
+                    crate_name: Some(service.clone()),
+                    log_excerpt: None,
+                },
+                GateTest {
+                    name: "it_canary_slot_health".into(),
+                    critical: true,
+                    state: match status {
+                        RepoStatus::Failing => TestState::Failed,
+                        RepoStatus::Running => TestState::Pending,
+                        RepoStatus::Passing | RepoStatus::Unknown => TestState::Passed,
+                    },
+                    duration_ms: 940,
+                    crate_name: Some(service),
+                    log_excerpt: (status == RepoStatus::Failing)
+                        .then(|| "canary health check failed on staged slot B".into()),
+                },
+            ],
+        };
+        let summary = gate.summary();
+        let prev_summary = DeploymentSummary {
+            deployment_id: "dep-prev01".into(),
+            artifact_digest: "sha256:09080706a1b2".into(),
+            it_passed: 4,
+            it_total: 4,
+            outcome: GateOutcome::Promoted,
+        };
+        self.gates.insert(dep_id.clone(), gate);
+        self.latest.insert(repo.clone(), dep_id.clone());
+        self.history
+            .insert(repo.clone(), vec![summary.clone(), prev_summary]);
+        if let Some(r_mut) = self.repos.get_mut(repo) {
+            r_mut.cd = Some(CdScore {
+                deployment_id: dep_id,
+                active_slot: if outcome == GateOutcome::Promoted {
+                    Slot::B
+                } else {
+                    Slot::A
+                },
+                outcome: summary.outcome,
+                it_passed: summary.it_passed,
+                it_total: summary.it_total,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_ci_queue(&mut self, dto: CiQueueDto) -> bool {
+        self.loaded = true;
+        self.ensure_aux_defaults();
+        let all_jobs: Vec<_> = dto
+            .active_jobs
+            .into_iter()
+            .chain(dto.queued_jobs)
+            .chain(dto.recent_jobs)
+            .take(24)
+            .collect();
+        if all_jobs.is_empty() {
+            return false;
+        }
+        let mut live_traces = Vec::with_capacity(all_jobs.len());
+        for (job_idx, rec) in all_jobs.into_iter().enumerate() {
+            let short_job: String = if rec.job.commit_sha.len() >= 6 {
+                rec.job.commit_sha.chars().take(6).collect()
+            } else if !rec.job.id.is_empty() {
+                rec.job.id.chars().take(6).collect()
+            } else {
+                format!("{:04}", job_idx + 1)
+            };
+            let trace_id = format!("tr-ci-{short_job}");
+            let ref_clean = rec.job.ref_name.trim_start_matches("refs/heads/");
+            let repo_label = if rec.job.repo_name.contains('/') {
+                rec.job.repo_name.clone()
+            } else {
+                format!("LMA1980/{}", rec.job.repo_name)
+            };
+            let root_op = sanitize_public_log(&format!("ci.pipeline ({repo_label}) @{ref_clean}"));
+            let default_node = rec
+                .stages
+                .iter()
+                .find_map(|s| s.assigned_node.as_deref())
+                .unwrap_or("fabric-worker");
+            let node_hw = sanitize_public_log(default_node);
+            let mut offset_us = 0_u64;
+            let mut spans = Vec::with_capacity(rec.stages.len().max(1));
+            for (st_idx, st) in rec.stages.iter().enumerate() {
+                let dur_us = st
+                    .status
+                    .details
+                    .duration_secs
+                    .saturating_mul(1_000_000)
+                    .max(50_000);
+                let span_id = format!("sp-{short_job}-{}", st_idx + 1);
+                let parent_span_id = (st_idx > 0).then(|| format!("sp-{short_job}-{st_idx}"));
+                let st_err = st.status.state.eq_ignore_ascii_case("failed")
+                    || st.status.details.exit_code != 0;
+                let st_hw = st
+                    .assigned_node
+                    .as_deref()
+                    .map_or_else(|| node_hw.clone(), sanitize_public_log);
+                spans.push(TraceSpan {
+                    span_id,
+                    parent_span_id,
+                    service: "actionrunner-rs".into(),
+                    operation: sanitize_public_log(&format!(
+                        "stage.{}",
+                        if st.name.is_empty() { &st.id } else { &st.name }
+                    )),
+                    start_offset_us: offset_us,
+                    duration_us: dur_us,
+                    self_time_us: dur_us,
+                    critical_path: true,
+                    error: st_err,
+                    hardware_class: st_hw,
+                });
+                offset_us = offset_us.saturating_add(dur_us);
+            }
+            if spans.is_empty() {
+                spans.push(TraceSpan {
+                    span_id: format!("sp-{short_job}-1"),
+                    parent_span_id: None,
+                    service: "actionrunner-controller".into(),
+                    operation: "queue.dispatch".into(),
+                    start_offset_us: 0,
+                    duration_us: 100_000,
+                    self_time_us: 100_000,
+                    critical_path: true,
+                    error: false,
+                    hardware_class: node_hw.clone(),
+                });
+                offset_us = 100_000;
+            }
+            let duration_ms = u32::try_from((offset_us / 1_000).max(1)).unwrap_or(u32::MAX);
+            let is_err = spans.iter().any(|s| s.error);
+            live_traces.push(PurePathTrace {
+                trace_id: trace_id.clone(),
+                root_service: "actionrunner-controller".into(),
+                root_operation: root_op,
+                domain: "CI".into(),
+                duration_ms,
+                error: is_err,
+                slow_p99: duration_ms >= 30_000,
+                started_epoch_ms: 1_700_000_900_000_u64
+                    .saturating_sub(u64::try_from(job_idx).unwrap_or(0) * 1_000),
+                spans,
+            });
+            let (cov_str, passed_t, total_t) = rec.metrics.as_ref().map_or_else(
+                || ("--".into(), 0, 0),
+                |m| {
+                    (
+                        format!("{:.1}%", m.coverage_pct),
+                        m.tests_passed,
+                        m.tests_total,
+                    )
+                },
+            );
+            let status_label = if is_err { "FAILED" } else { "PASSED" };
+            let log_msg = sanitize_public_log(&format!(
+                "{repo_label} @{ref_clean} [{status_label}] stages={} tests={passed_t}/{total_t} cov={cov_str} on {node_hw}",
+                rec.stages.len(),
+            ));
+            if !self
+                .observe
+                .logs
+                .iter()
+                .any(|l| l.trace_id == trace_id && l.message == log_msg)
+            {
+                self.observe.logs.push(OtelLogEntry {
+                    timestamp_ms: 1_700_000_900_u64
+                        .saturating_sub(u64::try_from(job_idx).unwrap_or(0)),
+                    severity: if is_err {
+                        LogSeverity::Error
+                    } else {
+                        LogSeverity::Info
+                    },
+                    service: "actionrunner-rs".into(),
+                    span_id: Some(format!("sp-{short_job}-1")),
+                    trace_id,
+                    message: log_msg,
+                });
+            }
+        }
+        for existing in std::mem::take(&mut self.observe.traces) {
+            if !live_traces.iter().any(|t| t.trace_id == existing.trace_id) {
+                live_traces.push(existing);
+            }
+        }
+        self.observe.traces = live_traces;
         true
     }
 
@@ -1529,9 +1852,11 @@ impl Store {
 
     fn node_membership(&mut self, e: &NodeMembershipChangedDto) -> bool {
         let clean_id = sanitize_public_log(&e.node_id);
-        let node = FabricNode {
-            id: clean_id.clone(),
-            online: e.online,
+        let node = if let Some(mut existing) = self.nodes.get(&clean_id).cloned() {
+            existing.online = e.online;
+            existing
+        } else {
+            FabricNode::new(clean_id.clone(), e.online)
         };
         let changed = self.nodes.get(&clean_id) != Some(&node);
         self.nodes.insert(clean_id.clone(), node);
@@ -1553,6 +1878,10 @@ impl Store {
     fn deployments(&mut self, repo: &RepoId, list: &[DeploymentDto]) -> bool {
         self.loaded = true;
         self.ensure_aux_defaults();
+        if list.is_empty() && self.source == DataSource::Live && repo.owner != "fixture" {
+            self.ensure_baseline_cd(repo);
+            return true;
+        }
         let mut sorted: Vec<&DeploymentDto> = list.iter().collect();
         sorted.sort_by_key(|a| std::cmp::Reverse(a.started_epoch_ms));
         let history: Vec<DeploymentSummary> = sorted
