@@ -234,9 +234,11 @@ impl Engine {
                         }
                         SubView::Cd(CdSubView::IntegrationGate | CdSubView::DeploymentsSlots) => {
                             self.fetch_selection(&mut fx);
+                            self.fetch(FetchKind::RegCanaries, &mut fx);
                         }
                         SubView::Cd(CdSubView::ActiveLeases) => {
                             self.fetch(FetchKind::Leases, &mut fx);
+                            self.fetch(FetchKind::RegCanaries, &mut fx);
                         }
                         SubView::Registry(RegistrySubView::Packages) => {
                             self.fetch(FetchKind::RegPackages, &mut fx);
@@ -391,6 +393,8 @@ impl Engine {
             self.fetch(FetchKind::CiQueue, fx);
             self.fetch(FetchKind::ObsLogs, fx);
             self.fetch(FetchKind::ObsStoreStatus, fx);
+            self.fetch(FetchKind::RegPackages, fx);
+            self.fetch(FetchKind::RegCanaries, fx);
             self.fetch(FetchKind::RegCasStatus, fx);
             for s in StreamId::ALL {
                 self.open_stream(s, fx);
@@ -425,6 +429,8 @@ impl Engine {
                 self.fetch(FetchKind::CiQueue, fx);
                 self.fetch(FetchKind::ObsLogs, fx);
                 self.fetch(FetchKind::ObsStoreStatus, fx);
+                self.fetch(FetchKind::RegPackages, fx);
+                self.fetch(FetchKind::RegCanaries, fx);
                 self.fetch(FetchKind::RegCasStatus, fx);
                 self.fetch_selection(fx);
             }
