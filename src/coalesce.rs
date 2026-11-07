@@ -123,10 +123,7 @@ mod tests {
     fn vm(n: u32) -> ViewModel {
         ViewModel {
             nodes: (0..n)
-                .map(|i| FabricNode {
-                    id: format!("node-{i:02}"),
-                    online: true,
-                })
+                .map(|i| FabricNode::new(format!("node-{i:02}"), true))
                 .collect(),
             ..ViewModel::default()
         }

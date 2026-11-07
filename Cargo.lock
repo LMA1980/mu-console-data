@@ -99,7 +99,7 @@ dependencies = [
 [[package]]
 name = "mu-console-protocol"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-console-protocol.git#c533579780ae7df7cca068085f78b44a057ea44f"
+source = "git+https://github.com/LMA1980/mu-console-protocol.git#bec474794d12b93a43262dd36d0ba79fcf29fc5d"
 dependencies = [
  "postcard",
  "serde",

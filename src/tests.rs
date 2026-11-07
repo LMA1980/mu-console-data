@@ -636,3 +636,115 @@ fn auth_session_probe_and_invite_redemption_emit_auth_delta_and_refresh_repos() 
     eng.handle(UiCommand::SetAuthSession(AuthSessionDto::default()), 360);
     assert_eq!(eng.store().auth(), &AuthState::Anonymous);
 }
+
+#[test]
+fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
+    let mut eng = Engine::new(77);
+    let fx = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    assert!(fx.contains(&Effect::Fetch {
+        kind: FetchKind::CiQueue,
+        url: "/api/queue".into(),
+    }));
+
+    // Capture gen = 0 before /api/repos auto-selects the first repository (which increments selection_gen).
+    let gen0 = eng.selection_gen();
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 10);
+    assert!(eng.selection_gen() > gen0);
+
+    // Global fetches initiated at gen0 (ClusterNodes, CiQueue, RegPackages, Leases, ObsProblems)
+    // must NOT be dropped by on_fetch_gen after auto-selection bumped selection_gen!
+    let nodes_json = r#"[{
+        "node_id": "worker-riscv64",
+        "is_online": true,
+        "arch": "riscv64",
+        "active_slots": 1,
+        "max_slots": 1,
+        "cpu_load_pct": 12.5,
+        "ram_used_mb": 1720,
+        "ram_total_mb": 32145,
+        "btrfs_enabled": true,
+        "exclusive_locked": true,
+        "last_seen_secs_ago": 2,
+        "tags": ["riscv64", "spacemit-k3"],
+        "toolchains": ["rust", "miri", "wasm32"]
+    }]"#;
+    eng.on_fetch_gen(gen0, &FetchKind::ClusterNodes, Ok(nodes_json.into()), 20);
+
+    let queue_json = r#"{
+        "queue_depth": 0,
+        "concurrency": 1,
+        "active_jobs": [],
+        "queued_jobs": [],
+        "recent_jobs": [{
+            "job": {
+                "id": "69af1f1d-0001",
+                "repo_name": "mu-console",
+                "ref_name": "refs/heads/main",
+                "commit_sha": "af7344e01234",
+                "event_type": "push",
+                "queued_at": "2026-11-07T05:00:00Z"
+            },
+            "metrics": {
+                "quality_score": 99,
+                "letter_grade": "A+",
+                "coverage_pct": 94.8,
+                "tests_passed": 71,
+                "tests_total": 71
+            },
+            "stages": [
+                {
+                    "id": "fmt",
+                    "name": "fmt-check",
+                    "assigned_node": "worker-riscv64",
+                    "threads": 6,
+                    "status": { "state": "passed", "details": { "duration_secs": 3, "exit_code": 0 } }
+                },
+                {
+                    "id": "clippy",
+                    "name": "clippy-check",
+                    "assigned_node": "worker-riscv64",
+                    "threads": 6,
+                    "status": { "state": "passed", "details": { "duration_secs": 8, "exit_code": 0 } }
+                }
+            ]
+        }]
+    }"#;
+    eng.on_fetch_gen(gen0, &FetchKind::CiQueue, Ok(queue_json.into()), 25);
+
+    // Empty arrays from RegPackages, RegCanaries, Leases, ObsProblems, and Deployments
+    // in Live mode must preserve defaults and baseline CD gate rather than wiping views empty.
+    eng.on_fetch_gen(gen0, &FetchKind::RegPackages, Ok("[]".into()), 30);
+    eng.on_fetch_gen(gen0, &FetchKind::RegCanaries, Ok("[]".into()), 31);
+    eng.on_fetch_gen(gen0, &FetchKind::Leases, Ok("[]".into()), 32);
+    eng.on_fetch_gen(gen0, &FetchKind::ObsProblems, Ok("[]".into()), 33);
+    let repo_a = RepoId::new("LMA1980", "engine");
+    eng.on_fetch(&FetchKind::Deployments(repo_a), Ok("[]".into()), 35);
+
+    let v = eng.store().view();
+    let k3 = v
+        .nodes
+        .iter()
+        .find(|n| n.id == "worker-riscv64")
+        .expect("worker-riscv64 node");
+    assert_eq!(k3.arch, "riscv64");
+    assert_eq!(k3.active_slots, 1);
+    assert_eq!(k3.cpu_load_bp, 1_250);
+    assert_eq!(k3.ram_total_mb, 32_145);
+    assert!(k3.btrfs_enabled);
+    assert!(k3.exclusive_locked);
+    assert_eq!(k3.tags, vec!["riscv64", "spacemit-k3"]);
+
+    assert!(v
+        .observe
+        .traces
+        .iter()
+        .any(|t| t.trace_id == "tr-ci-af7344"));
+    assert!(!v.registry.packages.is_empty());
+    assert!(!v.registry.canaries.is_empty());
+    assert!(!v.leases.is_empty());
+    assert!(!v.observe.problems.is_empty());
+    assert!(
+        v.gate.is_some(),
+        "Live mode must keep baseline CD gate when deployments list is empty"
+    );
+}

@@ -227,6 +227,7 @@ impl Engine {
                 if self.mode == Mode::Live {
                     match subview {
                         SubView::Ci(CiSubView::QueueLogs) => {
+                            self.fetch(FetchKind::CiQueue, &mut fx);
                             self.fetch(FetchKind::ObsLogs, &mut fx);
                         }
                         SubView::Cd(CdSubView::IntegrationGate | CdSubView::DeploymentsSlots) => {
@@ -248,6 +249,7 @@ impl Engine {
                             self.fetch(FetchKind::ObsSmartscape, &mut fx);
                         }
                         SubView::Observe(ObserveSubView::PurePath) => {
+                            self.fetch(FetchKind::CiQueue, &mut fx);
                             self.fetch(FetchKind::ObsTraces, &mut fx);
                         }
                         SubView::Observe(ObserveSubView::ProblemsSlos) => {
@@ -357,6 +359,10 @@ impl Engine {
             self.fetch(FetchKind::AuthSession, fx);
             self.fetch(FetchKind::Repos, fx);
             self.fetch(FetchKind::ClusterNodes, fx);
+            self.fetch(FetchKind::CiQueue, fx);
+            self.fetch(FetchKind::ObsLogs, fx);
+            self.fetch(FetchKind::ObsStoreStatus, fx);
+            self.fetch(FetchKind::RegCasStatus, fx);
             for s in StreamId::ALL {
                 self.open_stream(s, fx);
             }
@@ -387,6 +393,10 @@ impl Engine {
                 self.fetch(FetchKind::AuthSession, fx);
                 self.fetch(FetchKind::Repos, fx);
                 self.fetch(FetchKind::ClusterNodes, fx);
+                self.fetch(FetchKind::CiQueue, fx);
+                self.fetch(FetchKind::ObsLogs, fx);
+                self.fetch(FetchKind::ObsStoreStatus, fx);
+                self.fetch(FetchKind::RegCasStatus, fx);
                 self.fetch_selection(fx);
             }
         }
@@ -417,6 +427,7 @@ impl Engine {
         let path = match &kind {
             FetchKind::Repos => paths::REPOS.to_owned(),
             FetchKind::ClusterNodes => paths::CLUSTER_NODES.to_owned(),
+            FetchKind::CiQueue => paths::CI_QUEUE.to_owned(),
             FetchKind::Summary(r) => paths::summary(&r.owner, &r.repo),
             FetchKind::Topology(r) => paths::topology(&r.owner, &r.repo),
             FetchKind::Deployments(r) => paths::deployments(&r.owner, &r.repo, HISTORY_LIMIT),
@@ -529,14 +540,14 @@ impl Engine {
         result: Result<String, HttpError>,
         now_ms: u64,
     ) -> Vec<Effect> {
-        if !matches!(
+        let is_selection_scoped = matches!(
             kind,
-            FetchKind::Repos
-                | FetchKind::ClusterNodes
-                | FetchKind::AuthSession
-                | FetchKind::AuthRedeem(_)
-        ) && gen != self.selection_gen
-        {
+            FetchKind::Summary(_)
+                | FetchKind::Topology(_)
+                | FetchKind::Deployments(_)
+                | FetchKind::Gate(_)
+        );
+        if is_selection_scoped && gen != self.selection_gen {
             return Vec::new();
         }
         self.on_fetch(kind, result, now_ms)
@@ -563,6 +574,7 @@ impl Engine {
                         | FetchKind::Gate(_)
                         | FetchKind::Leases
                         | FetchKind::ClusterNodes
+                        | FetchKind::CiQueue
                         | FetchKind::AuthSession
                         | FetchKind::RegPackages
                         | FetchKind::RegCanaries

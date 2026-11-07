@@ -2,7 +2,7 @@
 //! REST and SSE payload decoding into store [`Input`]s.
 
 use mu_console_protocol::dto::{
-    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto,
+    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
     ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseDto,
     LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
     PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoListResponseDto, RepoSummaryDto,
@@ -20,6 +20,7 @@ use crate::store::Input;
 pub enum FetchKind {
     Repos,
     ClusterNodes,
+    CiQueue,
     Summary(RepoId),
     Topology(RepoId),
     Deployments(RepoId),
@@ -216,6 +217,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             };
             Input::ClusterNodes(nodes)
         }
+        FetchKind::CiQueue => Input::CiQueue(json::<CiQueueDto>(body)?),
         FetchKind::Summary(_) => Input::Summary(json::<RepoSummaryDto>(body)?),
         FetchKind::Topology(_) => Input::Topology(json::<TopologyDto>(body)?),
         FetchKind::Deployments(repo) => Input::Deployments {
