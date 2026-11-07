@@ -845,6 +845,19 @@ impl Store {
         self.topologies.contains_key(repo)
     }
 
+    /// Latest known `job_id` for `repo` (from `/api/repos`, `/summary`, or `/topology`).
+    #[must_use]
+    pub fn repo_latest_job(&self, repo: &RepoId) -> Option<u64> {
+        self.repos
+            .get(repo)
+            .and_then(|r| r.latest_job_id)
+            .or_else(|| {
+                self.topologies
+                    .get(repo)
+                    .and_then(|t| t.t.trains.first().map(|tr| tr.job_id))
+            })
+    }
+
     /// Ordered repository ids.
     pub fn repo_ids(&self) -> impl Iterator<Item = &RepoId> {
         self.repos.keys()
@@ -960,13 +973,103 @@ impl Store {
                         sn.healthy = n.is_online;
                     } else {
                         self.observe.smartscape_nodes.push(SmartscapeNode {
-                            id: host_id,
+                            id: host_id.clone(),
                             label: host_label,
                             layer: SmartscapeLayer::Host,
                             req_per_sec_bp: cpu_load_bp,
                             error_rate_bp: 0,
                             p95_ms: 6,
                             healthy: n.is_online,
+                        });
+                    }
+                    let proc_id = format!("proc:action-runner@{clean_id}");
+                    let proc_label = format!(
+                        "action-runner ({clean_id}, {}/{} slots)",
+                        n.active_slots,
+                        n.max_slots.max(1)
+                    );
+                    if let Some(pn) = self
+                        .observe
+                        .smartscape_nodes
+                        .iter_mut()
+                        .find(|s| s.id == proc_id)
+                    {
+                        pn.label = proc_label;
+                        pn.req_per_sec_bp = cpu_load_bp.max(100);
+                        pn.healthy = n.is_online;
+                    } else {
+                        self.observe.smartscape_nodes.push(SmartscapeNode {
+                            id: proc_id.clone(),
+                            label: proc_label,
+                            layer: SmartscapeLayer::Process,
+                            req_per_sec_bp: cpu_load_bp.max(100),
+                            error_rate_bp: 0,
+                            p95_ms: 12,
+                            healthy: n.is_online,
+                        });
+                    }
+                    let svc_id = "svc:action-runner-controller";
+                    if !self
+                        .observe
+                        .smartscape_edges
+                        .iter()
+                        .any(|e| e.from_id == svc_id && e.to_id == proc_id)
+                    {
+                        self.observe.smartscape_edges.push(SmartscapeEdge {
+                            from_id: svc_id.into(),
+                            to_id: proc_id.clone(),
+                            protocol: "HTTPS/mTLS".into(),
+                            call_rate_rps: 4,
+                            error_rate_bp: 0,
+                            p95_ms: 8,
+                        });
+                    }
+                    if !self
+                        .observe
+                        .smartscape_edges
+                        .iter()
+                        .any(|e| e.from_id == proc_id && e.to_id == host_id)
+                    {
+                        self.observe.smartscape_edges.push(SmartscapeEdge {
+                            from_id: proc_id,
+                            to_id: host_id,
+                            protocol: "cgroupv2/MuIsolation".into(),
+                            call_rate_rps: 4,
+                            error_rate_bp: 0,
+                            p95_ms: 2,
+                        });
+                    }
+                }
+                if !self
+                    .observe
+                    .smartscape_nodes
+                    .iter()
+                    .any(|s| s.layer == SmartscapeLayer::Service)
+                {
+                    for (id, label, rps_bp, p95_ms) in [
+                        (
+                            "svc:action-runner-controller",
+                            "ActionRunner Controller (CI)",
+                            420,
+                            8,
+                        ),
+                        ("svc:muconde-controller", "MuConDe Controller (CD)", 120, 6),
+                        ("svc:muregist", "MuRegist Artifact CAS (REG)", 180, 5),
+                        (
+                            "svc:muobserve-collector",
+                            "MuObserve OTel Collector (OBS)",
+                            310,
+                            4,
+                        ),
+                    ] {
+                        self.observe.smartscape_nodes.push(SmartscapeNode {
+                            id: id.into(),
+                            label: label.into(),
+                            layer: SmartscapeLayer::Service,
+                            req_per_sec_bp: rps_bp,
+                            error_rate_bp: 0,
+                            p95_ms,
+                            healthy: true,
                         });
                     }
                 }
@@ -1338,6 +1441,18 @@ impl Store {
             }
             Input::JobDetail(rec) => {
                 self.loaded = true;
+                let rec = rec.into_unwrapped();
+                let trace = self.build_ci_trace_and_log(&rec, "Completed", 0);
+                if let Some(slot) = self
+                    .observe
+                    .traces
+                    .iter_mut()
+                    .find(|t| t.trace_id == trace.trace_id)
+                {
+                    *slot = trace;
+                } else {
+                    self.observe.traces.insert(0, trace);
+                }
                 let Some(summary) = self.ci_job_from_record(rec, None) else {
                     return false;
                 };
@@ -1348,7 +1463,12 @@ impl Store {
                     }
                     existing.commit_sha = summary.commit_sha;
                     existing.job_id_str = summary.job_id_str;
-                    existing.elapsed_secs = existing.elapsed_secs.max(summary.elapsed_secs);
+                    if summary.elapsed_secs > 0 {
+                        existing.elapsed_secs = summary.elapsed_secs;
+                    }
+                    if !summary.benchmark_summary.is_empty() {
+                        existing.benchmark_summary = summary.benchmark_summary;
+                    }
                     if summary.quality_score > 0 || summary.tests_total > 0 {
                         existing.quality_score = summary.quality_score;
                         existing.coverage_bp = summary.coverage_bp;
@@ -1561,6 +1681,140 @@ impl Store {
         })
     }
 
+    fn build_ci_trace_and_log(
+        &mut self,
+        rec: &CiQueueJobRecordDto,
+        q_hint: &str,
+        job_idx: usize,
+    ) -> PurePathTrace {
+        let short_job: String = if rec.job.commit_sha.len() >= 6 {
+            rec.job.commit_sha.chars().take(6).collect()
+        } else if !rec.job.id.is_empty() {
+            rec.job.id.chars().take(6).collect()
+        } else {
+            format!("{:04}", job_idx + 1)
+        };
+        let trace_id = format!("tr-ci-{short_job}");
+        let ref_clean = rec.job.ref_name.trim_start_matches("refs/heads/");
+        let repo_label = if rec.job.repo_name.contains('/') {
+            rec.job.repo_name.clone()
+        } else {
+            format!("LMA1980/{}", rec.job.repo_name)
+        };
+        let root_op = sanitize_public_log(&format!("ci.pipeline ({repo_label}) @{ref_clean}"));
+        let default_node = rec
+            .stages
+            .iter()
+            .find_map(|s| s.assigned_node.as_deref())
+            .unwrap_or("fabric-worker");
+        let node_hw = sanitize_public_log(default_node);
+        let mut offset_us = 0_u64;
+        let mut spans = Vec::with_capacity(rec.stages.len().max(1));
+        for (st_idx, st) in rec.stages.iter().enumerate() {
+            let dur_us = st
+                .status
+                .details
+                .duration_secs
+                .saturating_mul(1_000_000)
+                .max(50_000);
+            let span_id = format!("sp-{short_job}-{}", st_idx + 1);
+            let parent_span_id = (st_idx > 0).then(|| format!("sp-{short_job}-{st_idx}"));
+            let st_err =
+                st.status.state.eq_ignore_ascii_case("failed") || st.status.details.exit_code != 0;
+            let st_hw = st
+                .assigned_node
+                .as_deref()
+                .map_or_else(|| node_hw.clone(), sanitize_public_log);
+            spans.push(TraceSpan {
+                span_id,
+                parent_span_id,
+                service: "actionrunner-rs".into(),
+                operation: sanitize_public_log(&format!(
+                    "stage.{}",
+                    if st.name.is_empty() { &st.id } else { &st.name }
+                )),
+                start_offset_us: offset_us,
+                duration_us: dur_us,
+                self_time_us: dur_us,
+                critical_path: true,
+                error: st_err,
+                hardware_class: st_hw,
+            });
+            offset_us = offset_us.saturating_add(dur_us);
+        }
+        if spans.is_empty() {
+            spans.push(TraceSpan {
+                span_id: format!("sp-{short_job}-1"),
+                parent_span_id: None,
+                service: "actionrunner-controller".into(),
+                operation: "queue.dispatch".into(),
+                start_offset_us: 0,
+                duration_us: 100_000,
+                self_time_us: 100_000,
+                critical_path: true,
+                error: false,
+                hardware_class: node_hw.clone(),
+            });
+            offset_us = 100_000;
+        }
+        let duration_ms = u32::try_from((offset_us / 1_000).max(1)).unwrap_or(u32::MAX);
+        let is_err = spans.iter().any(|s| s.error);
+        let (cov_str, passed_t, total_t) = rec.metrics.as_ref().map_or_else(
+            || ("--".into(), 0, 0),
+            |m| {
+                (
+                    format!("{:.1}%", m.coverage_pct),
+                    m.tests_passed,
+                    m.tests_total,
+                )
+            },
+        );
+        let status_label = if is_err {
+            "FAILED"
+        } else if q_hint == "Active" {
+            "RUNNING"
+        } else if q_hint == "Queued" {
+            "QUEUED"
+        } else {
+            "PASSED"
+        };
+        let log_msg = sanitize_public_log(&format!(
+            "{repo_label} @{ref_clean} [{status_label}] stages={} tests={passed_t}/{total_t} cov={cov_str} on {node_hw}",
+            rec.stages.len(),
+        ));
+        if !self
+            .observe
+            .logs
+            .iter()
+            .any(|l| l.trace_id == trace_id && l.message == log_msg)
+        {
+            self.observe.logs.push(OtelLogEntry {
+                timestamp_ms: 1_700_000_900_u64.saturating_sub(u64::try_from(job_idx).unwrap_or(0)),
+                severity: if is_err {
+                    LogSeverity::Error
+                } else {
+                    LogSeverity::Info
+                },
+                service: "actionrunner-rs".into(),
+                span_id: Some(format!("sp-{short_job}-1")),
+                trace_id: trace_id.clone(),
+                message: log_msg,
+            });
+        }
+        PurePathTrace {
+            trace_id,
+            root_service: "actionrunner-controller".into(),
+            root_operation: root_op,
+            domain: "CI".into(),
+            duration_ms,
+            error: is_err,
+            slow_p99: duration_ms >= 30_000,
+            started_epoch_ms: 1_700_000_900_000_u64
+                .saturating_sub(u64::try_from(job_idx).unwrap_or(0) * 1_000),
+            spans,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn apply_ci_queue(&mut self, dto: CiQueueDto) -> bool {
         self.loaded = true;
@@ -1604,133 +1858,7 @@ impl Store {
                     next_jobs.push(summary);
                 }
             }
-            let short_job: String = if rec.job.commit_sha.len() >= 6 {
-                rec.job.commit_sha.chars().take(6).collect()
-            } else if !rec.job.id.is_empty() {
-                rec.job.id.chars().take(6).collect()
-            } else {
-                format!("{:04}", job_idx + 1)
-            };
-            let trace_id = format!("tr-ci-{short_job}");
-            let ref_clean = rec.job.ref_name.trim_start_matches("refs/heads/");
-            let repo_label = if rec.job.repo_name.contains('/') {
-                rec.job.repo_name.clone()
-            } else {
-                format!("LMA1980/{}", rec.job.repo_name)
-            };
-            let root_op = sanitize_public_log(&format!("ci.pipeline ({repo_label}) @{ref_clean}"));
-            let default_node = rec
-                .stages
-                .iter()
-                .find_map(|s| s.assigned_node.as_deref())
-                .unwrap_or("fabric-worker");
-            let node_hw = sanitize_public_log(default_node);
-            let mut offset_us = 0_u64;
-            let mut spans = Vec::with_capacity(rec.stages.len().max(1));
-            for (st_idx, st) in rec.stages.iter().enumerate() {
-                let dur_us = st
-                    .status
-                    .details
-                    .duration_secs
-                    .saturating_mul(1_000_000)
-                    .max(50_000);
-                let span_id = format!("sp-{short_job}-{}", st_idx + 1);
-                let parent_span_id = (st_idx > 0).then(|| format!("sp-{short_job}-{st_idx}"));
-                let st_err = st.status.state.eq_ignore_ascii_case("failed")
-                    || st.status.details.exit_code != 0;
-                let st_hw = st
-                    .assigned_node
-                    .as_deref()
-                    .map_or_else(|| node_hw.clone(), sanitize_public_log);
-                spans.push(TraceSpan {
-                    span_id,
-                    parent_span_id,
-                    service: "actionrunner-rs".into(),
-                    operation: sanitize_public_log(&format!(
-                        "stage.{}",
-                        if st.name.is_empty() { &st.id } else { &st.name }
-                    )),
-                    start_offset_us: offset_us,
-                    duration_us: dur_us,
-                    self_time_us: dur_us,
-                    critical_path: true,
-                    error: st_err,
-                    hardware_class: st_hw,
-                });
-                offset_us = offset_us.saturating_add(dur_us);
-            }
-            if spans.is_empty() {
-                spans.push(TraceSpan {
-                    span_id: format!("sp-{short_job}-1"),
-                    parent_span_id: None,
-                    service: "actionrunner-controller".into(),
-                    operation: "queue.dispatch".into(),
-                    start_offset_us: 0,
-                    duration_us: 100_000,
-                    self_time_us: 100_000,
-                    critical_path: true,
-                    error: false,
-                    hardware_class: node_hw.clone(),
-                });
-                offset_us = 100_000;
-            }
-            let duration_ms = u32::try_from((offset_us / 1_000).max(1)).unwrap_or(u32::MAX);
-            let is_err = spans.iter().any(|s| s.error);
-            live_traces.push(PurePathTrace {
-                trace_id: trace_id.clone(),
-                root_service: "actionrunner-controller".into(),
-                root_operation: root_op,
-                domain: "CI".into(),
-                duration_ms,
-                error: is_err,
-                slow_p99: duration_ms >= 30_000,
-                started_epoch_ms: 1_700_000_900_000_u64
-                    .saturating_sub(u64::try_from(job_idx).unwrap_or(0) * 1_000),
-                spans,
-            });
-            let (cov_str, passed_t, total_t) = rec.metrics.as_ref().map_or_else(
-                || ("--".into(), 0, 0),
-                |m| {
-                    (
-                        format!("{:.1}%", m.coverage_pct),
-                        m.tests_passed,
-                        m.tests_total,
-                    )
-                },
-            );
-            let status_label = if is_err {
-                "FAILED"
-            } else if q_hint == "Active" {
-                "RUNNING"
-            } else if q_hint == "Queued" {
-                "QUEUED"
-            } else {
-                "PASSED"
-            };
-            let log_msg = sanitize_public_log(&format!(
-                "{repo_label} @{ref_clean} [{status_label}] stages={} tests={passed_t}/{total_t} cov={cov_str} on {node_hw}",
-                rec.stages.len(),
-            ));
-            if !self
-                .observe
-                .logs
-                .iter()
-                .any(|l| l.trace_id == trace_id && l.message == log_msg)
-            {
-                self.observe.logs.push(OtelLogEntry {
-                    timestamp_ms: 1_700_000_900_u64
-                        .saturating_sub(u64::try_from(job_idx).unwrap_or(0)),
-                    severity: if is_err {
-                        LogSeverity::Error
-                    } else {
-                        LogSeverity::Info
-                    },
-                    service: "actionrunner-rs".into(),
-                    span_id: Some(format!("sp-{short_job}-1")),
-                    trace_id,
-                    message: log_msg,
-                });
-            }
+            live_traces.push(self.build_ci_trace_and_log(&rec, q_hint, job_idx));
         }
         self.ci_jobs = next_jobs;
         for existing in std::mem::take(&mut self.observe.traces) {
