@@ -103,6 +103,7 @@ pub struct Engine {
     conn: Option<ConnState>,
     badges: Option<AreaBadges>,
     asked_deployments: BTreeSet<String>,
+    asked_job_details: BTreeSet<u64>,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
 }
@@ -125,6 +126,7 @@ impl Engine {
             conn: None,
             badges: None,
             asked_deployments: BTreeSet::new(),
+            asked_job_details: BTreeSet::new(),
             selection_gen: 0,
             pending_select: None,
         }
@@ -675,9 +677,20 @@ impl Engine {
                     .filter(|j| j.raw_log_lines.is_empty())
                     .map(|j| j.job_id);
                 if let Some(job_id) = first_job {
+                    self.asked_job_details.insert(job_id);
                     self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                     if self.store.auth().is_operator() {
                         self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                    }
+                }
+            }
+            FetchKind::Summary(repo) | FetchKind::Topology(repo) => {
+                if let Some(job_id) = self.store.repo_latest_job(repo) {
+                    if job_id > 0 && self.asked_job_details.insert(job_id) {
+                        self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                        if self.store.auth().is_operator() {
+                            self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                        }
                     }
                 }
             }

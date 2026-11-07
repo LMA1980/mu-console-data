@@ -748,11 +748,21 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         ]
     }"#;
     let repo_a = RepoId::new("LMA1980", "engine");
-    eng.on_fetch_gen(
+    let sum_fx = eng.on_fetch_gen(
         eng.selection_gen(),
         &FetchKind::Summary(repo_a.clone()),
         Ok(summary_json.into()),
         28,
+    );
+    assert!(
+        sum_fx.iter().any(|e| matches!(
+            e,
+            Effect::Fetch {
+                kind: FetchKind::JobDetail(_),
+                ..
+            }
+        )),
+        "Summary hydration must automatically fetch JobDetail for the repo's latest_job_id"
     );
 
     // Empty arrays from RegPackages, RegCanaries, Leases, ObsProblems, and Deployments
@@ -819,6 +829,22 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         .traces
         .iter()
         .any(|t| t.trace_id == "tr-ci-af7344"));
+    assert!(v_after_log
+        .observe
+        .smartscape_nodes
+        .iter()
+        .any(|n| n.id == "svc:action-runner-controller"));
+    assert!(v_after_log
+        .observe
+        .smartscape_nodes
+        .iter()
+        .any(|n| n.id == "proc:action-runner@worker-riscv64"));
+    assert!(v_after_log
+        .observe
+        .smartscape_edges
+        .iter()
+        .any(|e| e.from_id == "svc:action-runner-controller"
+            && e.to_id == "proc:action-runner@worker-riscv64"));
     assert!(v_after_log.registry.packages.is_empty());
     assert!(v_after_log.registry.canaries.is_empty());
     assert!(v_after_log.leases.is_empty());
