@@ -38,6 +38,7 @@ pub enum FetchKind {
     ObsStoreStatus,
     AuthSession,
     AuthRedeem(String),
+    RestartJob(u64),
 }
 
 /// Alias for [`FetchKind`] used by protocol consumers.
@@ -347,6 +348,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
         FetchKind::AuthSession | FetchKind::AuthRedeem(_) => {
             Input::AuthSession(parse_auth_session(body.as_bytes())?)
         }
+        FetchKind::RestartJob(job_id) => Input::JobRestarted(*job_id),
     })
 }
 

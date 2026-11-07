@@ -285,7 +285,10 @@ impl Engine {
                 }
             }
             // UI-local in Phase 3; nothing to fetch.
-            UiCommand::Page { .. } | UiCommand::SetCrtFont(_) | UiCommand::Navigate { .. } => {}
+            UiCommand::Page { .. }
+            | UiCommand::SetCrtFont(_)
+            | UiCommand::SetSkin(_)
+            | UiCommand::Navigate { .. } => {}
             UiCommand::SetAuthSession(dto) => {
                 self.store.apply(Input::AuthSession(dto), now_ms);
             }
@@ -294,9 +297,13 @@ impl Engine {
                     self.fetch(FetchKind::AuthRedeem(token), &mut fx);
                 }
             }
-            UiCommand::RestartJob { job_id: _ } => {
+            UiCommand::RestartJob { job_id } => {
                 if self.store.auth().is_operator() {
-                    self.retry(now_ms, &mut fx);
+                    self.store.apply(Input::JobRestarted(job_id), now_ms);
+                    if self.mode == Mode::Live {
+                        self.fetch(FetchKind::RestartJob(job_id), &mut fx);
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                    }
                 } else {
                     fx.push(Effect::Post(DataEvent::Error(UiError::Http {
                         status: 403,
@@ -445,6 +452,7 @@ impl Engine {
             FetchKind::ObsStoreStatus => paths::OBS_STORE_STATUS.to_owned(),
             FetchKind::AuthSession => paths::AUTH_SESSION.to_owned(),
             FetchKind::AuthRedeem(_) => paths::AUTH_REDEEM.to_owned(),
+            FetchKind::RestartJob(job_id) => paths::job_restart(*job_id),
         };
         fx.push(Effect::Fetch {
             kind,
@@ -586,6 +594,7 @@ impl Engine {
                         | FetchKind::ObsLogs
                         | FetchKind::ObsMetrics
                         | FetchKind::ObsStoreStatus
+                        | FetchKind::RestartJob(_)
                 );
                 if !(is_optional_probe && matches!(e.status, 404 | 502 | 503)) {
                     fx.push(Effect::Post(DataEvent::Error(UiError::Http {

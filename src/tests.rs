@@ -748,3 +748,99 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         "Live mode must keep baseline CD gate when deployments list is empty"
     );
 }
+
+#[test]
+fn operator_restart_job_dispatches_post_and_transitions_failed_stages() {
+    use mu_console_protocol::{ConsoleSkin, StageState, UiError};
+
+    let mut eng = Engine::new(99);
+    let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // SetSkin is a UI-local preference and must be a clean no-op in the data worker.
+    assert!(eng
+        .handle(UiCommand::SetSkin(ConsoleSkin::Avionics), 5)
+        .is_empty());
+
+    // Anonymous RestartJob in Live mode must be rejected with 403 and emit no HTTP requests.
+    let anon_eff = eng.handle(UiCommand::RestartJob { job_id: 1_233 }, 10);
+    assert!(
+        !anon_eff.iter().any(|e| matches!(
+            e,
+            Effect::Fetch {
+                kind: FetchKind::RestartJob(_),
+                ..
+            }
+        )),
+        "anonymous caller must not dispatch RestartJob POST"
+    );
+    assert!(
+        anon_eff.iter().any(|e| matches!(
+            e,
+            Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
+        )),
+        "anonymous caller must receive 403 error"
+    );
+
+    // Promote Live session to Operator via AuthSession fetch response.
+    let _ = eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(
+            r#"{"authenticated":true,"invite_bound":true,"github_login":"LMA1980","role":"operator"}"#
+                .into(),
+        ),
+        15,
+    );
+    assert!(eng.store().auth().is_operator());
+
+    // Operator RestartJob in Live mode must dispatch POST /api/jobs/1233/restart.
+    let op_eff = eng.handle(UiCommand::RestartJob { job_id: 1_233 }, 20);
+    assert!(
+        op_eff.iter().any(|e| matches!(
+            e,
+            Effect::Fetch {
+                kind: FetchKind::RestartJob(1_233),
+                url,
+            } if url == "/api/jobs/1233/restart"
+        )),
+        "operator RestartJob must dispatch POST /api/jobs/1233/restart"
+    );
+
+    // Verify optimistic stage state transition (Failed -> Running) on stage-failure scenario.
+    let mut sc_eng = Engine::new(100);
+    let _ = sc_eng.handle(
+        UiCommand::Configure(WorkerConfig {
+            api_base: String::new(),
+            scenario: Some("stage-failure".into()),
+        }),
+        0,
+    );
+    while sc_eng.step_scenario() {}
+    let before_topo = sc_eng.store().view().topology.expect("topology");
+    let failed_job_id = before_topo
+        .trains
+        .iter()
+        .find(|t| t.stage_states.contains(&StageState::Failed))
+        .map(|t| t.job_id)
+        .expect("stage-failure train with Failed stage");
+    let _ = sc_eng.handle(
+        UiCommand::RestartJob {
+            job_id: failed_job_id,
+        },
+        30,
+    );
+    let after_topo = sc_eng
+        .store()
+        .view()
+        .topology
+        .expect("topology after restart");
+    let train_after = after_topo
+        .trains
+        .iter()
+        .find(|t| t.job_id == failed_job_id)
+        .expect("restarted train");
+    assert!(
+        !train_after.stage_states.contains(&StageState::Failed),
+        "restarted train must transition Failed stages to Running"
+    );
+    assert!(train_after.stage_states.contains(&StageState::Running));
+}
