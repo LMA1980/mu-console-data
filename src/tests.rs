@@ -771,6 +771,18 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     eng.on_fetch_gen(gen0, &FetchKind::RegCanaries, Ok("[]".into()), 31);
     eng.on_fetch_gen(gen0, &FetchKind::Leases, Ok("[]".into()), 32);
     eng.on_fetch_gen(gen0, &FetchKind::ObsProblems, Ok("[]".into()), 33);
+    eng.on_fetch_gen(
+        gen0,
+        &FetchKind::ObsLogs,
+        Ok(r#"{"severity":"all","total":1,"logs":[{"timestamp_ms":1793858300000,"trace_id":"0102030405060708090a0b0c0d0e0f12","span_id":"010203040506070a","severity_text":"INFO","service":"muobserve-collector","body":"Edge collector mTLS forwarding verified from worker-riscv64"}]}"#.into()),
+        34,
+    );
+    eng.on_fetch_gen(
+        gen0,
+        &FetchKind::ObsMetrics,
+        Ok(r#"{"metric":"all","window":"1h","series":[],"cluster_efficiency":[]}"#.into()),
+        34,
+    );
     eng.on_fetch(&FetchKind::Deployments(repo_a.clone()), Ok("[]".into()), 35);
 
     let v = eng.store().view();
@@ -845,6 +857,17 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         .iter()
         .any(|e| e.from_id == "svc:action-runner-controller"
             && e.to_id == "proc:action-runner@worker-riscv64"));
+    assert!(v_after_log
+        .observe
+        .logs
+        .iter()
+        .any(|l| l.service == "actionrunner-rs" && l.trace_id == "tr-ci-af7344"));
+    assert!(v_after_log
+        .observe
+        .logs
+        .iter()
+        .any(|l| l.service == "muobserve-collector"));
+    assert!(!v_after_log.observe.metrics.is_empty());
     assert!(v_after_log.registry.packages.is_empty());
     assert!(v_after_log.registry.canaries.is_empty());
     assert!(v_after_log.leases.is_empty());

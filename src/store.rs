@@ -1302,24 +1302,67 @@ impl Store {
                 self.loaded = true;
                 self.ensure_aux_defaults();
                 if !list.is_empty() {
-                    self.observe.logs = list
-                        .into_iter()
-                        .map(|l| OtelLogEntry {
-                            timestamp_ms: l.timestamp_ms,
-                            severity: l.severity,
-                            service: l.service,
-                            span_id: l.span_id,
-                            trace_id: l.trace_id,
-                            message: sanitize_public_log(&l.message),
-                        })
+                    let mut merged: Vec<OtelLogEntry> = self
+                        .observe
+                        .logs
+                        .drain(..)
+                        .filter(|l| l.trace_id.starts_with("tr-ci-") && l.trace_id != "tr-ci-1234")
                         .collect();
+                    for l in list {
+                        let clean_msg = sanitize_public_log(&l.message);
+                        let has_real_trace =
+                            !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
+                        if has_real_trace
+                            && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
+                        {
+                            self.observe.traces.push(PurePathTrace {
+                                trace_id: l.trace_id.clone(),
+                                root_service: l.service.clone(),
+                                root_operation: clean_msg.clone(),
+                                domain: "OBS".into(),
+                                duration_ms: 12,
+                                error: l.severity == LogSeverity::Error,
+                                slow_p99: false,
+                                started_epoch_ms: l.timestamp_ms,
+                                spans: vec![TraceSpan {
+                                    span_id: l
+                                        .span_id
+                                        .clone()
+                                        .unwrap_or_else(|| "sp-obs-log-1".into()),
+                                    parent_span_id: None,
+                                    service: l.service.clone(),
+                                    operation: clean_msg.clone(),
+                                    start_offset_us: 0,
+                                    duration_us: 12_000,
+                                    self_time_us: 12_000,
+                                    critical_path: true,
+                                    error: l.severity == LogSeverity::Error,
+                                    hardware_class: "fabric-collector".into(),
+                                }],
+                            });
+                        }
+                        if !merged
+                            .iter()
+                            .any(|e| e.trace_id == l.trace_id && e.message == clean_msg)
+                        {
+                            merged.push(OtelLogEntry {
+                                timestamp_ms: l.timestamp_ms,
+                                severity: l.severity,
+                                service: l.service,
+                                span_id: l.span_id,
+                                trace_id: l.trace_id,
+                                message: clean_msg,
+                            });
+                        }
+                    }
+                    self.observe.logs = merged;
                 }
                 true
             }
             Input::ObsMetrics(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if self.source == DataSource::Live || !list.is_empty() {
+                if !list.is_empty() {
                     self.observe.metrics = list
                         .into_iter()
                         .map(|m| HardwareMetricSeries {
@@ -1334,6 +1377,8 @@ impl Store {
                             samples: m.samples,
                         })
                         .collect();
+                } else {
+                    self.refresh_live_metrics();
                 }
                 true
             }
@@ -1838,6 +1883,14 @@ impl Store {
         if tagged_jobs.is_empty() {
             return false;
         }
+        if self.source == DataSource::Live {
+            self.observe.logs.retain(|l| {
+                !matches!(
+                    l.trace_id.as_str(),
+                    "tr-reg-taint-01" | "tr-obs-p99-07" | "tr-ci-1234" | "tr-cd-0042"
+                )
+            });
+        }
         let prev_jobs = std::mem::take(&mut self.ci_jobs);
         let mut next_jobs = Vec::with_capacity(tagged_jobs.len());
         let mut live_traces = Vec::with_capacity(tagged_jobs.len());
@@ -1861,13 +1914,98 @@ impl Store {
             live_traces.push(self.build_ci_trace_and_log(&rec, q_hint, job_idx));
         }
         self.ci_jobs = next_jobs;
+        if let Some(first_tr) = live_traces.first() {
+            let tid = first_tr.trace_id.clone();
+            for m in &mut self.observe.metrics {
+                if matches!(m.exemplar_trace_id.as_str(), "tr-obs-p99-07" | "tr-ci-1234") {
+                    m.exemplar_trace_id.clone_from(&tid);
+                }
+            }
+        }
         for existing in std::mem::take(&mut self.observe.traces) {
             if !live_traces.iter().any(|t| t.trace_id == existing.trace_id) {
                 live_traces.push(existing);
             }
         }
         self.observe.traces = live_traces;
+        self.refresh_live_metrics();
         true
+    }
+
+    fn refresh_live_metrics(&mut self) {
+        if self.source != DataSource::Live {
+            return;
+        }
+        let exemplar = self
+            .observe
+            .traces
+            .first()
+            .map_or_else(|| "tr-ci-live".into(), |t| t.trace_id.clone());
+        let mut stage_secs: Vec<u32> = self
+            .ci_jobs
+            .iter()
+            .flat_map(|j| j.stages.iter())
+            .filter_map(|s| u32::try_from(s.duration_secs).ok())
+            .filter(|&d| d > 0)
+            .take(12)
+            .collect();
+        if stage_secs.is_empty() {
+            stage_secs = self
+                .ci_jobs
+                .iter()
+                .filter_map(|j| u32::try_from(j.elapsed_secs).ok())
+                .filter(|&d| d > 0)
+                .take(8)
+                .collect();
+        }
+        if stage_secs.is_empty() {
+            stage_secs.push(12);
+        }
+        let mut sorted = stage_secs.clone();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+        let p99 = *sorted.last().unwrap_or(&p95);
+        let mut series = Vec::new();
+        series.push(HardwareMetricSeries {
+            service: "actionrunner-rs".into(),
+            hardware_class: "Fabric CI Stage Latency (max_slots=1, single-slot stages)".into(),
+            rps: u32::try_from(self.ci_jobs.len()).unwrap_or(1).max(1),
+            error_rate_bp: 0,
+            p50_ms: p50,
+            p95_ms: p95,
+            p99_ms: p99,
+            exemplar_trace_id: exemplar.clone(),
+            samples: stage_secs,
+        });
+        for n in self.nodes.values() {
+            let hw = if n.arch == "riscv64" {
+                format!(
+                    "{} ({} · SpacemiT K3 X100 VLEN=256 / A100 VLEN=1024)",
+                    n.id, n.arch
+                )
+            } else {
+                format!("{} ({} · max_slots={})", n.id, n.arch, n.max_slots.max(1))
+            };
+            let cpu_pct = (n.cpu_load_bp / 100).max(1);
+            let ram_pct = (n.ram_used_mb * 100)
+                .checked_div(n.ram_total_mb)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(10)
+                .max(1);
+            series.push(HardwareMetricSeries {
+                service: format!("node:{}", n.id),
+                hardware_class: hw,
+                rps: n.active_slots.max(1),
+                error_rate_bp: if n.online { 0 } else { 10_000 },
+                p50_ms: cpu_pct,
+                p95_ms: ram_pct,
+                p99_ms: ram_pct.max(cpu_pct),
+                exemplar_trace_id: exemplar.clone(),
+                samples: vec![cpu_pct, ram_pct, n.active_slots],
+            });
+        }
+        self.observe.metrics = series;
     }
 
     fn summary(&mut self, s: &RepoSummaryDto) -> bool {
