@@ -104,6 +104,7 @@ pub struct Engine {
     badges: Option<AreaBadges>,
     asked_deployments: BTreeSet<String>,
     asked_job_details: BTreeSet<u64>,
+    fallback_job_logs: BTreeSet<u64>,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
 }
@@ -127,6 +128,7 @@ impl Engine {
             badges: None,
             asked_deployments: BTreeSet::new(),
             asked_job_details: BTreeSet::new(),
+            fallback_job_logs: BTreeSet::new(),
             selection_gen: 0,
             pending_select: None,
         }
@@ -497,6 +499,16 @@ impl Engine {
         });
     }
 
+    fn fetch_obs_job_log(&mut self, job_id: u64, fx: &mut Vec<Effect>) {
+        self.fallback_job_logs.insert(job_id);
+        let jid = self.store.resolve_job_id_str(job_id);
+        let path = format!("/api/obs/v1/jobs/{jid}/log");
+        fx.push(Effect::Fetch {
+            kind: FetchKind::JobLog(job_id),
+            url: self.config.url(&path),
+        });
+    }
+
     fn open_stream(&mut self, s: StreamId, fx: &mut Vec<Effect>) {
         let path = match s {
             StreamId::Ci => paths::CI_EVENTS,
@@ -636,6 +648,12 @@ impl Engine {
                         | FetchKind::JobDetail(_)
                         | FetchKind::JobLog(_)
                 );
+                if let FetchKind::JobLog(job_id) = kind {
+                    if matches!(e.status, 401 | 403) && self.fallback_job_logs.insert(*job_id) {
+                        self.fetch_obs_job_log(*job_id, &mut fx);
+                        return fx;
+                    }
+                }
                 let is_auth_gated_log =
                     matches!(kind, FetchKind::JobLog(_)) && matches!(e.status, 401 | 403);
                 if !((is_optional_probe && matches!(e.status, 404 | 502 | 503))
@@ -687,6 +705,8 @@ impl Engine {
                     self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                     if self.store.auth().is_operator() {
                         self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                    } else {
+                        self.fetch_obs_job_log(job_id, &mut fx);
                     }
                 }
             }
@@ -696,6 +716,8 @@ impl Engine {
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                         if self.store.auth().is_operator() {
                             self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                        } else {
+                            self.fetch_obs_job_log(job_id, &mut fx);
                         }
                     }
                 }

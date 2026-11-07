@@ -828,6 +828,22 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     assert_eq!(v_after_log.ci_jobs[0].raw_log_lines.len(), 2);
     assert!(v_after_log.ci_jobs[0].raw_log_lines[0].contains(".../work/mu-console"));
 
+    // Verify anonymous 401 on /api/jobs/{id}/log automatically falls back to /api/obs/v1/jobs/{id}/log.
+    let second_u64 = v_after_log.ci_jobs[1].job_id;
+    let fb_fx = eng.on_fetch(
+        &FetchKind::JobLog(second_u64),
+        Err(HttpError {
+            status: 401,
+            message: "Unauthorized".into(),
+        }),
+        38,
+    );
+    assert!(fb_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind: FetchKind::JobLog(id), url }
+        if *id == second_u64 && url == "/api/obs/v1/jobs/job-1794054497-af7344e0/log"
+    )));
+
     let engine_repo = v_after_log
         .repos
         .iter()
