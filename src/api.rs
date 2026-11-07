@@ -109,14 +109,81 @@ enum PackagesEnvelope {
 }
 
 #[derive(Deserialize)]
+struct RawCanaryBundleDto {
+    bundle_id: String,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default, alias = "service_name")]
+    service: Option<String>,
+    #[serde(default, alias = "binary_digest")]
+    artifact_digest: Option<String>,
+    #[serde(default, alias = "status")]
+    state: Option<String>,
+    #[serde(default)]
+    taint_reason: Option<String>,
+    #[serde(default)]
+    deployment_id: Option<String>,
+    #[serde(default)]
+    trace_id: Option<String>,
+}
+
+fn parse_canary_state(raw: Option<&str>) -> CanaryBundleState {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "promoted" | "active" | "healthy" => CanaryBundleState::Promoted,
+        "tainted" => CanaryBundleState::Tainted,
+        "rolled_back" | "rolled back" => CanaryBundleState::RolledBack,
+        _ => CanaryBundleState::Candidate,
+    }
+}
+
+impl From<RawCanaryBundleDto> for CanaryBundleDto {
+    fn from(r: RawCanaryBundleDto) -> Self {
+        let raw_digest = r.artifact_digest.unwrap_or_default();
+        let hex_part = raw_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&raw_digest)
+            .to_string();
+        let artifact_digest = if !raw_digest.starts_with("sha256:") && hex_part.len() >= 12 {
+            format!("sha256:{}", &hex_part[..12])
+        } else {
+            raw_digest
+        };
+        let bundle_id = if let Some(uuid) = r.bundle_id.strip_prefix("bundle-") {
+            let short: String = uuid.chars().take(4).collect();
+            format!("cny-{short}")
+        } else {
+            r.bundle_id
+        };
+        let deployment_id = match r.deployment_id {
+            Some(d) if !d.is_empty() => d,
+            _ if hex_part.len() >= 4 => format!("dep-{}", &hex_part[..4]),
+            _ => "dep-live".into(),
+        };
+        Self {
+            bundle_id,
+            owner: r.owner.unwrap_or_default(),
+            repo: r.repo.unwrap_or_default(),
+            service: r.service.unwrap_or_default(),
+            artifact_digest,
+            state: parse_canary_state(r.state.as_deref()),
+            taint_reason: r.taint_reason,
+            deployment_id,
+            trace_id: r.trace_id.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum CanariesEnvelope {
-    List(Vec<CanaryBundleDto>),
+    List(Vec<RawCanaryBundleDto>),
     Envelope {
         #[serde(default)]
-        bundles: Vec<CanaryBundleDto>,
+        bundles: Vec<RawCanaryBundleDto>,
         #[serde(default)]
-        canaries: Vec<CanaryBundleDto>,
+        canaries: Vec<RawCanaryBundleDto>,
         #[serde(default)]
         taints: Vec<TaintedDigestDto>,
     },
@@ -255,7 +322,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
         }
         FetchKind::RegCanaries => {
             let list = match json::<CanariesEnvelope>(body)? {
-                CanariesEnvelope::List(v) => v,
+                CanariesEnvelope::List(v) => v.into_iter().map(CanaryBundleDto::from).collect(),
                 CanariesEnvelope::Envelope {
                     mut bundles,
                     canaries,
@@ -264,16 +331,21 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                     if bundles.is_empty() {
                         bundles = canaries;
                     }
+                    let mut out: Vec<CanaryBundleDto> =
+                        bundles.into_iter().map(CanaryBundleDto::from).collect();
                     for t in taints {
-                        if let Some(existing) =
-                            bundles.iter_mut().find(|b| b.artifact_digest == t.digest)
-                        {
+                        let t_hex = t.digest.strip_prefix("sha256:").unwrap_or(&t.digest);
+                        let t_prefix = &t_hex[..t_hex.len().min(12)];
+                        if let Some(existing) = out.iter_mut().find(|b| {
+                            b.artifact_digest == t.digest
+                                || (!t_prefix.is_empty() && b.artifact_digest.ends_with(t_prefix))
+                        }) {
                             existing.state = CanaryBundleState::Tainted;
                             if existing.taint_reason.is_none() && !t.reason.is_empty() {
                                 existing.taint_reason = Some(t.reason);
                             }
                         } else {
-                            bundles.push(CanaryBundleDto {
+                            out.push(CanaryBundleDto {
                                 bundle_id: t.digest.chars().take(12).collect(),
                                 owner: "LMA1980".into(),
                                 repo: t.service.clone(),
@@ -286,7 +358,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                             });
                         }
                     }
-                    bundles
+                    out
                 }
             };
             Input::RegCanaries(list)
@@ -862,11 +934,11 @@ pub(crate) mod tests {
           "total_taints": 1,
           "bundles": [
             {
-              "bundle_id": "cny-042",
-              "service_name": "muconde-agent",
-              "binary_digest": "sha256:9f82c01a334e",
-              "status": "promoted",
-              "trace_id": "tr-cd-0042"
+              "bundle_id": "bundle-fa2bf3e5-3b69-41ac-8150-c7260b34c3cb",
+              "service_name": "mu-console",
+              "binary_digest": "ed4ef429ff61329f9f31d6574c772db3263e65925d76fb979e54b58aa74ec60c",
+              "status": "healthy",
+              "trace_id": "2c845aa5d1e5b27cf613a435ab41f3f1"
             }
           ],
           "taints": [
@@ -884,6 +956,9 @@ pub(crate) mod tests {
             panic!("kind");
         };
         assert_eq!(canaries.len(), 2);
+        assert_eq!(canaries[0].bundle_id, "cny-fa2b");
+        assert_eq!(canaries[0].artifact_digest, "sha256:ed4ef429ff61");
+        assert_eq!(canaries[0].deployment_id, "dep-ed4e");
         assert_eq!(canaries[0].state, CanaryBundleState::Promoted);
         assert_eq!(canaries[1].state, CanaryBundleState::Tainted);
 
