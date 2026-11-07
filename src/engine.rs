@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use mu_console_protocol::dto::paths;
 use mu_console_protocol::{
-    decode, encode, AreaBadges, CdSubView, CodecError, ConnState, DataEvent, DataSource,
+    decode, encode, AreaBadges, CdSubView, CiSubView, CodecError, ConnState, DataEvent, DataSource,
     ObserveSubView, RegistrySubView, RepoId, Selection, SubView, UiCommand, UiError, WorkerConfig,
     PROTOCOL_VERSION,
 };
@@ -214,6 +214,11 @@ impl Engine {
                         &mut fx,
                     );
                 }
+                if self.mode == Mode::Live {
+                    if let Some(tid) = route.trace_id {
+                        self.fetch(FetchKind::ObsTraceDetail(tid), &mut fx);
+                    }
+                }
             }
             UiCommand::SelectRepo { repo, submodule } => {
                 self.select(Selection { repo, submodule }, now_ms, &mut fx);
@@ -221,6 +226,12 @@ impl Engine {
             UiCommand::SelectSubView(subview) => {
                 if self.mode == Mode::Live {
                     match subview {
+                        SubView::Ci(CiSubView::QueueLogs) => {
+                            self.fetch(FetchKind::ObsLogs, &mut fx);
+                        }
+                        SubView::Cd(CdSubView::IntegrationGate | CdSubView::DeploymentsSlots) => {
+                            self.fetch_selection(&mut fx);
+                        }
                         SubView::Cd(CdSubView::ActiveLeases) => {
                             self.fetch(FetchKind::Leases, &mut fx);
                         }
@@ -251,7 +262,10 @@ impl Engine {
                         SubView::Observe(ObserveSubView::DataStore) => {
                             self.fetch(FetchKind::ObsStoreStatus, &mut fx);
                         }
-                        _ => {}
+                        SubView::Fleet(_) => {
+                            self.fetch(FetchKind::ClusterNodes, &mut fx);
+                        }
+                        SubView::Ci(_) => {}
                     }
                 }
             }
@@ -342,6 +356,7 @@ impl Engine {
             fx.push(Effect::LoadOffline);
             self.fetch(FetchKind::AuthSession, fx);
             self.fetch(FetchKind::Repos, fx);
+            self.fetch(FetchKind::ClusterNodes, fx);
             for s in StreamId::ALL {
                 self.open_stream(s, fx);
             }
@@ -371,6 +386,7 @@ impl Engine {
                 }
                 self.fetch(FetchKind::AuthSession, fx);
                 self.fetch(FetchKind::Repos, fx);
+                self.fetch(FetchKind::ClusterNodes, fx);
                 self.fetch_selection(fx);
             }
         }
@@ -400,6 +416,7 @@ impl Engine {
     fn fetch(&self, kind: FetchKind, fx: &mut Vec<Effect>) {
         let path = match &kind {
             FetchKind::Repos => paths::REPOS.to_owned(),
+            FetchKind::ClusterNodes => paths::CLUSTER_NODES.to_owned(),
             FetchKind::Summary(r) => paths::summary(&r.owner, &r.repo),
             FetchKind::Topology(r) => paths::topology(&r.owner, &r.repo),
             FetchKind::Deployments(r) => paths::deployments(&r.owner, &r.repo, HISTORY_LIMIT),
@@ -462,6 +479,11 @@ impl Engine {
                 }
             }
             Mode::Live => {
+                let ci = &self.streams[StreamId::Ci.index()];
+                let cd = &self.streams[StreamId::Cd.index()];
+                if ci.open && (cd.open || cd.backoff.attempt() > 0) {
+                    return ConnState::Live;
+                }
                 let worst = self
                     .streams
                     .iter()
@@ -509,7 +531,10 @@ impl Engine {
     ) -> Vec<Effect> {
         if !matches!(
             kind,
-            FetchKind::Repos | FetchKind::AuthSession | FetchKind::AuthRedeem(_)
+            FetchKind::Repos
+                | FetchKind::ClusterNodes
+                | FetchKind::AuthSession
+                | FetchKind::AuthRedeem(_)
         ) && gen != self.selection_gen
         {
             return Vec::new();
@@ -531,10 +556,26 @@ impl Engine {
         let body = match result {
             Ok(b) => b,
             Err(e) => {
-                // A 404 for a single repo's CD history or auth session probe is non-fatal.
-                if !(e.status == 404
-                    && matches!(kind, FetchKind::Deployments(_) | FetchKind::AuthSession))
-                {
+                // Non-fatal 404/502/503 on optional auxiliary daemon probes.
+                let is_optional_probe = matches!(
+                    kind,
+                    FetchKind::Deployments(_)
+                        | FetchKind::Gate(_)
+                        | FetchKind::Leases
+                        | FetchKind::ClusterNodes
+                        | FetchKind::AuthSession
+                        | FetchKind::RegPackages
+                        | FetchKind::RegCanaries
+                        | FetchKind::RegCasStatus
+                        | FetchKind::ObsSmartscape
+                        | FetchKind::ObsProblems
+                        | FetchKind::ObsTraces
+                        | FetchKind::ObsTraceDetail(_)
+                        | FetchKind::ObsLogs
+                        | FetchKind::ObsMetrics
+                        | FetchKind::ObsStoreStatus
+                );
+                if !(is_optional_probe && matches!(e.status, 404 | 502 | 503)) {
                     fx.push(Effect::Post(DataEvent::Error(UiError::Http {
                         status: e.status,
                         message: e.message,
@@ -569,6 +610,19 @@ impl Engine {
                 self.update_conn(now_ms, &mut fx);
             }
             FetchKind::Deployments(repo) => self.fetch_latest_gate(repo, &mut fx),
+            FetchKind::ObsTraces => {
+                let first_empty_tid = self
+                    .store
+                    .view()
+                    .observe
+                    .traces
+                    .iter()
+                    .find(|t| t.spans.is_empty())
+                    .map(|t| t.trace_id.clone());
+                if let Some(tid) = first_empty_tid {
+                    self.fetch(FetchKind::ObsTraceDetail(tid), &mut fx);
+                }
+            }
             FetchKind::AuthRedeem(_) if self.store.auth().is_operator() => {
                 self.fetch(FetchKind::Repos, &mut fx);
                 self.fetch_selection(&mut fx);
@@ -645,24 +699,31 @@ impl Engine {
         if self.mode != Mode::Live {
             return fx;
         }
+        let ci_open = self.streams[StreamId::Ci.index()].open;
         let st = &mut self.streams[s.index()];
         st.open = false;
         let delay = st.backoff.next_delay_ms();
         let attempt = st.backoff.attempt();
         st.reconnect_at = Some(now_ms + u64::from(delay));
         if let Some(msg) = error {
-            fx.push(Effect::Post(DataEvent::Error(UiError::Stream(msg))));
+            if !(s == StreamId::Cd && ci_open) {
+                fx.push(Effect::Post(DataEvent::Error(UiError::Stream(msg))));
+            }
         }
         if !self.out.is_hidden() {
-            let state = if attempt >= OFFLINE_AFTER_ATTEMPTS && !self.store.has_live_data() {
-                ConnState::Offline
+            if s == StreamId::Cd && ci_open {
+                self.update_conn(now_ms, &mut fx);
             } else {
-                ConnState::Reconnecting {
-                    attempt,
-                    retry_in_ms: delay,
-                }
-            };
-            self.set_conn(state, &mut fx);
+                let state = if attempt >= OFFLINE_AFTER_ATTEMPTS && !self.store.has_live_data() {
+                    ConnState::Offline
+                } else {
+                    ConnState::Reconnecting {
+                        attempt,
+                        retry_in_ms: delay,
+                    }
+                };
+                self.set_conn(state, &mut fx);
+            }
         }
         fx
     }

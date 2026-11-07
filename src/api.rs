@@ -3,12 +3,13 @@
 
 use mu_console_protocol::dto::{
     AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto,
-    DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseDto, LeaseExpiredDto,
-    MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto, PrStateChangedDto,
-    ProblemDto, PromotedDto, RepoDto, RepoListResponseDto, RepoSummaryDto, RolledBackDto,
-    SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
+    ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseDto,
+    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
+    PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoListResponseDto, RepoSummaryDto,
+    RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto, TopologyDto,
+    TraceDto,
 };
-use mu_console_protocol::{CdLease, RepoId};
+use mu_console_protocol::{CanaryBundleState, CdLease, RepoId};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
@@ -18,6 +19,7 @@ use crate::store::Input;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchKind {
     Repos,
+    ClusterNodes,
     Summary(RepoId),
     Topology(RepoId),
     Deployments(RepoId),
@@ -81,10 +83,123 @@ enum ReposEnvelope {
     Envelope(RepoListResponseDto),
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClusterNodesEnvelope {
+    List(Vec<ClusterNodeDto>),
+    Envelope {
+        #[serde(default)]
+        nodes: Vec<ClusterNodeDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PackagesEnvelope {
+    List(Vec<PackageDto>),
+    Envelope {
+        #[serde(default)]
+        packages: Vec<PackageDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CanariesEnvelope {
+    List(Vec<CanaryBundleDto>),
+    Envelope {
+        #[serde(default)]
+        bundles: Vec<CanaryBundleDto>,
+        #[serde(default)]
+        canaries: Vec<CanaryBundleDto>,
+        #[serde(default)]
+        taints: Vec<TaintedDigestDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProblemsEnvelope {
+    List(Vec<ProblemDto>),
+    Envelope {
+        #[serde(default)]
+        problems: Vec<ProblemDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TracesEnvelope {
+    List(Vec<TraceDto>),
+    Envelope {
+        #[serde(default)]
+        traces: Vec<TraceDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LogsEnvelope {
+    List(Vec<OtelLogDto>),
+    Envelope {
+        #[serde(default)]
+        logs: Vec<OtelLogDto>,
+    },
+}
+
+#[derive(Deserialize)]
+struct ClusterEfficiencyDto {
+    #[serde(default)]
+    arch: String,
+    #[serde(default)]
+    cpu_cluster: String,
+    #[serde(default)]
+    vlen_bits: u32,
+    #[serde(default)]
+    run_count: u32,
+    #[serde(default)]
+    avg_ns_per_iter: f64,
+    #[serde(default)]
+    min_ns_per_iter: f64,
+    #[serde(default)]
+    max_ns_per_iter: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MetricsEnvelope {
+    List(Vec<MetricSeriesDto>),
+    Envelope {
+        #[serde(default)]
+        series: Vec<MetricSeriesDto>,
+        #[serde(default)]
+        cluster_efficiency: Vec<ClusterEfficiencyDto>,
+    },
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ns_to_ms(ns: f64) -> u32 {
+    if ns <= 0.0 || ns.is_nan() {
+        0
+    } else {
+        (ns / 1_000_000.0).round().max(1.0) as u32
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ns_to_u32(ns: f64) -> u32 {
+    if ns <= 0.0 || ns.is_nan() {
+        0
+    } else {
+        ns.round() as u32
+    }
+}
+
 /// Decode a REST response body.
 ///
 /// # Errors
 /// Returns the JSON error message.
+#[allow(clippy::too_many_lines)]
 pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
     Ok(match kind {
         FetchKind::Repos => {
@@ -93,6 +208,13 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                 ReposEnvelope::Envelope(e) => e.repos,
             };
             Input::Repos(repos)
+        }
+        FetchKind::ClusterNodes => {
+            let nodes = match json::<ClusterNodesEnvelope>(body)? {
+                ClusterNodesEnvelope::List(v) => v,
+                ClusterNodesEnvelope::Envelope { nodes } => nodes,
+            };
+            Input::ClusterNodes(nodes)
         }
         FetchKind::Summary(_) => Input::Summary(json::<RepoSummaryDto>(body)?),
         FetchKind::Topology(_) => Input::Topology(json::<TopologyDto>(body)?),
@@ -118,15 +240,107 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                 .collect();
             Input::Leases(leases)
         }
-        FetchKind::RegPackages => Input::RegPackages(json::<Vec<PackageDto>>(body)?),
-        FetchKind::RegCanaries => Input::RegCanaries(json::<Vec<CanaryBundleDto>>(body)?),
+        FetchKind::RegPackages => {
+            let pkgs = match json::<PackagesEnvelope>(body)? {
+                PackagesEnvelope::List(v) => v,
+                PackagesEnvelope::Envelope { packages } => packages,
+            };
+            Input::RegPackages(pkgs)
+        }
+        FetchKind::RegCanaries => {
+            let list = match json::<CanariesEnvelope>(body)? {
+                CanariesEnvelope::List(v) => v,
+                CanariesEnvelope::Envelope {
+                    mut bundles,
+                    canaries,
+                    taints,
+                } => {
+                    if bundles.is_empty() {
+                        bundles = canaries;
+                    }
+                    for t in taints {
+                        if let Some(existing) =
+                            bundles.iter_mut().find(|b| b.artifact_digest == t.digest)
+                        {
+                            existing.state = CanaryBundleState::Tainted;
+                            if existing.taint_reason.is_none() && !t.reason.is_empty() {
+                                existing.taint_reason = Some(t.reason);
+                            }
+                        } else {
+                            bundles.push(CanaryBundleDto {
+                                bundle_id: t.digest.chars().take(12).collect(),
+                                owner: "LMA1980".into(),
+                                repo: t.service.clone(),
+                                service: t.service,
+                                artifact_digest: t.digest,
+                                state: CanaryBundleState::Tainted,
+                                taint_reason: (!t.reason.is_empty()).then_some(t.reason),
+                                deployment_id: String::new(),
+                                trace_id: t.trace_id,
+                            });
+                        }
+                    }
+                    bundles
+                }
+            };
+            Input::RegCanaries(list)
+        }
         FetchKind::RegCasStatus => Input::RegCasStatus(json::<CasStatusDto>(body)?),
         FetchKind::ObsSmartscape => Input::ObsSmartscape(json::<SmartscapeDto>(body)?),
-        FetchKind::ObsProblems => Input::ObsProblems(json::<Vec<ProblemDto>>(body)?),
-        FetchKind::ObsTraces => Input::ObsTraces(json::<Vec<TraceDto>>(body)?),
+        FetchKind::ObsProblems => {
+            let list = match json::<ProblemsEnvelope>(body)? {
+                ProblemsEnvelope::List(v) => v,
+                ProblemsEnvelope::Envelope { problems } => problems,
+            };
+            Input::ObsProblems(list)
+        }
+        FetchKind::ObsTraces => {
+            let list = match json::<TracesEnvelope>(body)? {
+                TracesEnvelope::List(v) => v,
+                TracesEnvelope::Envelope { traces } => traces,
+            };
+            Input::ObsTraces(list)
+        }
         FetchKind::ObsTraceDetail(_) => Input::ObsTraceDetail(json::<TraceDto>(body)?),
-        FetchKind::ObsLogs => Input::ObsLogs(json::<Vec<OtelLogDto>>(body)?),
-        FetchKind::ObsMetrics => Input::ObsMetrics(json::<Vec<MetricSeriesDto>>(body)?),
+        FetchKind::ObsLogs => {
+            let list = match json::<LogsEnvelope>(body)? {
+                LogsEnvelope::List(v) => v,
+                LogsEnvelope::Envelope { logs } => logs,
+            };
+            Input::ObsLogs(list)
+        }
+        FetchKind::ObsMetrics => {
+            let list = match json::<MetricsEnvelope>(body)? {
+                MetricsEnvelope::List(v) => v,
+                MetricsEnvelope::Envelope {
+                    mut series,
+                    cluster_efficiency,
+                } => {
+                    for ce in cluster_efficiency {
+                        series.push(MetricSeriesDto {
+                            service: format!("bench ({})", ce.arch),
+                            hardware_class: format!(
+                                "{} {} (VLEN={})",
+                                ce.arch, ce.cpu_cluster, ce.vlen_bits
+                            ),
+                            rps: ce.run_count,
+                            error_rate_bp: 0,
+                            p50_ms: ns_to_ms(ce.min_ns_per_iter),
+                            p95_ms: ns_to_ms(ce.avg_ns_per_iter),
+                            p99_ms: ns_to_ms(ce.max_ns_per_iter),
+                            exemplar_trace_id: "tr-obs-p99-07".into(),
+                            samples: vec![
+                                ns_to_u32(ce.min_ns_per_iter),
+                                ns_to_u32(ce.avg_ns_per_iter),
+                                ns_to_u32(ce.max_ns_per_iter),
+                            ],
+                        });
+                    }
+                    series
+                }
+            };
+            Input::ObsMetrics(list)
+        }
         FetchKind::ObsStoreStatus => Input::ObsStoreStatus(json::<StoreStatusDto>(body)?),
         FetchKind::AuthSession | FetchKind::AuthRedeem(_) => {
             Input::AuthSession(parse_auth_session(body.as_bytes())?)
@@ -587,5 +801,112 @@ pub(crate) mod tests {
         )
         .expect("lease_expired");
         assert!(matches!(le_ev, Some(Input::LeaseExpired(l)) if l.deployment_id == "dep-7f3c"));
+    }
+
+    #[test]
+    fn muregist_and_muobserve_contract_samples_deserialize() {
+        let cluster_nodes = r#"[
+          {"node_id":"node-a","arch":"x86_64","active_slots":0,"max_slots":1,"is_online":true,"cpu_load_pct":4.2,"ram_used_mb":512,"ram_total_mb":16000},
+          {"node_id":"worker-riscv64","arch":"riscv64","active_slots":0,"max_slots":1,"is_online":true,"cpu_load_pct":8.1,"ram_used_mb":1024,"ram_total_mb":32000}
+        ]"#;
+        let Input::ClusterNodes(nodes) =
+            parse_fetch(&FetchKind::ClusterNodes, cluster_nodes).expect("cluster nodes")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].is_online);
+
+        let reg_pkgs = r#"{
+          "ecosystem": "all",
+          "total": 1,
+          "packages": [
+            {
+              "ecosystem": "cargo",
+              "name": "muisolation",
+              "latest_version": "0.4.2",
+              "sha256": "4a8b91e0c21f00112233",
+              "yanked": false,
+              "tainted": false,
+              "dependency_count": 4
+            }
+          ]
+        }"#;
+        let Input::RegPackages(pkgs) =
+            parse_fetch(&FetchKind::RegPackages, reg_pkgs).expect("reg packages")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].effective_sha256_prefix(), "4a8b91e0");
+        assert_eq!(pkgs[0].deps_count, 4);
+
+        let reg_canaries = r#"{
+          "status": "all",
+          "total_bundles": 1,
+          "total_taints": 1,
+          "bundles": [
+            {
+              "bundle_id": "cny-042",
+              "service_name": "muconde-agent",
+              "binary_digest": "sha256:9f82c01a334e",
+              "status": "promoted",
+              "trace_id": "tr-cd-0042"
+            }
+          ],
+          "taints": [
+            {
+              "digest": "sha256:deadbeef9012",
+              "service_name": "muregist",
+              "reason": "IT regression",
+              "trace_id": "tr-reg-taint-01"
+            }
+          ]
+        }"#;
+        let Input::RegCanaries(canaries) =
+            parse_fetch(&FetchKind::RegCanaries, reg_canaries).expect("reg canaries")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(canaries.len(), 2);
+        assert_eq!(canaries[0].state, CanaryBundleState::Promoted);
+        assert_eq!(canaries[1].state, CanaryBundleState::Tainted);
+
+        let obs_smartscape = r#"{
+          "window_secs": 300,
+          "services": [{"id":"svc:muregist","name":"muregist","request_rate_rps":8.9,"error_rate_pct":0.12,"p95_latency_ms":11.2,"health_state":"healthy"}],
+          "processes": [{"id":"proc:muregist@node-a","name":"muregist-daemon","health_state":"healthy"}],
+          "hosts": [{"id":"host:node-a","name":"node-a","health_state":"healthy"}],
+          "edges": [{"source":"svc:muregist","target":"proc:muregist@node-a","relation":"calls","request_rate_rps":8.9,"error_rate_pct":0.12,"p95_latency_ms":11.2}]
+        }"#;
+        let Input::ObsSmartscape(sm) =
+            parse_fetch(&FetchKind::ObsSmartscape, obs_smartscape).expect("obs smartscape")
+        else {
+            panic!("kind");
+        };
+        let (sm_nodes, sm_edges) = sm.into_nodes_and_edges();
+        assert_eq!(sm_nodes.len(), 3);
+        assert_eq!(sm_edges.len(), 1);
+        assert_eq!(sm_nodes[0].effective_req_per_sec_bp(), 890);
+
+        let obs_metrics = r#"{
+          "metric": "latency",
+          "window": "1h",
+          "window_secs": 3600,
+          "total": 0,
+          "series": [],
+          "cluster_efficiency": [
+            {"arch":"riscv64","cpu_cluster":"A100","vlen_bits":1024,"run_count":42,"avg_ns_per_iter":14000000.0,"min_ns_per_iter":11000000.0,"max_ns_per_iter":17000000.0}
+          ]
+        }"#;
+        let Input::ObsMetrics(metrics) =
+            parse_fetch(&FetchKind::ObsMetrics, obs_metrics).expect("obs metrics")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].p50_ms, 11);
+        assert_eq!(metrics[0].p95_ms, 14);
+        assert_eq!(metrics[0].p99_ms, 17);
     }
 }

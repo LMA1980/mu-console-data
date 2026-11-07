@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 
 use mu_console_protocol::dto::{
     AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto,
-    DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseExpiredDto, MetricSeriesDto,
-    NodeMembershipChangedDto, OtelLogDto, PackageDto, PrStateChangedDto, ProblemDto, PromotedDto,
-    RepoDto, RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto,
-    TraceDto,
+    ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto, LeaseExpiredDto,
+    MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto, PrStateChangedDto,
+    ProblemDto, PromotedDto, RepoDto, RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto,
+    TaintedDto, TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
     sanitize_public_log, AreaBadges, AuthState, Branch, CanaryBundle, CanaryBundleState, CasHealth,
@@ -34,6 +34,7 @@ pub const FADE_MS: u64 = 2_000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     Repos(Vec<RepoDto>),
+    ClusterNodes(Vec<ClusterNodeDto>),
     Summary(RepoSummaryDto),
     Topology(TopologyDto),
     Deployments {
@@ -862,6 +863,21 @@ impl Store {
     pub fn apply(&mut self, input: Input, now_ms: u64) -> bool {
         let changed = match input {
             Input::Repos(list) => self.repos_loaded(list),
+            Input::ClusterNodes(list) => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                for n in list {
+                    let clean_id = sanitize_public_log(&n.node_id);
+                    self.nodes.insert(
+                        clean_id.clone(),
+                        FabricNode {
+                            id: clean_id,
+                            online: n.is_online,
+                        },
+                    );
+                }
+                true
+            }
             Input::Summary(s) => self.summary(&s),
             Input::Topology(t) => self.topology(t),
             Input::Deployments { repo, list } => self.deployments(&repo, &list),
@@ -889,17 +905,28 @@ impl Store {
                 self.ensure_aux_defaults();
                 self.registry.packages = list
                     .into_iter()
-                    .map(|d| RegistryPackage {
-                        ecosystem: d.ecosystem,
-                        name: d.name,
-                        latest_version: d.latest_version,
-                        versions_count: d.versions_count,
-                        sha256_prefix: d.sha256_prefix,
-                        deps_count: d.deps_count,
-                        yanked: d.yanked,
-                        tainted: d.tainted,
-                        taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
-                        versions: d.versions,
+                    .map(|d| {
+                        let sha256_prefix = d.effective_sha256_prefix();
+                        let versions = if d.versions.is_empty() && !d.latest_version.is_empty() {
+                            vec![d.latest_version.clone()]
+                        } else {
+                            d.versions
+                        };
+                        let versions_count = d
+                            .versions_count
+                            .max(u32::try_from(versions.len()).unwrap_or(0).max(1));
+                        RegistryPackage {
+                            ecosystem: d.ecosystem,
+                            name: d.name,
+                            latest_version: d.latest_version,
+                            versions_count,
+                            sha256_prefix,
+                            deps_count: d.deps_count,
+                            yanked: d.yanked,
+                            tainted: d.tainted,
+                            taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
+                            versions,
+                        }
                     })
                     .collect();
                 true
@@ -909,15 +936,27 @@ impl Store {
                 self.ensure_aux_defaults();
                 self.registry.canaries = list
                     .into_iter()
-                    .map(|d| CanaryBundle {
-                        bundle_id: d.bundle_id,
-                        repo: RepoId::new(&d.owner, &d.repo),
-                        service: d.service,
-                        artifact_digest: d.artifact_digest,
-                        state: d.state,
-                        taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
-                        deployment_id: d.deployment_id,
-                        trace_id: d.trace_id,
+                    .map(|d| {
+                        let owner = if d.owner.is_empty() {
+                            "LMA1980"
+                        } else {
+                            d.owner.as_str()
+                        };
+                        let repo_name = if d.repo.is_empty() {
+                            d.service.as_str()
+                        } else {
+                            d.repo.as_str()
+                        };
+                        CanaryBundle {
+                            bundle_id: d.bundle_id,
+                            repo: RepoId::new(owner, repo_name),
+                            service: d.service,
+                            artifact_digest: d.artifact_digest,
+                            state: d.state,
+                            taint_reason: d.taint_reason.map(|r| sanitize_public_log(&r)),
+                            deployment_id: d.deployment_id,
+                            trace_id: d.trace_id,
+                        }
                     })
                     .collect();
                 true
@@ -925,10 +964,11 @@ impl Store {
             Input::RegCasStatus(d) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
+                let raw_bytes = d.effective_raw_bytes();
                 self.registry.cas = CasHealth {
                     blob_count: d.blob_count,
                     dedup_bytes: d.dedup_bytes,
-                    raw_bytes: d.raw_bytes,
+                    raw_bytes,
                     dedup_ratio_bp: d.dedup_ratio_bp,
                     gc_watermark_pct: d.gc_watermark_pct,
                     last_scrub_epoch_ms: d.last_scrub_epoch_ms,
@@ -939,31 +979,50 @@ impl Store {
             Input::ObsSmartscape(d) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.observe.smartscape_nodes = d
-                    .nodes
-                    .into_iter()
-                    .map(|n| SmartscapeNode {
-                        id: n.id,
-                        label: sanitize_public_log(&n.label),
-                        layer: n.layer,
-                        req_per_sec_bp: n.req_per_sec_bp,
-                        error_rate_bp: n.error_rate_bp,
-                        p95_ms: n.p95_ms,
-                        healthy: n.healthy,
-                    })
-                    .collect();
-                self.observe.smartscape_edges = d
-                    .edges
-                    .into_iter()
-                    .map(|e| SmartscapeEdge {
-                        from_id: e.from_id,
-                        to_id: e.to_id,
-                        protocol: e.protocol,
-                        call_rate_rps: e.call_rate_rps,
-                        error_rate_bp: e.error_rate_bp,
-                        p95_ms: e.p95_ms,
-                    })
-                    .collect();
+                let (nodes, edges) = d.into_nodes_and_edges();
+                if !nodes.is_empty() {
+                    self.observe.smartscape_nodes = nodes
+                        .into_iter()
+                        .map(|n| {
+                            let req_per_sec_bp = n.effective_req_per_sec_bp();
+                            let error_rate_bp = n.effective_error_rate_bp();
+                            let p95_ms = n.effective_p95_ms();
+                            let healthy = n.effective_healthy();
+                            let label = if n.label.is_empty() {
+                                sanitize_public_log(&n.id)
+                            } else {
+                                sanitize_public_log(&n.label)
+                            };
+                            SmartscapeNode {
+                                id: sanitize_public_log(&n.id),
+                                label,
+                                layer: n.layer,
+                                req_per_sec_bp,
+                                error_rate_bp,
+                                p95_ms,
+                                healthy,
+                            }
+                        })
+                        .collect();
+                }
+                if !edges.is_empty() {
+                    self.observe.smartscape_edges = edges
+                        .into_iter()
+                        .map(|e| {
+                            let call_rate_rps = e.effective_call_rate_rps();
+                            let error_rate_bp = e.effective_error_rate_bp();
+                            let p95_ms = e.effective_p95_ms();
+                            SmartscapeEdge {
+                                from_id: sanitize_public_log(&e.from_id),
+                                to_id: sanitize_public_log(&e.to_id),
+                                protocol: e.protocol,
+                                call_rate_rps,
+                                error_rate_bp,
+                                p95_ms,
+                            }
+                        })
+                        .collect();
+                }
                 true
             }
             Input::ObsProblems(list) => {
@@ -971,15 +1030,18 @@ impl Store {
                 self.ensure_aux_defaults();
                 self.observe.problems = list
                     .into_iter()
-                    .map(|p| SloProblem {
-                        problem_id: p.problem_id,
-                        title: sanitize_public_log(&p.title),
-                        category: p.category,
-                        severity: p.severity,
-                        burn_rate_bp: p.burn_rate_bp,
-                        impacted_entity: sanitize_public_log(&p.impacted_entity),
-                        root_cause_trace_id: p.root_cause_trace_id,
-                        active: p.active,
+                    .map(|p| {
+                        let active = p.effective_active();
+                        SloProblem {
+                            problem_id: p.problem_id,
+                            title: sanitize_public_log(&p.title),
+                            category: p.category,
+                            severity: p.severity,
+                            burn_rate_bp: p.burn_rate_bp,
+                            impacted_entity: sanitize_public_log(&p.impacted_entity),
+                            root_cause_trace_id: p.root_cause_trace_id,
+                            active,
+                        }
                     })
                     .collect();
                 true
@@ -987,12 +1049,15 @@ impl Store {
             Input::ObsTraces(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.observe.traces = list.into_iter().map(trace_from_dto).collect();
+                if !list.is_empty() {
+                    self.observe.traces = list.into_iter().map(trace_from_dto).collect();
+                }
                 true
             }
-            Input::ObsTraceDetail(d) => {
+            Input::ObsTraceDetail(mut d) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
+                let correlated = std::mem::take(&mut d.correlated_logs);
                 let trace = trace_from_dto(d);
                 if let Some(slot) = self
                     .observe
@@ -1004,53 +1069,78 @@ impl Store {
                 } else {
                     self.observe.traces.push(trace);
                 }
+                for l in correlated {
+                    let clean_msg = sanitize_public_log(&l.message);
+                    let exists = self.observe.logs.iter().any(|existing| {
+                        existing.trace_id == l.trace_id
+                            && existing.timestamp_ms == l.timestamp_ms
+                            && existing.message == clean_msg
+                    });
+                    if !exists {
+                        self.observe.logs.push(OtelLogEntry {
+                            timestamp_ms: l.timestamp_ms,
+                            severity: l.severity,
+                            service: l.service,
+                            span_id: l.span_id,
+                            trace_id: l.trace_id,
+                            message: clean_msg,
+                        });
+                    }
+                }
                 true
             }
             Input::ObsLogs(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.observe.logs = list
-                    .into_iter()
-                    .map(|l| OtelLogEntry {
-                        timestamp_ms: l.timestamp_ms,
-                        severity: l.severity,
-                        service: l.service,
-                        span_id: l.span_id,
-                        trace_id: l.trace_id,
-                        message: sanitize_public_log(&l.message),
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.observe.logs = list
+                        .into_iter()
+                        .map(|l| OtelLogEntry {
+                            timestamp_ms: l.timestamp_ms,
+                            severity: l.severity,
+                            service: l.service,
+                            span_id: l.span_id,
+                            trace_id: l.trace_id,
+                            message: sanitize_public_log(&l.message),
+                        })
+                        .collect();
+                }
                 true
             }
             Input::ObsMetrics(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                self.observe.metrics = list
-                    .into_iter()
-                    .map(|m| HardwareMetricSeries {
-                        service: m.service,
-                        hardware_class: sanitize_public_log(&m.hardware_class),
-                        rps: m.rps,
-                        error_rate_bp: m.error_rate_bp,
-                        p50_ms: m.p50_ms,
-                        p95_ms: m.p95_ms,
-                        p99_ms: m.p99_ms,
-                        exemplar_trace_id: m.exemplar_trace_id,
-                        samples: m.samples,
-                    })
-                    .collect();
+                if !list.is_empty() {
+                    self.observe.metrics = list
+                        .into_iter()
+                        .map(|m| HardwareMetricSeries {
+                            service: m.service,
+                            hardware_class: sanitize_public_log(&m.hardware_class),
+                            rps: m.rps,
+                            error_rate_bp: m.error_rate_bp,
+                            p50_ms: m.p50_ms,
+                            p95_ms: m.p95_ms,
+                            p99_ms: m.p99_ms,
+                            exemplar_trace_id: m.exemplar_trace_id,
+                            samples: m.samples,
+                        })
+                        .collect();
+                }
                 true
             }
             Input::ObsStoreStatus(d) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
+                let hot_duckdb_rows = d.effective_hot_rows();
+                let cold_parquet_rows = d.effective_cold_rows();
+                let zstd_compression_bp = d.effective_zstd_compression_bp();
                 self.observe.store = DataStoreHealth {
-                    hot_duckdb_rows: d.hot_duckdb_rows,
+                    hot_duckdb_rows,
                     hot_duckdb_bytes: d.hot_duckdb_bytes,
                     cold_parquet_partitions: d.cold_parquet_partitions,
-                    cold_parquet_rows: d.cold_parquet_rows,
+                    cold_parquet_rows,
                     cold_parquet_bytes: d.cold_parquet_bytes,
-                    zstd_compression_bp: d.zstd_compression_bp,
+                    zstd_compression_bp,
                     retention_days: d.retention_days,
                     oldest_watermark_iso: d.oldest_watermark_iso,
                 };
@@ -1211,8 +1301,8 @@ impl Store {
             .stations
             .into_iter()
             .map(|s| Station {
+                label: compact_station_label(&s.id, &s.label),
                 id: s.id,
-                label: s.label,
             })
             .collect();
         let n = stations.len();
@@ -1709,30 +1799,88 @@ impl Store {
     }
 }
 
+fn compact_station_label(id: &str, label: &str) -> String {
+    if !label.is_empty() && label.chars().count() <= 12 {
+        return label.to_owned();
+    }
+    let clean_id = id
+        .trim_end_matches("-check")
+        .trim_end_matches("_check")
+        .trim_end_matches("-gate")
+        .trim_end_matches("_gate")
+        .trim_end_matches("-build")
+        .trim_end_matches("_build");
+    let base = if clean_id.is_empty() { id } else { clean_id };
+    match base {
+        "fmt" | "rustfmt" => "FMT".into(),
+        "doc-format" | "doc_format" | "docs" => "DOCS".into(),
+        "clippy" => "CLIPPY".into(),
+        "wasm32" | "wasm" => "WASM32".into(),
+        "unit-tests" | "unit_tests" | "test" | "tests" => "TESTS".into(),
+        "audit" | "cargo-audit" => "AUDIT".into(),
+        "coverage" | "llvm-cov" | "cov" => "COV".into(),
+        "miri" => "MIRI".into(),
+        "bench" | "benchmarks" => "BENCH".into(),
+        other if !other.is_empty() => other
+            .replace(['-', '_'], " ")
+            .chars()
+            .take(10)
+            .collect::<String>()
+            .to_ascii_uppercase(),
+        _ => label
+            .chars()
+            .take(10)
+            .collect::<String>()
+            .to_ascii_uppercase(),
+    }
+}
+
 fn trace_from_dto(d: TraceDto) -> PurePathTrace {
+    let duration_ms = d.effective_duration_ms();
+    let error = d.effective_error();
+    let domain = if d.domain.is_empty() {
+        if d.root_service.contains("actionrunner") || d.root_operation.contains("ci") {
+            "CI".into()
+        } else if d.root_service.contains("muconde") || d.root_operation.contains("cd") {
+            "CD".into()
+        } else if d.root_service.contains("muregist") || d.root_operation.contains("cas") {
+            "REGISTRY".into()
+        } else {
+            "OBS".into()
+        }
+    } else {
+        d.domain
+    };
     PurePathTrace {
         trace_id: d.trace_id,
         root_service: d.root_service,
         root_operation: sanitize_public_log(&d.root_operation),
-        domain: d.domain,
-        duration_ms: d.duration_ms,
-        error: d.error,
-        slow_p99: d.slow_p99,
+        domain,
+        duration_ms,
+        error,
+        slow_p99: d.slow_p99 || duration_ms >= 2_500,
         started_epoch_ms: d.started_epoch_ms,
         spans: d
             .spans
             .into_iter()
-            .map(|s| TraceSpan {
-                span_id: s.span_id,
-                parent_span_id: s.parent_span_id,
-                service: s.service,
-                operation: sanitize_public_log(&s.operation),
-                start_offset_us: s.start_offset_us,
-                duration_us: s.duration_us,
-                self_time_us: s.self_time_us,
-                critical_path: s.critical_path,
-                error: s.error,
-                hardware_class: sanitize_public_log(&s.hardware_class),
+            .map(|s| {
+                let sp_err = s.effective_error();
+                TraceSpan {
+                    span_id: s.span_id,
+                    parent_span_id: s.parent_span_id,
+                    service: s.service,
+                    operation: sanitize_public_log(&s.operation),
+                    start_offset_us: s.start_offset_us,
+                    duration_us: s.duration_us,
+                    self_time_us: if s.self_time_us > 0 {
+                        s.self_time_us
+                    } else {
+                        s.duration_us
+                    },
+                    critical_path: s.critical_path,
+                    error: sp_err,
+                    hardware_class: sanitize_public_log(&s.hardware_class),
+                }
             })
             .collect(),
     }
