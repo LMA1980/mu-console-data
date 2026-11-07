@@ -68,6 +68,8 @@ pub enum Input {
     Select(Selection),
     /// Operator authentication session state (`/api/auth/session` or `/api/auth/redeem`).
     AuthSession(AuthSessionDto),
+    /// Operator restarted a CI job (`POST /api/jobs/{job_id}/restart`).
+    JobRestarted(u64),
     /// Offline snapshot restored from CacheStorage (`saved_epoch_ms`, view).
     Restore {
         saved_epoch_ms: u64,
@@ -1258,6 +1260,33 @@ impl Store {
                 let changed = self.auth != next;
                 self.auth = next;
                 changed
+            }
+            Input::JobRestarted(job_id) => {
+                let mut any = false;
+                for topo in self.topologies.values_mut() {
+                    let mut tr_changed = false;
+                    for tr in &mut topo.t.trains {
+                        if tr.job_id == job_id {
+                            for sig in &mut tr.stage_states {
+                                if *sig == StageState::Failed {
+                                    *sig = StageState::Running;
+                                    tr_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if tr_changed {
+                        topo.t.fabric_rev += 1;
+                        any = true;
+                    }
+                }
+                for r in self.repos.values_mut() {
+                    if r.latest_job_id == Some(job_id) && r.status == RepoStatus::Failing {
+                        r.status = RepoStatus::Running;
+                        any = true;
+                    }
+                }
+                any
             }
             Input::Restore {
                 saved_epoch_ms,
