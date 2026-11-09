@@ -279,7 +279,10 @@ impl Engine {
                         SubView::Fleet(_) => {
                             self.fetch(FetchKind::ClusterNodes, &mut fx);
                         }
-                        SubView::Ci(_) => {}
+                        SubView::Ci(CiSubView::Trainway | CiSubView::Scorecards) => {
+                            self.fetch_selection(&mut fx);
+                            self.fetch(FetchKind::CiQueue, &mut fx);
+                        }
                     }
                 }
             }
@@ -565,7 +568,9 @@ impl Engine {
             Mode::Live => {
                 let ci = &self.streams[StreamId::Ci.index()];
                 let cd = &self.streams[StreamId::Cd.index()];
-                if ci.open && (cd.open || cd.backoff.attempt() > 0) {
+                if (ci.open && (cd.open || cd.backoff.attempt() > 0))
+                    || (cd.open && (ci.open || ci.backoff.attempt() > 0))
+                {
                     return ConnState::Live;
                 }
                 let worst = self
@@ -842,19 +847,22 @@ impl Engine {
         if self.mode != Mode::Live {
             return fx;
         }
-        let ci_open = self.streams[StreamId::Ci.index()].open;
+        let peer_open = match s {
+            StreamId::Ci => self.streams[StreamId::Cd.index()].open,
+            StreamId::Cd => self.streams[StreamId::Ci.index()].open,
+        };
         let st = &mut self.streams[s.index()];
         st.open = false;
         let delay = st.backoff.next_delay_ms();
         let attempt = st.backoff.attempt();
         st.reconnect_at = Some(now_ms + u64::from(delay));
         if let Some(msg) = error {
-            if !(s == StreamId::Cd && ci_open) {
+            if !peer_open {
                 fx.push(Effect::Post(DataEvent::Error(UiError::Stream(msg))));
             }
         }
         if !self.out.is_hidden() {
-            if s == StreamId::Cd && ci_open {
+            if peer_open {
                 self.update_conn(now_ms, &mut fx);
             } else {
                 let state = if attempt >= OFFLINE_AFTER_ATTEMPTS && !self.store.has_live_data() {
