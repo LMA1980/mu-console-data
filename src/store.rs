@@ -1543,7 +1543,7 @@ impl Store {
                         existing.tests_passed = summary.tests_passed;
                         existing.tests_total = summary.tests_total;
                     }
-                    if existing.queue_state != "Active" && existing.queue_state != "Queued" {
+                    if !summary.queue_state.is_empty() {
                         existing.queue_state = summary.queue_state;
                     }
                 } else {
@@ -1705,15 +1705,24 @@ impl Store {
                 }
             })
             .collect();
-        let any_failed = stages.iter().any(|s| s.state == StageState::Failed);
-        let any_running = stages.iter().any(|s| s.state == StageState::Running);
+        let top_failed = rec.status.state.eq_ignore_ascii_case("failed")
+            || (rec.status.state.eq_ignore_ascii_case("completed")
+                && rec.status.details.exit_code != 0);
+        let top_running = rec.status.state.eq_ignore_ascii_case("running");
+        let top_queued = rec.status.state.eq_ignore_ascii_case("queued");
+        let any_failed = top_failed || stages.iter().any(|s| s.state == StageState::Failed);
+        let any_running = top_running || stages.iter().any(|s| s.state == StageState::Running);
         let all_passed = !stages.is_empty() && stages.iter().all(|s| s.state == StageState::Passed);
+        let all_pending =
+            !stages.is_empty() && stages.iter().all(|s| s.state == StageState::Pending);
         let queue_state = match queue_state_hint {
             Some("Active") => "Active".into(),
             Some("Queued") => "Queued".into(),
             _ if any_failed => "Failed".into(),
             _ if any_running => "Active".into(),
+            _ if top_queued => "Queued".into(),
             _ if all_passed => "Passed".into(),
+            _ if all_pending => "Queued".into(),
             Some(other) => other.to_owned(),
             None => "Passed".into(),
         };
@@ -2557,6 +2566,38 @@ impl Store {
             }
             if let Some(s) = default_train_status {
                 r.status = s;
+            }
+            changed = true;
+        }
+        if let Some(j) = self.ci_jobs.iter_mut().find(|j| j.job_id == e.job_id) {
+            let mut matched = false;
+            for st in &mut j.stages {
+                if st.id == e.stage || st.name == e.stage {
+                    st.state = e.state;
+                    if clean_node.is_some() {
+                        st.assigned_node.clone_from(&clean_node);
+                    }
+                    matched = true;
+                }
+            }
+            if !matched && !e.stage.is_empty() {
+                j.stages.push(CiJobStage {
+                    id: e.stage.clone(),
+                    name: e.stage.clone(),
+                    assigned_node: clean_node,
+                    threads: 0,
+                    state: e.state,
+                    duration_secs: 0,
+                    exit_code: i32::from(e.state == StageState::Failed),
+                });
+            }
+            if j.stages.iter().any(|s| s.state == StageState::Failed) {
+                j.queue_state = "Failed".into();
+            } else if j.stages.iter().any(|s| s.state == StageState::Running) {
+                j.queue_state = "Active".into();
+            } else if !j.stages.is_empty() && j.stages.iter().all(|s| s.state == StageState::Passed)
+            {
+                j.queue_state = "Passed".into();
             }
             changed = true;
         }

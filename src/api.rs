@@ -9,7 +9,9 @@ use mu_console_protocol::dto::{
     RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto, TopologyDto,
     TraceDto,
 };
-use mu_console_protocol::{sanitize_ansi_log_lines, CanaryBundleState, CdLease, RepoId};
+use mu_console_protocol::{
+    sanitize_ansi_log_lines, CanaryBundleState, CdLease, RepoId, DEFAULT_MAX_JOB_LOG_LINES,
+};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
@@ -95,6 +97,16 @@ enum ClusterNodesEnvelope {
     Envelope {
         #[serde(default)]
         nodes: Vec<ClusterNodeDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JobsEnvelope {
+    List(Vec<CiQueueJobRecordDto>),
+    Envelope {
+        #[serde(default)]
+        jobs: Vec<CiQueueJobRecordDto>,
     },
 }
 
@@ -430,13 +442,12 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
         }
         FetchKind::JobLog(job_id) => Input::JobLog {
             job_id: *job_id,
-            lines: sanitize_ansi_log_lines(body, 120),
+            lines: sanitize_ansi_log_lines(body, DEFAULT_MAX_JOB_LOG_LINES),
         },
     })
 }
 
-/// Decode one SSE event. `Ok(None)` for event kinds the console does not
-/// use (the existing `queue` / `jobs` / `cluster` kinds, keep-alives).
+/// Decode one SSE event. `Ok(None)` for keep-alives or empty snapshots.
 ///
 /// # Errors
 /// Returns the JSON error message for a known kind with a bad payload.
@@ -452,6 +463,48 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         }
         (StreamId::Ci, "node_membership_changed") => {
             Input::NodeMembership(json::<NodeMembershipChangedDto>(data)?)
+        }
+        (StreamId::Ci, "queue") => {
+            let dto = json::<CiQueueDto>(data)?;
+            if dto.active_jobs.is_empty()
+                && dto.queued_jobs.is_empty()
+                && dto.recent_jobs.is_empty()
+                && dto.concurrency == 0
+                && dto.queue_depth == 0
+            {
+                return Ok(None);
+            }
+            Input::CiQueue(dto)
+        }
+        (StreamId::Ci, "cluster") => {
+            let nodes = match json::<ClusterNodesEnvelope>(data)? {
+                ClusterNodesEnvelope::List(v) => v,
+                ClusterNodesEnvelope::Envelope { nodes } => nodes,
+            };
+            if nodes.is_empty() {
+                return Ok(None);
+            }
+            Input::ClusterNodes(nodes)
+        }
+        (StreamId::Ci, "jobs") => {
+            let jobs = match json::<JobsEnvelope>(data)? {
+                JobsEnvelope::List(v) => v,
+                JobsEnvelope::Envelope { jobs } => jobs,
+            };
+            if jobs.is_empty() {
+                return Ok(None);
+            }
+            let mut dto = CiQueueDto::default();
+            for raw in jobs {
+                let rec = raw.into_unwrapped();
+                match rec.status.state.as_str() {
+                    "Running" => dto.active_jobs.push(rec),
+                    "Queued" => dto.queued_jobs.push(rec),
+                    _ => dto.recent_jobs.push(rec),
+                }
+            }
+            dto.queue_depth = u32::try_from(dto.queued_jobs.len()).unwrap_or(u32::MAX);
+            Input::CiQueue(dto)
         }
         (StreamId::Cd, "it_progress") => Input::ItProgress(json::<ItProgressDto>(data)?),
         (StreamId::Cd, "promoted") => Input::Promoted(json::<PromotedDto>(data)?),
@@ -570,8 +623,34 @@ pub(crate) mod tests {
         assert!(
             matches!(ev, Some(Input::RolledBack(r)) if r.reason == RollbackReason::CriticalTestFailed)
         );
-        // Existing kinds and cross-stream names are ignored.
+        // Empty queue/cluster snapshots and cross-stream names are ignored.
         assert_eq!(parse_event(StreamId::Ci, "queue", "{}"), Ok(None));
+        assert_eq!(parse_event(StreamId::Ci, "cluster", "[]"), Ok(None));
+        assert_eq!(parse_event(StreamId::Ci, "jobs", "[]"), Ok(None));
+        assert!(matches!(
+            parse_event(
+                StreamId::Ci,
+                "queue",
+                r#"{"queue_depth":1,"concurrency":1,"active_jobs":[],"queued_jobs":[],"recent_jobs":[]}"#
+            ),
+            Ok(Some(Input::CiQueue(q))) if q.queue_depth == 1
+        ));
+        assert!(matches!(
+            parse_event(
+                StreamId::Ci,
+                "cluster",
+                r#"[{"node_id":"worker-riscv64","is_online":true}]"#
+            ),
+            Ok(Some(Input::ClusterNodes(nodes))) if nodes.len() == 1
+        ));
+        assert!(matches!(
+            parse_event(
+                StreamId::Ci,
+                "jobs",
+                r#"[{"job":{"id":"job-1794054805-5cec9056","repo_name":"LMA1980/mu-console","ref_name":"refs/heads/main","commit_sha":"5cec9056"},"status":{"state":"Running"}}]"#
+            ),
+            Ok(Some(Input::CiQueue(q))) if q.active_jobs.len() == 1
+        ));
         assert_eq!(parse_event(StreamId::Cd, "branch_created", "{}"), Ok(None));
         assert!(parse_event(StreamId::Cd, "tainted", "{not json").is_err());
     }
