@@ -30,6 +30,8 @@ pub const HISTORY_LIMIT: u32 = 8;
 pub const OFFLINE_AFTER_ATTEMPTS: u32 = 3;
 /// Rotary-selector settle window before committing a new selection.
 pub const SELECT_SETTLE_MS: u64 = 350;
+/// Active CI job detail & log tailing poll interval (ms) while a job is running or queued.
+pub const LIVE_ACTIVE_JOB_POLL_MS: u64 = 2_000;
 
 /// Side effect for the browser glue to execute.
 #[allow(clippy::large_enum_variant)]
@@ -105,6 +107,8 @@ pub struct Engine {
     asked_deployments: BTreeSet<String>,
     asked_job_details: BTreeSet<u64>,
     fallback_job_logs: BTreeSet<u64>,
+    selected_job_id: Option<u64>,
+    last_live_poll_ms: u64,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
 }
@@ -129,6 +133,8 @@ impl Engine {
             asked_deployments: BTreeSet::new(),
             asked_job_details: BTreeSet::new(),
             fallback_job_logs: BTreeSet::new(),
+            selected_job_id: None,
+            last_live_poll_ms: 0,
             selection_gen: 0,
             pending_select: None,
         }
@@ -332,9 +338,12 @@ impl Engine {
                 }
             }
             UiCommand::SelectJob { job_id } => {
-                if self.mode == Mode::Live && job_id > 0 {
-                    self.fetch(FetchKind::JobDetail(job_id), &mut fx);
-                    self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                if job_id > 0 {
+                    self.selected_job_id = Some(job_id);
+                    if self.mode == Mode::Live {
+                        self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                        self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                    }
                 }
             }
         }
@@ -499,14 +508,21 @@ impl Engine {
         });
     }
 
-    fn fetch_obs_job_log(&mut self, job_id: u64, fx: &mut Vec<Effect>) {
-        self.fallback_job_logs.insert(job_id);
+    fn fetch_obs_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
         let jid = self.store.resolve_job_id_str(job_id);
-        let path = format!("/api/obs/v1/jobs/{jid}/log");
+        let path = paths::job_obs_log_id(&jid);
         fx.push(Effect::Fetch {
             kind: FetchKind::JobLog(job_id),
             url: self.config.url(&path),
         });
+    }
+
+    fn fetch_active_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
+        if self.store.auth().is_operator() {
+            self.fetch(FetchKind::JobLog(job_id), fx);
+        } else {
+            self.fetch_obs_job_log(job_id, fx);
+        }
     }
 
     fn open_stream(&mut self, s: StreamId, fx: &mut Vec<Effect>) {
@@ -789,9 +805,23 @@ impl Engine {
                     let unknown = deployment_of(&input)
                         .filter(|id| !self.store.has_gate(id))
                         .map(str::to_owned);
+                    let stage_changed = match &input {
+                        Input::JobStageChanged(e) => {
+                            Some((RepoId::new(&e.owner, &e.repo), e.job_id))
+                        }
+                        _ => None,
+                    };
                     self.store.apply(input, now_ms);
                     if let Some(id) = unknown {
                         self.on_unknown_deployment(id, &mut fx);
+                    }
+                    if let Some((repo, job_id)) = stage_changed {
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                        self.fetch(FetchKind::Summary(repo), &mut fx);
+                        if job_id > 0 {
+                            self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                            self.fetch_active_job_log(job_id, &mut fx);
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -884,6 +914,34 @@ impl Engine {
                         .is_some_and(|t| now_ms >= t)
                     {
                         self.open_stream(s, &mut fx);
+                    }
+                }
+                if !self.out.is_hidden()
+                    && now_ms
+                        >= self
+                            .last_live_poll_ms
+                            .saturating_add(LIVE_ACTIVE_JOB_POLL_MS)
+                {
+                    let active_job_id = self
+                        .selected_job_id
+                        .filter(|id| {
+                            self.store.view().ci_jobs.iter().any(|j| {
+                                j.job_id == *id
+                                    && (j.queue_state == "Active" || j.queue_state == "Queued")
+                            })
+                        })
+                        .or_else(|| {
+                            self.store
+                                .view()
+                                .ci_jobs
+                                .iter()
+                                .find(|j| j.queue_state == "Active" || j.queue_state == "Queued")
+                                .map(|j| j.job_id)
+                        });
+                    if let Some(job_id) = active_job_id {
+                        self.last_live_poll_ms = now_ms;
+                        self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                        self.fetch_active_job_log(job_id, &mut fx);
                     }
                 }
             }

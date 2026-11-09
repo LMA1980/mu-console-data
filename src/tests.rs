@@ -989,3 +989,53 @@ fn operator_restart_job_dispatches_post_and_transitions_failed_stages() {
     );
     assert!(train_after.stage_states.contains(&StageState::Running));
 }
+
+#[test]
+fn live_sse_push_and_active_job_log_tailing() {
+    use mu_console_protocol::StageState;
+
+    let mut eng = Engine::new(42);
+    let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = eng.on_stream_open(StreamId::Ci, 5);
+
+    // 1. SSE event: queue populates active job in Store.ci_jobs.
+    let sse_queue = concat!(
+        "event: queue\n",
+        "data: {\"queue_depth\":0,\"concurrency\":1,\"active_jobs\":[{\"elapsed_secs\":5,\"wait_secs\":1,\"position\":0,\"record\":{\"job\":{\"id\":\"job-1794054805-5cec9056\",\"repo_name\":\"LMA1980/mu-console\",\"ref_name\":\"refs/heads/main\",\"commit_sha\":\"5cec90561234\",\"event_type\":\"push\"},\"status\":{\"state\":\"Running\"},\"stages\":[{\"id\":\"fmt-check\",\"name\":\"fmt-check\",\"assigned_node\":\"worker-riscv64\",\"threads\":6,\"status\":{\"state\":\"Running\",\"details\":{\"duration_secs\":2,\"exit_code\":0}}}]}}],\"queued_jobs\":[],\"recent_jobs\":[]}\n\n"
+    );
+    let _ = eng.on_stream_chunk(StreamId::Ci, sse_queue.as_bytes(), 10);
+    let v = eng.store().view();
+    assert_eq!(v.ci_jobs.len(), 1);
+    assert_eq!(v.ci_jobs[0].queue_state, "Active");
+    let job_id = v.ci_jobs[0].job_id;
+
+    // 2. Engine::tick at >= 2_000ms polls JobDetail + JobLog for the active job.
+    let tick_fx = eng.tick(2_010);
+    assert!(tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind: FetchKind::JobDetail(id), url }
+        if *id == job_id && url == "/api/jobs/job-1794054805-5cec9056"
+    )));
+    assert!(tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind: FetchKind::JobLog(id), url }
+        if *id == job_id && url == "/api/obs/v1/jobs/job-1794054805-5cec9056/log"
+    )));
+
+    // 3. SSE event: job_stage_changed updates Store.ci_jobs stage state and triggers refresh fetches.
+    let sse_stage = concat!(
+        "event: job_stage_changed\n",
+        "data: {\"owner\":\"LMA1980\",\"repo\":\"mu-console\",\"job_id\":\"job-1794054805-5cec9056\",\"ref\":\"main\",\"stage\":\"fmt-check\",\"state\":\"passed\",\"fabric_rev\":10}\n\n"
+    );
+    let stage_fx = eng.on_stream_chunk(StreamId::Ci, sse_stage.as_bytes(), 2_100);
+    assert!(stage_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+    let v_after = eng.store().view();
+    assert_eq!(v_after.ci_jobs[0].stages[0].state, StageState::Passed);
+    assert_eq!(v_after.ci_jobs[0].queue_state, "Passed");
+}
