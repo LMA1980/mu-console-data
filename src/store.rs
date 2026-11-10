@@ -16,14 +16,15 @@ use mu_console_protocol::dto::{
     RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
-    format_job_id, sanitize_public_log, AreaBadges, AuthState, Branch, CanaryBundle,
-    CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage, CiJobSummary, DataSource,
-    DataStoreHealth, DeploymentGate, DeploymentSummary, FabricNode, FadeReason, GateOutcome,
-    GateTest, HardwareMetricSeries, LogSeverity, ObserveView, OtelLogEntry, PackageEcosystem,
-    ParentRef, PrState, ProblemCategory, PurePathTrace, RegistryPackage, RegistryView, RepoId,
-    RepoScore, RepoStatus, RepoTopology, RollbackReason, SandboxProfileSummary, Selection,
-    SidingPhase, SloProblem, Slot, SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState,
-    Station, SubmoduleRef, TestState, TraceSpan, Train, ViewModel,
+    format_job_id, sanitize_ansi_log_lines, sanitize_public_log, AreaBadges, AuthState, Branch,
+    CanaryBundle, CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage, CiJobSummary,
+    DataSource, DataStoreHealth, DeploymentGate, DeploymentSummary, FabricNode, FadeReason,
+    GateOutcome, GateTest, HardwareMetricSeries, LogSeverity, ObserveView, OtelLogEntry,
+    PackageEcosystem, ParentRef, PrState, ProblemCategory, PurePathTrace, RegistryPackage,
+    RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology, RollbackReason,
+    SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot, SmartscapeEdge,
+    SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState, TraceSpan,
+    Train, ViewModel,
 };
 
 /// A merged or deleted siding is removed this long after it starts fading.
@@ -205,6 +206,19 @@ pub(crate) fn service_matches_repo(service: &str, repo_name: &str) -> bool {
         ),
         (Some(ga), Some(gb)) if ga == gb
     )
+}
+
+fn clean_otel_message(raw: &str) -> String {
+    sanitize_ansi_log_lines(raw, 8).join(" ").trim().to_owned()
+}
+
+fn push_unique_log(live: &mut Vec<OtelLogEntry>, entry: OtelLogEntry) {
+    if !live
+        .iter()
+        .any(|e| e.service == entry.service && e.message == entry.message)
+    {
+        live.push(entry);
+    }
 }
 
 fn default_leases() -> Vec<CdLease> {
@@ -1133,6 +1147,7 @@ impl Store {
                 if self.source == DataSource::Live {
                     self.refresh_live_smartscape();
                     self.refresh_live_metrics();
+                    self.refresh_live_logs();
                 }
                 true
             }
@@ -1156,6 +1171,9 @@ impl Store {
                     self.leases.clear();
                     self.refresh_live_cd();
                 }
+                if self.source == DataSource::Live {
+                    self.refresh_live_logs();
+                }
                 true
             }
             Input::Sandboxes(list) => {
@@ -1163,6 +1181,9 @@ impl Store {
                 self.ensure_aux_defaults();
                 if !list.is_empty() {
                     self.sandboxes = list;
+                }
+                if self.source == DataSource::Live {
+                    self.refresh_live_logs();
                 }
                 true
             }
@@ -1197,6 +1218,9 @@ impl Store {
                             }
                         })
                         .collect();
+                }
+                if self.source == DataSource::Live {
+                    self.refresh_live_logs();
                 }
                 true
             }
@@ -1240,6 +1264,7 @@ impl Store {
                         .collect();
                     self.refresh_live_cd();
                     self.refresh_live_problems();
+                    self.refresh_live_logs();
                 }
                 true
             }
@@ -1266,6 +1291,9 @@ impl Store {
                     last_scrub_epoch_ms: d.last_scrub_epoch_ms,
                     corrupt_blobs: d.corrupt_blobs,
                 };
+                if self.source == DataSource::Live {
+                    self.refresh_live_logs();
+                }
                 true
             }
             Input::ObsSmartscape(d) => {
@@ -1351,6 +1379,7 @@ impl Store {
                 if self.source == DataSource::Live {
                     self.live_obs_problems = mapped;
                     self.refresh_live_problems();
+                    self.refresh_live_logs();
                 } else if !mapped.is_empty() {
                     self.observe.problems = mapped;
                 }
@@ -1380,7 +1409,15 @@ impl Store {
                     self.observe.traces.push(trace);
                 }
                 for l in correlated {
-                    let clean_msg = sanitize_public_log(&l.message);
+                    let clean_msg = clean_otel_message(&l.message);
+                    if clean_msg.is_empty() {
+                        continue;
+                    }
+                    let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
+                        String::from("actionrunner-controller")
+                    } else {
+                        l.service
+                    };
                     let exists = self.observe.logs.iter().any(|existing| {
                         existing.trace_id == l.trace_id
                             && existing.timestamp_ms == l.timestamp_ms
@@ -1390,23 +1427,62 @@ impl Store {
                         self.observe.logs.push(OtelLogEntry {
                             timestamp_ms: l.timestamp_ms,
                             severity: l.severity,
-                            service: l.service,
+                            service,
                             span_id: l.span_id,
                             trace_id: l.trace_id,
                             message: clean_msg,
                         });
                     }
                 }
-                self.refresh_live_logs();
                 self.refresh_live_problems();
+                self.refresh_live_logs();
                 true
             }
             Input::ObsLogs(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
                 let mut incoming = Vec::with_capacity(list.len());
+                let mut dstate_alert_count = 0_usize;
                 for l in list {
-                    let clean_msg = sanitize_public_log(&l.message);
+                    let clean_msg = clean_otel_message(&l.message);
+                    if self.source == DataSource::Live
+                        && (clean_msg.is_empty()
+                            || clean_msg.eq_ignore_ascii_case("running 0 tests"))
+                    {
+                        continue;
+                    }
+                    let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
+                        String::from("actionrunner-controller")
+                    } else {
+                        l.service
+                    };
+                    let mut severity = l.severity;
+                    if severity == LogSeverity::Error
+                        && (clean_msg.contains("test result: ok.")
+                            || (clean_msg.contains("0 failed") && !clean_msg.contains("FAILED"))
+                            || clean_msg.starts_with("Running ")
+                            || clean_msg.starts_with("Compiling ")
+                            || clean_msg.starts_with("Finished ")
+                            || clean_msg.starts_with("Doc-tests "))
+                    {
+                        severity = LogSeverity::Info;
+                    }
+                    let is_dstate_alert = clean_msg.contains("Host pressure / D-state alert");
+                    if is_dstate_alert {
+                        if dstate_alert_count >= 3 {
+                            continue;
+                        }
+                        if severity == LogSeverity::Error
+                            && clean_msg.contains("wchan=0")
+                            && (clean_msg.contains("io_some_avg10=0.")
+                                || clean_msg.contains("io_some_avg10=1.")
+                                || clean_msg.contains("io_some_avg10=2.")
+                                || clean_msg.contains("io_some_avg10=3.")
+                                || clean_msg.contains("io_some_avg10=4."))
+                        {
+                            severity = LogSeverity::Warn;
+                        }
+                    }
                     let has_real_trace =
                         !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
                     if has_real_trace
@@ -1414,23 +1490,23 @@ impl Store {
                     {
                         self.observe.traces.push(PurePathTrace {
                             trace_id: l.trace_id.clone(),
-                            root_service: l.service.clone(),
+                            root_service: service.clone(),
                             root_operation: clean_msg.clone(),
                             domain: "OBS".into(),
                             duration_ms: 12,
-                            error: l.severity == LogSeverity::Error,
+                            error: severity == LogSeverity::Error,
                             slow_p99: false,
                             started_epoch_ms: l.timestamp_ms,
                             spans: vec![TraceSpan {
                                 span_id: l.span_id.clone().unwrap_or_else(|| "sp-obs-log-1".into()),
                                 parent_span_id: None,
-                                service: l.service.clone(),
+                                service: service.clone(),
                                 operation: clean_msg.clone(),
                                 start_offset_us: 0,
                                 duration_us: 12_000,
                                 self_time_us: 12_000,
                                 critical_path: true,
-                                error: l.severity == LogSeverity::Error,
+                                error: severity == LogSeverity::Error,
                                 hardware_class: "fabric-collector".into(),
                             }],
                         });
@@ -1439,10 +1515,13 @@ impl Store {
                         .iter()
                         .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
                     {
+                        if is_dstate_alert {
+                            dstate_alert_count += 1;
+                        }
                         incoming.push(OtelLogEntry {
                             timestamp_ms: l.timestamp_ms,
-                            severity: l.severity,
-                            service: l.service,
+                            severity,
+                            service,
                             span_id: l.span_id,
                             trace_id: l.trace_id,
                             message: clean_msg,
@@ -1453,9 +1532,9 @@ impl Store {
                     if !incoming.is_empty() {
                         self.live_obs_logs = incoming;
                     }
+                    self.refresh_live_problems();
                     self.refresh_live_logs();
                     self.refresh_live_smartscape();
-                    self.refresh_live_problems();
                 } else if !incoming.is_empty() {
                     let mut merged: Vec<OtelLogEntry> = self
                         .observe
@@ -1497,6 +1576,7 @@ impl Store {
                         self.live_obs_metrics = mapped;
                     }
                     self.refresh_live_metrics();
+                    self.refresh_live_logs();
                     self.refresh_live_smartscape();
                 } else if !mapped.is_empty() {
                     self.observe.metrics = mapped;
@@ -1519,6 +1599,9 @@ impl Store {
                     retention_days: d.retention_days,
                     oldest_watermark_iso: d.oldest_watermark_iso,
                 };
+                if self.source == DataSource::Live {
+                    self.refresh_live_logs();
+                }
                 true
             }
             Input::BranchCreated(e) => self.branch_created(&e),
@@ -1650,6 +1733,7 @@ impl Store {
                 }
                 self.refresh_live_cd();
                 self.refresh_live_problems();
+                self.refresh_live_logs();
                 true
             }
             Input::JobLog { job_id, lines } => {
@@ -2063,36 +2147,452 @@ impl Store {
             }
         }
         self.observe.traces = live_traces;
-        self.refresh_live_logs();
         self.refresh_live_metrics();
         self.refresh_live_cd();
-        self.refresh_live_smartscape();
         self.refresh_live_problems();
+        self.refresh_live_logs();
+        self.refresh_live_smartscape();
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     fn refresh_live_logs(&mut self) {
         if self.source != DataSource::Live {
             return;
         }
+        let prev_logs = std::mem::take(&mut self.observe.logs);
         let mut live = self.live_obs_logs.clone();
-        live.sort_by_key(|a| std::cmp::Reverse(a.timestamp_ms));
+        let base_ts = live
+            .iter()
+            .map(|l| l.timestamp_ms)
+            .max()
+            .filter(|&t| t > 0)
+            .unwrap_or(1_762_742_400_000);
+
+        // 1. actionrunner-controller (CI Control Plane) & actionrunner-rs (CI Worker Daemon & Crate Stages)
+        for (j_idx, job) in self.ci_jobs.iter().take(10).enumerate() {
+            let disp_id = format_job_id(job.job_id);
+            let sha7: String = if job.commit_sha.is_empty() {
+                String::from("HEAD")
+            } else {
+                job.commit_sha.chars().take(7).collect()
+            };
+            let tr_id = format!(
+                "tr-ci-{}",
+                if job.commit_sha.len() >= 6 {
+                    job.commit_sha.chars().take(6).collect::<String>()
+                } else {
+                    job.job_id_str.clone()
+                }
+            );
+            let pipe_sev = if job.queue_state.eq_ignore_ascii_case("failed")
+                || job.stages.iter().any(|s| s.state == StageState::Failed)
+            {
+                LogSeverity::Error
+            } else {
+                LogSeverity::Info
+            };
+            let j_off = u64::try_from(j_idx).unwrap_or(0) * 3_500;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(j_off + 200),
+                    severity: pipe_sev,
+                    service: "actionrunner-controller".into(),
+                    span_id: Some(format!("sp-ci-pipe-{}", j_idx + 1)),
+                    trace_id: tr_id.clone(),
+                    message: format!(
+                        "[pipeline #{disp_id}] {}/{} @{} ({sha7}) state={} · {} stages · tests={}/{} · cov={:.1}% · elapsed={}s",
+                        job.repo.owner,
+                        job.repo.repo,
+                        job.ref_name,
+                        job.queue_state,
+                        job.stages.len(),
+                        job.tests_passed,
+                        job.tests_total,
+                        f64::from(job.coverage_bp) / 100.0,
+                        job.elapsed_secs,
+                    ),
+                },
+            );
+            for (s_idx, st) in job.stages.iter().enumerate() {
+                if j_idx >= 4 && !matches!(st.state, StageState::Failed | StageState::Running) {
+                    continue;
+                }
+                let worker = sanitize_public_log(st.assigned_node.as_deref().unwrap_or("node-a"));
+                let st_sev = if st.state == StageState::Failed || st.exit_code != 0 {
+                    LogSeverity::Error
+                } else {
+                    LogSeverity::Info
+                };
+                let st_name = if st.name.is_empty() { &st.id } else { &st.name };
+                let s_off = (u64::try_from(s_idx).unwrap_or(0) + 1) * 350;
+                push_unique_log(
+                    &mut live,
+                    OtelLogEntry {
+                        timestamp_ms: base_ts.saturating_sub(j_off + s_off),
+                        severity: st_sev,
+                        service: "actionrunner-rs".into(),
+                        span_id: Some(format!("sp-ci-{}-{}", j_idx + 1, s_idx + 1)),
+                        trace_id: tr_id.clone(),
+                        message: format!(
+                            "[pipeline #{disp_id}] [stage #{} {st_name}] repo={} worker={worker} threads={} state={:?} duration={}s exit={}",
+                            s_idx + 1,
+                            job.repo.repo,
+                            st.threads,
+                            st.state,
+                            st.duration_secs,
+                            st.exit_code,
+                        ),
+                    },
+                );
+            }
+            if job.stages.is_empty() && j_idx < 4 {
+                push_unique_log(
+                    &mut live,
+                    OtelLogEntry {
+                        timestamp_ms: base_ts.saturating_sub(j_off + 350),
+                        severity: pipe_sev,
+                        service: "actionrunner-rs".into(),
+                        span_id: Some(format!("sp-ci-{}-1", j_idx + 1)),
+                        trace_id: tr_id,
+                        message: format!(
+                            "[pipeline #{disp_id}] [stage #1 dispatch] repo={} worker=node-a state={} elapsed={}s",
+                            job.repo.repo, job.queue_state, job.elapsed_secs
+                        ),
+                    },
+                );
+            }
+        }
+
+        // 2. muconde-controller (CD Control Plane) & muconde-agent (CD Slot & Gate Agent)
+        for (g_idx, gate) in self.gates.values().take(8).enumerate() {
+            let passed = gate
+                .tests
+                .iter()
+                .filter(|t| t.state == TestState::Passed)
+                .count();
+            let g_sev = if matches!(gate.outcome, GateOutcome::RolledBack | GateOutcome::Tainted) {
+                LogSeverity::Error
+            } else {
+                LogSeverity::Info
+            };
+            let tr_id = format!("tr-cd-{}", gate.deployment_id);
+            let g_off = u64::try_from(g_idx).unwrap_or(0) * 4_200;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(g_off + 500),
+                    severity: g_sev,
+                    service: "muconde-controller".into(),
+                    span_id: Some(format!("sp-cd-gate-{}", g_idx + 1)),
+                    trace_id: tr_id.clone(),
+                    message: format!(
+                        "[cd-gate] Deployment {} ({}/{}) on {} :: staged_slot={:?} restore_slot={:?} outcome={:?} · {}/{} IT checks passed",
+                        gate.deployment_id,
+                        gate.repo.owner,
+                        gate.repo.repo,
+                        gate.target_node,
+                        gate.staged_slot,
+                        gate.restore_slot,
+                        gate.outcome,
+                        passed,
+                        gate.tests.len(),
+                    ),
+                },
+            );
+            for (t_idx, tc) in gate.tests.iter().take(4).enumerate() {
+                let tc_sev = if tc.state == TestState::Failed {
+                    LogSeverity::Error
+                } else {
+                    LogSeverity::Info
+                };
+                let crate_name = tc.crate_name.as_deref().unwrap_or(&gate.repo.repo);
+                let t_off = (u64::try_from(t_idx).unwrap_or(0) + 1) * 400;
+                push_unique_log(
+                    &mut live,
+                    OtelLogEntry {
+                        timestamp_ms: base_ts.saturating_sub(g_off + t_off),
+                        severity: tc_sev,
+                        service: "muconde-agent".into(),
+                        span_id: Some(format!("sp-cd-it-{}-{}", g_idx + 1, t_idx + 1)),
+                        trace_id: tr_id.clone(),
+                        message: format!(
+                            "[cd-it-check] [{}] crate={crate_name} test={} state={:?} duration={}ms critical={}",
+                            gate.deployment_id, tc.name, tc.state, tc.duration_ms, tc.critical
+                        ),
+                    },
+                );
+            }
+        }
+        for (l_idx, lease) in self.leases.iter().take(6).enumerate() {
+            let l_off = u64::try_from(l_idx).unwrap_or(0) * 5_000;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(l_off + 800),
+                    severity: LogSeverity::Info,
+                    service: "muconde-agent".into(),
+                    span_id: Some(format!("sp-cd-lease-{}", l_idx + 1)),
+                    trace_id: format!("tr-cd-{}", lease.deployment_id),
+                    message: format!(
+                        "[slot-lease] Lease {} on {} :: service={} active_slot={:?} candidate_slot={:?} digest={} ttl={}s promoted={}",
+                        lease.lease_id,
+                        lease.target_node,
+                        lease.service,
+                        lease.active_slot,
+                        lease.candidate_slot,
+                        lease.artifact_digest,
+                        lease.ttl_remaining_ms / 1_000,
+                        lease.promoted,
+                    ),
+                },
+            );
+        }
+
+        // 3. muregist (Artifact & Crate Registry) & cas-blob-store (Content-Addressed Storage Sidecar)
+        let cas = &self.registry.cas;
+        let cas_sev = if cas.corrupt_blobs > 0 {
+            LogSeverity::Error
+        } else {
+            LogSeverity::Info
+        };
+        push_unique_log(
+            &mut live,
+            OtelLogEntry {
+                timestamp_ms: base_ts.saturating_sub(1_100),
+                severity: cas_sev,
+                service: "cas-blob-store".into(),
+                span_id: Some("sp-cas-scrub-1".into()),
+                trace_id: String::new(),
+                message: format!(
+                    "[cas-scrub] Content-addressed store verified: {} blobs ({} KiB raw -> {} KiB dedup, ratio={:.2}x) · gc_watermark={}% · corrupt_blobs={}",
+                    cas.blob_count,
+                    cas.raw_bytes / 1_024,
+                    cas.dedup_bytes / 1_024,
+                    f64::from(cas.dedup_ratio_bp) / 100.0,
+                    cas.gc_watermark_pct,
+                    cas.corrupt_blobs,
+                ),
+            },
+        );
+        for (c_idx, c) in self.registry.canaries.iter().take(8).enumerate() {
+            let c_sev = match c.state {
+                CanaryBundleState::Tainted => LogSeverity::Error,
+                CanaryBundleState::RolledBack => LogSeverity::Warn,
+                CanaryBundleState::Promoted | CanaryBundleState::Candidate => LogSeverity::Info,
+            };
+            let taint_suffix = c
+                .taint_reason
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" reason={r}"));
+            let c_off = u64::try_from(c_idx).unwrap_or(0) * 4_000;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(c_off + 1_300),
+                    severity: c_sev,
+                    service: "muregist".into(),
+                    span_id: Some(format!("sp-reg-cny-{}", c_idx + 1)),
+                    trace_id: c.trace_id.clone(),
+                    message: format!(
+                        "[canary-bundle] [{}] service={} ({}/{}) digest={} state={:?} deploy={}{taint_suffix}",
+                        c.bundle_id,
+                        c.service,
+                        c.repo.owner,
+                        c.repo.repo,
+                        c.artifact_digest,
+                        c.state,
+                        c.deployment_id,
+                    ),
+                },
+            );
+        }
+        for (p_idx, pkg) in self.registry.packages.iter().take(8).enumerate() {
+            let p_sev = if pkg.yanked || pkg.tainted {
+                LogSeverity::Warn
+            } else {
+                LogSeverity::Info
+            };
+            let p_off = u64::try_from(p_idx).unwrap_or(0) * 4_500;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(p_off + 1_600),
+                    severity: p_sev,
+                    service: "muregist".into(),
+                    span_id: Some(format!("sp-reg-pkg-{}", p_idx + 1)),
+                    trace_id: String::new(),
+                    message: format!(
+                        "[crate-index] [{}] package={} v{} ({} versions, {} deps) sha256={} yanked={} tainted={}",
+                        pkg.ecosystem.label(),
+                        pkg.name,
+                        pkg.latest_version,
+                        pkg.versions_count,
+                        pkg.deps_count,
+                        pkg.sha256_prefix,
+                        pkg.yanked,
+                        pkg.tainted,
+                    ),
+                },
+            );
+        }
+
+        // 4. muobserve-hub (Observability Analytics Hub) & duckdb-hot-store (DuckDB / Parquet Storage Sidecar)
+        let st = &self.observe.store;
+        push_unique_log(
+            &mut live,
+            OtelLogEntry {
+                timestamp_ms: base_ts.saturating_sub(900),
+                severity: LogSeverity::Info,
+                service: "duckdb-hot-store".into(),
+                span_id: Some("sp-obs-store-1".into()),
+                trace_id: String::new(),
+                message: format!(
+                    "[storage-tier] Hot DuckDB store: {} rows ({} KiB) · Cold Parquet Zstd archive: {} rows across {} partitions (zstd={:.2}x, retention={}d)",
+                    st.hot_duckdb_rows,
+                    st.hot_duckdb_bytes / 1_024,
+                    st.cold_parquet_rows,
+                    st.cold_parquet_partitions,
+                    f64::from(st.zstd_compression_bp) / 100.0,
+                    st.retention_days,
+                ),
+            },
+        );
+        for (m_idx, m) in self.observe.metrics.iter().take(6).enumerate() {
+            let m_sev = if m.error_rate_bp >= 500 {
+                LogSeverity::Warn
+            } else {
+                LogSeverity::Info
+            };
+            let m_off = u64::try_from(m_idx).unwrap_or(0) * 3_800;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(m_off + 1_900),
+                    severity: m_sev,
+                    service: "muobserve-hub".into(),
+                    span_id: Some(format!("sp-obs-met-{}", m_idx + 1)),
+                    trace_id: m.exemplar_trace_id.clone(),
+                    message: format!(
+                        "[golden-signals] Service {} [{}] :: rps={} p50={}ms p95={}ms p99={}ms err={:.2}%",
+                        m.service,
+                        m.hardware_class,
+                        m.rps,
+                        m.p50_ms,
+                        m.p95_ms,
+                        m.p99_ms,
+                        f64::from(m.error_rate_bp) / 100.0,
+                    ),
+                },
+            );
+        }
+        for (p_idx, p) in self.observe.problems.iter().take(6).enumerate() {
+            let p_sev = if p.severity.eq_ignore_ascii_case("error") {
+                LogSeverity::Error
+            } else {
+                LogSeverity::Warn
+            };
+            let p_off = u64::try_from(p_idx).unwrap_or(0) * 2_500;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(p_off + 400),
+                    severity: p_sev,
+                    service: "muobserve-hub".into(),
+                    span_id: Some(format!("sp-obs-prb-{}", p_idx + 1)),
+                    trace_id: p.root_cause_trace_id.clone(),
+                    message: format!(
+                        "[slo-alert] [{}] {}: {} · impacted={} · burn={:.2}x",
+                        p.problem_id,
+                        p.category.label(),
+                        p.title,
+                        p.impacted_entity,
+                        f64::from(p.burn_rate_bp) / 100.0,
+                    ),
+                },
+            );
+        }
+
+        // 5. mu-isolation (Fleet & KernelSandbox Enforcement)
+        for (n_idx, n) in self.nodes.values().enumerate() {
+            let n_sev = if n.online {
+                LogSeverity::Info
+            } else {
+                LogSeverity::Warn
+            };
+            let n_off = u64::try_from(n_idx).unwrap_or(0) * 3_200;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(n_off + 2_100),
+                    severity: n_sev,
+                    service: "mu-isolation".into(),
+                    span_id: Some(format!("sp-flt-node-{}", n_idx + 1)),
+                    trace_id: String::new(),
+                    message: format!(
+                        "[node-heartbeat] Worker {} ({}) online={} slots={}/{} cpu={:.1}% ram={}/{}MiB btrfs={} toolchains=[{}]",
+                        n.id,
+                        n.arch,
+                        n.online,
+                        n.active_slots,
+                        n.max_slots,
+                        f64::from(n.cpu_load_bp) / 100.0,
+                        n.ram_used_mb,
+                        n.ram_total_mb,
+                        n.btrfs_enabled,
+                        n.toolchains.join(","),
+                    ),
+                },
+            );
+        }
+        for (sb_idx, sb) in self.sandboxes.iter().take(4).enumerate() {
+            let sb_off = u64::try_from(sb_idx).unwrap_or(0) * 5_500;
+            push_unique_log(
+                &mut live,
+                OtelLogEntry {
+                    timestamp_ms: base_ts.saturating_sub(sb_off + 2_400),
+                    severity: LogSeverity::Info,
+                    service: "mu-isolation".into(),
+                    span_id: Some(format!("sp-flt-sb-{}", sb_idx + 1)),
+                    trace_id: String::new(),
+                    message: format!(
+                        "[sandbox-policy] Profile {} ({}) :: target={} max_slots={} threads={} max_pids={}",
+                        sb.profile_name,
+                        sb.backend,
+                        sb.hardware_target,
+                        sb.max_slots,
+                        sb.thread_budget,
+                        sb.max_pids,
+                    ),
+                },
+            );
+        }
+
+        // Preserve up to 6 external correlated trace logs from ObsTraceDetail.
         let mut correlated_count = 0_usize;
-        for existing in std::mem::take(&mut self.observe.logs) {
+        for existing in prev_logs {
             if matches!(
                 existing.trace_id.as_str(),
                 "tr-reg-taint-01" | "tr-obs-p99-07" | "tr-ci-1234" | "tr-cd-0042"
-            ) {
+            ) || existing.message.starts_with('[')
+                || existing.trace_id.starts_with("tr-ci-")
+                || existing.trace_id.starts_with("tr-cd-")
+            {
                 continue;
             }
-            let already_present = live
+            if !live
                 .iter()
-                .any(|l| l.trace_id == existing.trace_id && l.message == existing.message);
-            if !already_present && correlated_count < 6 {
+                .any(|e| e.service == existing.service && e.message == existing.message)
+                && correlated_count < 6
+            {
                 live.push(existing);
                 correlated_count += 1;
             }
         }
+
+        live.sort_by_key(|a| std::cmp::Reverse(a.timestamp_ms));
+        live.truncate(120);
         self.observe.logs = live;
     }
 
@@ -2534,8 +3034,7 @@ impl Store {
 
         let mut seen_log_services: Vec<String> = Vec::new();
         for (idx, l) in self
-            .observe
-            .logs
+            .live_obs_logs
             .iter()
             .filter(|l| l.severity == LogSeverity::Error)
             .enumerate()
@@ -3172,6 +3671,7 @@ impl Store {
         if list.is_empty() && self.source == DataSource::Live && !self.registry.canaries.is_empty()
         {
             self.refresh_live_cd();
+            self.refresh_live_logs();
             return true;
         }
         let mut sorted: Vec<&DeploymentDto> = list.iter().collect();
@@ -3213,6 +3713,9 @@ impl Store {
         let latest = self.latest.get(repo).cloned();
         if let Some(id) = latest {
             self.refresh_cd(&id);
+        }
+        if self.source == DataSource::Live {
+            self.refresh_live_logs();
         }
         true
     }
@@ -3261,6 +3764,9 @@ impl Store {
         };
         self.gates.insert(id.clone(), gate);
         self.refresh_cd(&id);
+        if self.source == DataSource::Live {
+            self.refresh_live_logs();
+        }
         true
     }
 
@@ -3780,5 +4286,150 @@ mod tests {
             .problems
             .iter()
             .any(|p| p.problem_id.starts_with("PRB-LOG-muobserve-collector-")));
+    }
+
+    #[test]
+    fn obs_logs_normalization_and_multi_service_synthesis() {
+        let mut s = Store::new(DataSource::Live);
+        s.apply(
+            Input::ClusterNodes(vec![ClusterNodeDto {
+                node_id: "worker-riscv64".into(),
+                is_online: true,
+                arch: "riscv64".into(),
+                active_slots: 1,
+                max_slots: 1,
+                cpu_load_pct: 12.0,
+                ram_used_mb: 2048,
+                ram_total_mb: 32768,
+                btrfs_enabled: true,
+                exclusive_locked: false,
+                last_seen_secs_ago: 1,
+                tags: vec!["spacemit-k3".into()],
+                toolchains: vec!["stable".into(), "nightly".into()],
+            }]),
+            5,
+        );
+        s.apply(
+            Input::RegPackages(vec![PackageDto {
+                ecosystem: PackageEcosystem::Cargo,
+                name: "mu-isolation".into(),
+                latest_version: "0.4.2".into(),
+                versions_count: 3,
+                sha256_prefix: "4a8b91e0c21f".into(),
+                sha256: String::new(),
+                deps_count: 4,
+                yanked: false,
+                tainted: false,
+                taint_reason: None,
+                versions: vec!["0.4.2".into()],
+            }]),
+            8,
+        );
+        s.apply(
+            Input::RegCanaries(vec![CanaryBundleDto {
+                bundle_id: "cny-101".into(),
+                owner: "LMA1980".into(),
+                repo: "mu-console".into(),
+                service: "muconsole".into(),
+                artifact_digest: "sha256:9f82c01a334e".into(),
+                state: CanaryBundleState::Promoted,
+                taint_reason: None,
+                deployment_id: "dep-101".into(),
+                trace_id: "tr-cd-101".into(),
+            }]),
+            10,
+        );
+        s.apply(
+            Input::ObsLogs(vec![
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_500_000,
+                    severity: LogSeverity::Error,
+                    service: "action-runner-controller".into(),
+                    span_id: None,
+                    trace_id: "tr-ok-1".into(),
+                    message: "\u{1b}[32mtest result: ok.\u{1b}[0m 42 passed; 0 failed".into(),
+                },
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_499_000,
+                    severity: LogSeverity::Info,
+                    service: "actionrunner-rs".into(),
+                    span_id: None,
+                    trace_id: "tr-skip-1".into(),
+                    message: "   running 0 tests   ".into(),
+                },
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_498_000,
+                    severity: LogSeverity::Error,
+                    service: "muobserve-collector".into(),
+                    span_id: None,
+                    trace_id: "tr-dstate-1".into(),
+                    message: "Host pressure / D-state alert on node-a: wchan=0 io_some_avg10=1.25"
+                        .into(),
+                },
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_497_000,
+                    severity: LogSeverity::Error,
+                    service: "muobserve-collector".into(),
+                    span_id: None,
+                    trace_id: "tr-dstate-2".into(),
+                    message: "Host pressure / D-state alert on node-a: wchan=0 io_some_avg10=2.10"
+                        .into(),
+                },
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_496_000,
+                    severity: LogSeverity::Error,
+                    service: "muobserve-collector".into(),
+                    span_id: None,
+                    trace_id: "tr-dstate-3".into(),
+                    message: "Host pressure / D-state alert on node-a: wchan=0 io_some_avg10=0.50"
+                        .into(),
+                },
+                OtelLogDto {
+                    timestamp_ms: 1_762_742_495_000,
+                    severity: LogSeverity::Error,
+                    service: "muobserve-collector".into(),
+                    span_id: None,
+                    trace_id: "tr-dstate-4".into(),
+                    message: "Host pressure / D-state alert on node-a: wchan=0 io_some_avg10=3.10"
+                        .into(),
+                },
+            ]),
+            15,
+        );
+
+        let v = s.view();
+        let first = &v.observe.logs[0];
+        assert_eq!(first.service, "actionrunner-controller");
+        assert_eq!(first.severity, LogSeverity::Info);
+        assert_eq!(first.message, "test result: ok. 42 passed; 0 failed");
+        assert!(!v
+            .observe
+            .logs
+            .iter()
+            .any(|l| l.message.eq_ignore_ascii_case("running 0 tests")));
+        let dstates: Vec<&OtelLogEntry> = v
+            .observe
+            .logs
+            .iter()
+            .filter(|l| l.message.contains("Host pressure / D-state alert"))
+            .collect();
+        assert_eq!(dstates.len(), 3);
+        assert!(dstates.iter().all(|l| l.severity == LogSeverity::Warn));
+
+        // Verify multi-service & sidecar operational log synthesis.
+        for svc in [
+            "muconde-controller",
+            "muconde-agent",
+            "muregist",
+            "cas-blob-store",
+            "duckdb-hot-store",
+            "muobserve-hub",
+            "mu-isolation",
+        ] {
+            assert!(
+                v.observe.logs.iter().any(|l| l.service == svc),
+                "expected synthesized operational log for service {svc}"
+            );
+        }
     }
 }
