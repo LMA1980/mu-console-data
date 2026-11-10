@@ -106,8 +106,11 @@ pub struct Store {
     sandboxes: Vec<SandboxProfileSummary>,
     registry: RegistryView,
     observe: ObserveView,
+    live_obs_logs: Vec<OtelLogEntry>,
     live_obs_metrics: Vec<HardwareMetricSeries>,
     live_obs_problems: Vec<SloProblem>,
+    live_smartscape_nodes: Vec<SmartscapeNode>,
+    live_smartscape_edges: Vec<SmartscapeEdge>,
     ci_jobs: Vec<CiJobSummary>,
     job_id_strings: BTreeMap<u64, String>,
     job_logs: BTreeMap<u64, Vec<String>>,
@@ -1128,6 +1131,7 @@ impl Store {
                     }
                 }
                 if self.source == DataSource::Live {
+                    self.refresh_live_smartscape();
                     self.refresh_live_metrics();
                 }
                 true
@@ -1268,48 +1272,60 @@ impl Store {
                 self.loaded = true;
                 self.ensure_aux_defaults();
                 let (nodes, edges) = d.into_nodes_and_edges();
-                if !nodes.is_empty() {
-                    self.observe.smartscape_nodes = nodes
-                        .into_iter()
-                        .map(|n| {
-                            let req_per_sec_bp = n.effective_req_per_sec_bp();
-                            let error_rate_bp = n.effective_error_rate_bp();
-                            let p95_ms = n.effective_p95_ms();
-                            let healthy = n.effective_healthy();
-                            let label = if n.label.is_empty() {
-                                sanitize_public_log(&n.id)
-                            } else {
-                                sanitize_public_log(&n.label)
-                            };
-                            SmartscapeNode {
-                                id: sanitize_public_log(&n.id),
-                                label,
-                                layer: n.layer,
-                                req_per_sec_bp,
-                                error_rate_bp,
-                                p95_ms,
-                                healthy,
-                            }
-                        })
-                        .collect();
-                }
-                if !edges.is_empty() {
-                    self.observe.smartscape_edges = edges
-                        .into_iter()
-                        .map(|e| {
-                            let call_rate_rps = e.effective_call_rate_rps();
-                            let error_rate_bp = e.effective_error_rate_bp();
-                            let p95_ms = e.effective_p95_ms();
-                            SmartscapeEdge {
-                                from_id: sanitize_public_log(&e.from_id),
-                                to_id: sanitize_public_log(&e.to_id),
-                                protocol: e.protocol,
-                                call_rate_rps,
-                                error_rate_bp,
-                                p95_ms,
-                            }
-                        })
-                        .collect();
+                let mapped_nodes: Vec<SmartscapeNode> = nodes
+                    .into_iter()
+                    .map(|n| {
+                        let req_per_sec_bp = n.effective_req_per_sec_bp();
+                        let error_rate_bp = n.effective_error_rate_bp();
+                        let p95_ms = n.effective_p95_ms();
+                        let healthy = n.effective_healthy();
+                        let label = if n.label.is_empty() {
+                            sanitize_public_log(&n.id)
+                        } else {
+                            sanitize_public_log(&n.label)
+                        };
+                        SmartscapeNode {
+                            id: sanitize_public_log(&n.id),
+                            label,
+                            layer: n.layer,
+                            req_per_sec_bp,
+                            error_rate_bp,
+                            p95_ms,
+                            healthy,
+                        }
+                    })
+                    .collect();
+                let mapped_edges: Vec<SmartscapeEdge> = edges
+                    .into_iter()
+                    .map(|e| {
+                        let call_rate_rps = e.effective_call_rate_rps();
+                        let error_rate_bp = e.effective_error_rate_bp();
+                        let p95_ms = e.effective_p95_ms();
+                        SmartscapeEdge {
+                            from_id: sanitize_public_log(&e.from_id),
+                            to_id: sanitize_public_log(&e.to_id),
+                            protocol: e.protocol,
+                            call_rate_rps,
+                            error_rate_bp,
+                            p95_ms,
+                        }
+                    })
+                    .collect();
+                if self.source == DataSource::Live {
+                    if !mapped_nodes.is_empty() {
+                        self.live_smartscape_nodes = mapped_nodes;
+                    }
+                    if !mapped_edges.is_empty() {
+                        self.live_smartscape_edges = mapped_edges;
+                    }
+                    self.refresh_live_smartscape();
+                } else {
+                    if !mapped_nodes.is_empty() {
+                        self.observe.smartscape_nodes = mapped_nodes;
+                    }
+                    if !mapped_edges.is_empty() {
+                        self.observe.smartscape_edges = mapped_edges;
+                    }
                 }
                 true
             }
@@ -1381,68 +1397,81 @@ impl Store {
                         });
                     }
                 }
+                self.refresh_live_logs();
                 self.refresh_live_problems();
                 true
             }
             Input::ObsLogs(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
+                let mut incoming = Vec::with_capacity(list.len());
+                for l in list {
+                    let clean_msg = sanitize_public_log(&l.message);
+                    let has_real_trace =
+                        !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
+                    if has_real_trace
+                        && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
+                    {
+                        self.observe.traces.push(PurePathTrace {
+                            trace_id: l.trace_id.clone(),
+                            root_service: l.service.clone(),
+                            root_operation: clean_msg.clone(),
+                            domain: "OBS".into(),
+                            duration_ms: 12,
+                            error: l.severity == LogSeverity::Error,
+                            slow_p99: false,
+                            started_epoch_ms: l.timestamp_ms,
+                            spans: vec![TraceSpan {
+                                span_id: l.span_id.clone().unwrap_or_else(|| "sp-obs-log-1".into()),
+                                parent_span_id: None,
+                                service: l.service.clone(),
+                                operation: clean_msg.clone(),
+                                start_offset_us: 0,
+                                duration_us: 12_000,
+                                self_time_us: 12_000,
+                                critical_path: true,
+                                error: l.severity == LogSeverity::Error,
+                                hardware_class: "fabric-collector".into(),
+                            }],
+                        });
+                    }
+                    if !incoming
+                        .iter()
+                        .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
+                    {
+                        incoming.push(OtelLogEntry {
+                            timestamp_ms: l.timestamp_ms,
+                            severity: l.severity,
+                            service: l.service,
+                            span_id: l.span_id,
+                            trace_id: l.trace_id,
+                            message: clean_msg,
+                        });
+                    }
+                }
+                if self.source == DataSource::Live {
+                    if !incoming.is_empty() {
+                        self.live_obs_logs = incoming;
+                    }
+                    self.refresh_live_logs();
+                    self.refresh_live_smartscape();
+                    self.refresh_live_problems();
+                } else if !incoming.is_empty() {
                     let mut merged: Vec<OtelLogEntry> = self
                         .observe
                         .logs
                         .drain(..)
                         .filter(|l| l.trace_id.starts_with("tr-ci-") && l.trace_id != "tr-ci-1234")
                         .collect();
-                    for l in list {
-                        let clean_msg = sanitize_public_log(&l.message);
-                        let has_real_trace =
-                            !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
-                        if has_real_trace
-                            && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
-                        {
-                            self.observe.traces.push(PurePathTrace {
-                                trace_id: l.trace_id.clone(),
-                                root_service: l.service.clone(),
-                                root_operation: clean_msg.clone(),
-                                domain: "OBS".into(),
-                                duration_ms: 12,
-                                error: l.severity == LogSeverity::Error,
-                                slow_p99: false,
-                                started_epoch_ms: l.timestamp_ms,
-                                spans: vec![TraceSpan {
-                                    span_id: l
-                                        .span_id
-                                        .clone()
-                                        .unwrap_or_else(|| "sp-obs-log-1".into()),
-                                    parent_span_id: None,
-                                    service: l.service.clone(),
-                                    operation: clean_msg.clone(),
-                                    start_offset_us: 0,
-                                    duration_us: 12_000,
-                                    self_time_us: 12_000,
-                                    critical_path: true,
-                                    error: l.severity == LogSeverity::Error,
-                                    hardware_class: "fabric-collector".into(),
-                                }],
-                            });
-                        }
+                    for entry in incoming {
                         if !merged
                             .iter()
-                            .any(|e| e.trace_id == l.trace_id && e.message == clean_msg)
+                            .any(|e| e.trace_id == entry.trace_id && e.message == entry.message)
                         {
-                            merged.push(OtelLogEntry {
-                                timestamp_ms: l.timestamp_ms,
-                                severity: l.severity,
-                                service: l.service,
-                                span_id: l.span_id,
-                                trace_id: l.trace_id,
-                                message: clean_msg,
-                            });
+                            merged.push(entry);
                         }
                     }
                     self.observe.logs = merged;
-                    self.refresh_live_problems();
                 }
                 true
             }
@@ -1468,6 +1497,7 @@ impl Store {
                         self.live_obs_metrics = mapped;
                     }
                     self.refresh_live_metrics();
+                    self.refresh_live_smartscape();
                 } else if !mapped.is_empty() {
                     self.observe.metrics = mapped;
                 }
@@ -1938,7 +1968,8 @@ impl Store {
             .any(|l| l.trace_id == trace_id && l.message == log_msg)
         {
             self.observe.logs.push(OtelLogEntry {
-                timestamp_ms: 1_700_000_900_u64.saturating_sub(u64::try_from(job_idx).unwrap_or(0)),
+                timestamp_ms: 1_700_000_900_000_u64
+                    .saturating_sub(u64::try_from(job_idx).unwrap_or(0) * 1_000),
                 severity: if is_err {
                     LogSeverity::Error
                 } else {
@@ -2032,10 +2063,305 @@ impl Store {
             }
         }
         self.observe.traces = live_traces;
+        self.refresh_live_logs();
         self.refresh_live_metrics();
         self.refresh_live_cd();
+        self.refresh_live_smartscape();
         self.refresh_live_problems();
         true
+    }
+
+    fn refresh_live_logs(&mut self) {
+        if self.source != DataSource::Live {
+            return;
+        }
+        let mut live = self.live_obs_logs.clone();
+        live.sort_by_key(|a| std::cmp::Reverse(a.timestamp_ms));
+        let mut correlated_count = 0_usize;
+        for existing in std::mem::take(&mut self.observe.logs) {
+            if matches!(
+                existing.trace_id.as_str(),
+                "tr-reg-taint-01" | "tr-obs-p99-07" | "tr-ci-1234" | "tr-cd-0042"
+            ) {
+                continue;
+            }
+            let already_present = live
+                .iter()
+                .any(|l| l.trace_id == existing.trace_id && l.message == existing.message);
+            if !already_present && correlated_count < 6 {
+                live.push(existing);
+                correlated_count += 1;
+            }
+        }
+        self.observe.logs = live;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn refresh_live_smartscape(&mut self) {
+        if self.source != DataSource::Live {
+            return;
+        }
+        if !self.live_smartscape_nodes.is_empty() {
+            self.observe.smartscape_nodes = self.live_smartscape_nodes.clone();
+            if !self.live_smartscape_edges.is_empty() {
+                self.observe.smartscape_edges = self.live_smartscape_edges.clone();
+            }
+            return;
+        }
+
+        let mut nodes: Vec<SmartscapeNode> = Vec::new();
+        let mut edges: Vec<SmartscapeEdge> = Vec::new();
+
+        // 1. Host nodes from live cluster nodes (or canonical fabric fallback).
+        if self.nodes.is_empty() {
+            for (id, label, rps_bp, p95_ms) in [
+                ("host:node-a", "node-a (x86_64)", 210, 5),
+                ("host:node-b", "node-b (x86_64)", 340, 6),
+                ("host:worker-riscv64", "worker-riscv64 (riscv64)", 480, 7),
+            ] {
+                nodes.push(SmartscapeNode {
+                    id: id.into(),
+                    label: label.into(),
+                    layer: SmartscapeLayer::Host,
+                    req_per_sec_bp: rps_bp,
+                    error_rate_bp: 0,
+                    p95_ms,
+                    healthy: true,
+                });
+            }
+        } else {
+            for n in self.nodes.values() {
+                let host_id = format!("host:{}", n.id);
+                let host_label = format!("{} ({})", n.id, n.arch);
+                nodes.push(SmartscapeNode {
+                    id: host_id,
+                    label: host_label,
+                    layer: SmartscapeLayer::Host,
+                    req_per_sec_bp: (n.active_slots * 100).max(n.cpu_load_bp),
+                    error_rate_bp: if n.online { 0 } else { 10_000 },
+                    p95_ms: (n.cpu_load_bp / 100).max(4),
+                    healthy: n.online,
+                });
+            }
+        }
+
+        // 2. Process nodes (per-host CI workers + core platform crates/daemons/sidecars).
+        for n in self.nodes.values() {
+            let host_id = format!("host:{}", n.id);
+            let proc_id = format!("proc:action-runner@{}", n.id);
+            let proc_label = format!(
+                "action-runner ({}, {}/{} slots)",
+                n.id,
+                n.active_slots,
+                n.max_slots.max(1)
+            );
+            nodes.push(SmartscapeNode {
+                id: proc_id.clone(),
+                label: proc_label,
+                layer: SmartscapeLayer::Process,
+                req_per_sec_bp: n.cpu_load_bp.max(100),
+                error_rate_bp: if n.online { 0 } else { 10_000 },
+                p95_ms: 12,
+                healthy: n.online,
+            });
+            edges.push(SmartscapeEdge {
+                from_id: "svc:action-runner-controller".into(),
+                to_id: proc_id.clone(),
+                protocol: "HTTPS/mTLS".into(),
+                call_rate_rps: 4,
+                error_rate_bp: 0,
+                p95_ms: 8,
+            });
+            edges.push(SmartscapeEdge {
+                from_id: proc_id,
+                to_id: host_id,
+                protocol: "cgroupv2/MuIsolation".into(),
+                call_rate_rps: 4,
+                error_rate_bp: 0,
+                p95_ms: 2,
+            });
+        }
+
+        let primary_host = nodes
+            .iter()
+            .find(|n| n.layer == SmartscapeLayer::Host)
+            .map_or_else(|| String::from("host:node-a"), |n| n.id.clone());
+        for (proc_id, proc_label, rps_bp, p95_ms) in [
+            (
+                "proc:mu-observable",
+                "muobserve-collector / hub (OTel + DuckDB)",
+                320,
+                4,
+            ),
+            (
+                "proc:actionrunner-controller",
+                "actionrunner-controller (CI Control Plane)",
+                420,
+                8,
+            ),
+            (
+                "proc:actionrunner-rs",
+                "actionrunner-rs (CI Worker Daemon)",
+                380,
+                12,
+            ),
+            (
+                "proc:muconde-controller",
+                "muconde-controller (CD Control Plane)",
+                160,
+                6,
+            ),
+            (
+                "proc:muconde-agent",
+                "muconde-agent (CD Slot Agent)",
+                140,
+                9,
+            ),
+            ("proc:muregist", "muregist (CAS & Release Registry)", 210, 5),
+            (
+                "proc:duckdb-hot-store",
+                "duckdb-hot-store (Sidecar Analytics Engine)",
+                260,
+                3,
+            ),
+        ] {
+            if !nodes.iter().any(|n| n.id == proc_id) {
+                nodes.push(SmartscapeNode {
+                    id: proc_id.into(),
+                    label: proc_label.into(),
+                    layer: SmartscapeLayer::Process,
+                    req_per_sec_bp: rps_bp,
+                    error_rate_bp: 0,
+                    p95_ms,
+                    healthy: true,
+                });
+                edges.push(SmartscapeEdge {
+                    from_id: proc_id.into(),
+                    to_id: primary_host.clone(),
+                    protocol: "systemd/mTLS".into(),
+                    call_rate_rps: 3,
+                    error_rate_bp: 0,
+                    p95_ms: 2,
+                });
+            }
+        }
+
+        // 3. Service nodes (core services + distinct services observed in logs, metrics, leases, canaries).
+        for (svc_id, svc_label, proc_id, proto, rps_bp, p95_ms) in [
+            (
+                "svc:action-runner-controller",
+                "ActionRunner Controller (CI)",
+                "proc:actionrunner-controller",
+                "HTTPS/mTLS",
+                420,
+                8,
+            ),
+            (
+                "svc:muconde-controller",
+                "MuConDe Controller (CD)",
+                "proc:muconde-controller",
+                "HTTPS/mTLS",
+                120,
+                6,
+            ),
+            (
+                "svc:muregist",
+                "MuRegist Artifact CAS (REG)",
+                "proc:muregist",
+                "HTTPS/mTLS",
+                180,
+                5,
+            ),
+            (
+                "svc:muobserve-collector",
+                "MuObserve OTel Collector (OBS)",
+                "proc:mu-observable",
+                "OTLP/mTLS",
+                310,
+                4,
+            ),
+        ] {
+            let bare_name = svc_id.strip_prefix("svc:").unwrap_or(svc_id);
+            let err_logs = self
+                .live_obs_logs
+                .iter()
+                .filter(|l| {
+                    l.service.eq_ignore_ascii_case(bare_name) && l.severity == LogSeverity::Error
+                })
+                .count();
+            let err_bp = u32::try_from(err_logs * 50).unwrap_or(0);
+            nodes.push(SmartscapeNode {
+                id: svc_id.into(),
+                label: svc_label.into(),
+                layer: SmartscapeLayer::Service,
+                req_per_sec_bp: rps_bp,
+                error_rate_bp: err_bp,
+                p95_ms,
+                healthy: err_logs == 0,
+            });
+            edges.push(SmartscapeEdge {
+                from_id: svc_id.into(),
+                to_id: proc_id.into(),
+                protocol: proto.into(),
+                call_rate_rps: (rps_bp / 100).max(1),
+                error_rate_bp: err_bp,
+                p95_ms,
+            });
+        }
+
+        let mut extra_services: Vec<String> = Vec::new();
+        for s in self
+            .live_obs_logs
+            .iter()
+            .map(|l| l.service.as_str())
+            .chain(self.live_obs_metrics.iter().map(|m| m.service.as_str()))
+            .chain(self.leases.iter().map(|l| l.service.as_str()))
+            .chain(self.registry.canaries.iter().map(|c| c.service.as_str()))
+        {
+            let trimmed = s.trim().trim_start_matches("svc:");
+            if !trimmed.is_empty()
+                && !trimmed.starts_with("node:")
+                && !extra_services
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(trimmed))
+            {
+                extra_services.push(trimmed.to_owned());
+            }
+        }
+        for svc_name in extra_services {
+            let svc_id = format!("svc:{svc_name}");
+            if nodes.iter().any(|n| n.id.eq_ignore_ascii_case(&svc_id)) {
+                continue;
+            }
+            let err_logs = self
+                .live_obs_logs
+                .iter()
+                .filter(|l| {
+                    l.service.eq_ignore_ascii_case(&svc_name) && l.severity == LogSeverity::Error
+                })
+                .count();
+            let err_bp = u32::try_from(err_logs * 50).unwrap_or(0);
+            nodes.push(SmartscapeNode {
+                id: svc_id.clone(),
+                label: format!("{svc_name} (Observed Service)"),
+                layer: SmartscapeLayer::Service,
+                req_per_sec_bp: 150,
+                error_rate_bp: err_bp,
+                p95_ms: 6,
+                healthy: err_logs == 0,
+            });
+            edges.push(SmartscapeEdge {
+                from_id: svc_id,
+                to_id: "proc:mu-observable".into(),
+                protocol: "OTLP/mTLS".into(),
+                call_rate_rps: 2,
+                error_rate_bp: err_bp,
+                p95_ms: 4,
+            });
+        }
+
+        self.observe.smartscape_nodes = nodes;
+        self.observe.smartscape_edges = edges;
     }
 
     fn refresh_live_metrics(&mut self) {
@@ -2427,6 +2753,7 @@ impl Store {
                 })
                 .collect();
         }
+        self.refresh_live_smartscape();
     }
 
     fn summary(&mut self, s: &RepoSummaryDto) -> bool {

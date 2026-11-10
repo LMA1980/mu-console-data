@@ -873,6 +873,10 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         .iter()
         .any(|e| e.from_id == "svc:action-runner-controller"
             && e.to_id == "proc:action-runner@worker-riscv64"));
+    assert_eq!(
+        v_after_log.observe.logs[0].service, "muobserve-collector",
+        "Live MuObserve OTel logs must be prioritized ahead of synthetic CI job logs"
+    );
     assert!(v_after_log
         .observe
         .logs
@@ -880,9 +884,22 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
         .any(|l| l.service == "actionrunner-rs" && l.trace_id == "tr-ci-af7344"));
     assert!(v_after_log
         .observe
-        .logs
+        .smartscape_nodes
         .iter()
-        .any(|l| l.service == "muobserve-collector"));
+        .any(|n| n.id == "proc:mu-observable"));
+    assert!(v_after_log
+        .observe
+        .smartscape_nodes
+        .iter()
+        .any(|n| n.id == "proc:duckdb-hot-store"));
+
+    // Verify subsequent CiQueue updates preserve live_obs_logs at the top of observe.logs.
+    eng.on_fetch_gen(gen0, &FetchKind::CiQueue, Ok(queue_json.into()), 39);
+    let v_after_requeue = eng.store().view();
+    assert_eq!(
+        v_after_requeue.observe.logs[0].service,
+        "muobserve-collector"
+    );
     assert!(!v_after_log.observe.metrics.is_empty());
     assert!(v_after_log.registry.packages.is_empty());
     assert!(v_after_log.registry.canaries.is_empty());
