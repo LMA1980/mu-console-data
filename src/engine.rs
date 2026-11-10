@@ -108,6 +108,7 @@ pub struct Engine {
     asked_job_details: BTreeSet<u64>,
     fallback_job_logs: BTreeSet<u64>,
     selected_job_id: Option<u64>,
+    active_subview: Option<SubView>,
     last_live_poll_ms: u64,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
@@ -134,6 +135,7 @@ impl Engine {
             asked_job_details: BTreeSet::new(),
             fallback_job_logs: BTreeSet::new(),
             selected_job_id: None,
+            active_subview: None,
             last_live_poll_ms: 0,
             selection_gen: 0,
             pending_select: None,
@@ -214,6 +216,7 @@ impl Engine {
         match cmd {
             UiCommand::Configure(cfg) => self.configure(cfg, now_ms, &mut fx),
             UiCommand::Subscribe(route) => {
+                self.active_subview = Some(route.subview);
                 if let Some(repo) = route.repo {
                     self.select(
                         Selection {
@@ -228,17 +231,32 @@ impl Engine {
                     if let Some(tid) = route.trace_id {
                         self.fetch(FetchKind::ObsTraceDetail(tid), &mut fx);
                     }
+                    if matches!(
+                        route.subview,
+                        SubView::Observe(ObserveSubView::Logs) | SubView::Ci(CiSubView::QueueLogs)
+                    ) {
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                        self.fetch(FetchKind::ObsLogs, &mut fx);
+                    }
                 }
             }
             UiCommand::SelectRepo { repo, submodule } => {
                 self.select(Selection { repo, submodule }, now_ms, &mut fx);
             }
             UiCommand::SelectSubView(subview) => {
+                self.active_subview = Some(subview);
                 if self.mode == Mode::Live {
                     match subview {
                         SubView::Ci(CiSubView::QueueLogs) => {
                             self.fetch(FetchKind::CiQueue, &mut fx);
                             self.fetch(FetchKind::ObsLogs, &mut fx);
+                            if let Some(job_id) = self
+                                .selected_job_id
+                                .or_else(|| self.store.view().ci_jobs.first().map(|j| j.job_id))
+                            {
+                                self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                                self.fetch_active_job_log(job_id, &mut fx);
+                            }
                         }
                         SubView::Cd(CdSubView::IntegrationGate | CdSubView::DeploymentsSlots) => {
                             self.fetch_selection(&mut fx);
@@ -269,6 +287,7 @@ impl Engine {
                         }
                         SubView::Observe(ObserveSubView::Logs) => {
                             self.fetch(FetchKind::ObsLogs, &mut fx);
+                            self.fetch(FetchKind::CiQueue, &mut fx);
                         }
                         SubView::Observe(ObserveSubView::Metrics) => {
                             self.fetch(FetchKind::ObsMetrics, &mut fx);
@@ -345,7 +364,13 @@ impl Engine {
                     self.selected_job_id = Some(job_id);
                     if self.mode == Mode::Live {
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
-                        self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                        if self.fallback_job_logs.contains(&job_id)
+                            && !self.store.auth().is_operator()
+                        {
+                            self.fetch_obs_job_log(job_id, &mut fx);
+                        } else {
+                            self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                        }
                     }
                 }
             }
@@ -930,6 +955,7 @@ impl Engine {
                             .last_live_poll_ms
                             .saturating_add(LIVE_ACTIVE_JOB_POLL_MS)
                 {
+                    let mut polled = false;
                     let active_job_id = self
                         .selected_job_id
                         .filter(|id| {
@@ -946,10 +972,47 @@ impl Engine {
                                 .find(|j| j.queue_state == "Active" || j.queue_state == "Queued")
                                 .map(|j| j.job_id)
                         });
+                    if matches!(
+                        self.active_subview,
+                        Some(
+                            SubView::Observe(ObserveSubView::Logs)
+                                | SubView::Ci(CiSubView::QueueLogs)
+                        )
+                    ) {
+                        polled = true;
+                        self.fetch(FetchKind::ObsLogs, &mut fx);
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                    }
                     if let Some(job_id) = active_job_id {
-                        self.last_live_poll_ms = now_ms;
+                        polled = true;
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                         self.fetch_active_job_log(job_id, &mut fx);
+                    } else if self.active_subview == Some(SubView::Ci(CiSubView::QueueLogs)) {
+                        let missing_log_job_id = self
+                            .selected_job_id
+                            .filter(|id| {
+                                self.store
+                                    .view()
+                                    .ci_jobs
+                                    .iter()
+                                    .any(|j| j.job_id == *id && j.raw_log_lines.is_empty())
+                            })
+                            .or_else(|| {
+                                self.store
+                                    .view()
+                                    .ci_jobs
+                                    .first()
+                                    .filter(|j| j.raw_log_lines.is_empty())
+                                    .map(|j| j.job_id)
+                            });
+                        if let Some(job_id) = missing_log_job_id {
+                            polled = true;
+                            self.fetch(FetchKind::JobDetail(job_id), &mut fx);
+                            self.fetch_active_job_log(job_id, &mut fx);
+                        }
+                    }
+                    if polled {
+                        self.last_live_poll_ms = now_ms;
                     }
                 }
             }
