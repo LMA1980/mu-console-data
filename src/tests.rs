@@ -1055,4 +1055,46 @@ fn live_sse_push_and_active_job_log_tailing() {
     let v_after = eng.store().view();
     assert_eq!(v_after.ci_jobs[0].stages[0].state, StageState::Passed);
     assert_eq!(v_after.ci_jobs[0].queue_state, "Passed");
+
+    // 4. Switching to OBS > Logs polls ObsLogs + CiQueue on live tick even when no CI job is running.
+    let _ = eng.handle(
+        UiCommand::SelectSubView(SubView::Observe(ObserveSubView::Logs)),
+        2_200,
+    );
+    let obs_tick_fx = eng.tick(4_020);
+    assert!(obs_tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsLogs,
+            ..
+        }
+    )));
+    assert!(obs_tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+
+    // 5. Switching to CI > Queue & Logs polls CiQueue + ObsLogs and hydrates missing job logs on tick.
+    let _ = eng.handle(
+        UiCommand::SelectSubView(SubView::Ci(CiSubView::QueueLogs)),
+        4_100,
+    );
+    let ci_tick_fx = eng.tick(6_030);
+    assert!(ci_tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+    assert!(ci_tick_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::JobLog(id),
+            url,
+        } if *id == job_id && url == "/api/obs/v1/jobs/job-1794054805-5cec9056/log"
+    )));
 }
