@@ -5,9 +5,9 @@ use mu_console_protocol::dto::{
     AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
     CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto,
     LeaseDto, LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
-    PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoListResponseDto, RepoSummaryDto,
-    RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto, TopologyDto,
-    TraceDto,
+    PrStateChangedDto, ProblemDto, PromotedDto, RawMetricPointDto, RepoDto, RepoListResponseDto,
+    RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto,
+    TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
     sanitize_ansi_log_lines, CanaryBundleState, CdLease, RepoId, DEFAULT_MAX_JOB_LOG_LINES,
@@ -160,7 +160,7 @@ impl From<RawCanaryBundleDto> for CanaryBundleDto {
         let artifact_digest = if !raw_digest.starts_with("sha256:") && hex_part.len() >= 12 {
             format!("sha256:{}", &hex_part[..12])
         } else {
-            raw_digest
+            raw_digest.clone()
         };
         let bundle_id = if let Some(uuid) = r.bundle_id.strip_prefix("bundle-") {
             let short: String = uuid.chars().take(4).collect();
@@ -173,6 +173,24 @@ impl From<RawCanaryBundleDto> for CanaryBundleDto {
             _ if hex_part.len() >= 4 => format!("dep-{}", &hex_part[..4]),
             _ => "dep-live".into(),
         };
+        let raw_trace = r.trace_id.unwrap_or_default();
+        let trimmed_trace = raw_trace.trim();
+        let trace_id = if !trimmed_trace.is_empty() {
+            trimmed_trace.to_owned()
+        } else if !raw_digest.is_empty() || !bundle_id.is_empty() {
+            let token: String = hex_part
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(6)
+                .collect();
+            if !token.is_empty() {
+                format!("tr-ci-{token}")
+            } else {
+                format!("tr-reg-{bundle_id}")
+            }
+        } else {
+            String::new()
+        };
         Self {
             bundle_id,
             owner: r.owner.unwrap_or_default(),
@@ -182,7 +200,7 @@ impl From<RawCanaryBundleDto> for CanaryBundleDto {
             state: parse_canary_state(r.state.as_deref()),
             taint_reason: r.taint_reason,
             deployment_id,
-            trace_id: r.trace_id.unwrap_or_default(),
+            trace_id,
         }
     }
 }
@@ -252,12 +270,20 @@ struct ClusterEfficiencyDto {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum MetricsEnvelope {
-    List(Vec<MetricSeriesDto>),
+    List(Vec<RawMetricPointDto>),
     Envelope {
         #[serde(default)]
-        series: Vec<MetricSeriesDto>,
+        series: Option<Vec<RawMetricPointDto>>,
         #[serde(default)]
-        cluster_efficiency: Vec<ClusterEfficiencyDto>,
+        metrics: Option<Vec<RawMetricPointDto>>,
+        #[serde(default)]
+        items: Option<Vec<RawMetricPointDto>>,
+        #[serde(default)]
+        points: Option<Vec<RawMetricPointDto>>,
+        #[serde(default)]
+        timeseries: Option<Vec<RawMetricPointDto>>,
+        #[serde(default)]
+        cluster_efficiency: Option<Vec<ClusterEfficiencyDto>>,
     },
 }
 
@@ -357,8 +383,24 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                                 existing.taint_reason = Some(t.reason);
                             }
                         } else {
+                            let bundle_id: String = t.digest.chars().take(12).collect();
+                            let trimmed_trace = t.trace_id.trim();
+                            let trace_id = if !trimmed_trace.is_empty() {
+                                trimmed_trace.to_owned()
+                            } else {
+                                let token: String = t_hex
+                                    .chars()
+                                    .filter(char::is_ascii_alphanumeric)
+                                    .take(6)
+                                    .collect();
+                                if !token.is_empty() {
+                                    format!("tr-ci-{token}")
+                                } else {
+                                    format!("tr-reg-{bundle_id}")
+                                }
+                            };
                             out.push(CanaryBundleDto {
-                                bundle_id: t.digest.chars().take(12).collect(),
+                                bundle_id,
                                 owner: "LMA1980".into(),
                                 repo: t.service.clone(),
                                 service: t.service,
@@ -366,7 +408,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                                 state: CanaryBundleState::Tainted,
                                 taint_reason: (!t.reason.is_empty()).then_some(t.reason),
                                 deployment_id: String::new(),
-                                trace_id: t.trace_id,
+                                trace_id,
                             });
                         }
                     }
@@ -401,13 +443,31 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
         }
         FetchKind::ObsMetrics => {
             let list = match json::<MetricsEnvelope>(body)? {
-                MetricsEnvelope::List(v) => v,
+                MetricsEnvelope::List(v) => RawMetricPointDto::aggregate_into_series(&v),
                 MetricsEnvelope::Envelope {
-                    mut series,
+                    series,
+                    metrics,
+                    items,
+                    points,
+                    timeseries,
                     cluster_efficiency,
                 } => {
-                    for ce in cluster_efficiency {
-                        series.push(MetricSeriesDto {
+                    let mut raw_points = series.unwrap_or_default();
+                    if let Some(m) = metrics {
+                        raw_points.extend(m);
+                    }
+                    if let Some(it) = items {
+                        raw_points.extend(it);
+                    }
+                    if let Some(pts) = points {
+                        raw_points.extend(pts);
+                    }
+                    if let Some(ts) = timeseries {
+                        raw_points.extend(ts);
+                    }
+                    let mut aggregated = RawMetricPointDto::aggregate_into_series(&raw_points);
+                    for ce in cluster_efficiency.unwrap_or_default() {
+                        aggregated.push(MetricSeriesDto {
                             service: format!("bench ({})", ce.arch),
                             hardware_class: format!(
                                 "{} {} (VLEN={})",
@@ -426,7 +486,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                             ],
                         });
                     }
-                    series
+                    aggregated
                 }
             };
             Input::ObsMetrics(list)
@@ -1077,5 +1137,69 @@ pub(crate) mod tests {
         assert_eq!(metrics[0].p50_ms, 11);
         assert_eq!(metrics[0].p95_ms, 14);
         assert_eq!(metrics[0].p99_ms, 17);
+
+        let raw_obs_metrics = r#"{
+          "metric": "all",
+          "window": "1h",
+          "series": [
+            {
+              "timestamp_ns": 1700000001000000000,
+              "service": "muobserve-collector",
+              "node_id": "worker-riscv64",
+              "metric_name": "host.psi.memory.some_avg60",
+              "metric_unit": "%",
+              "value_f64": 0.35,
+              "arch": "riscv64",
+              "cpu_cluster": "X100",
+              "vlen_bits": 256
+            },
+            {
+              "timestamp_ns": 1700000002000000000,
+              "service": "muobserve-collector",
+              "node_id": "worker-riscv64",
+              "metric_name": "host.psi.memory.some_avg60",
+              "metric_unit": "%",
+              "value_f64": 0.65,
+              "arch": "riscv64",
+              "cpu_cluster": "X100",
+              "vlen_bits": 256
+            }
+          ]
+        }"#;
+        let Input::ObsMetrics(raw_series) =
+            parse_fetch(&FetchKind::ObsMetrics, raw_obs_metrics).expect("raw obs metrics")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(raw_series.len(), 1);
+        assert_eq!(
+            raw_series[0].service,
+            "muobserve-collector · host.psi.memory.some_avg60 (%)"
+        );
+        assert_eq!(
+            raw_series[0].hardware_class,
+            "worker-riscv64 · riscv64 · X100 · rvv-256"
+        );
+        assert_eq!(raw_series[0].rps, 2);
+        assert_eq!(raw_series[0].samples, vec![35, 65]);
+
+        let null_trace_canaries = r#"{
+          "bundles": [
+            {
+              "bundle_id": "bundle-778899aa-0011",
+              "service_name": "muconsole",
+              "binary_digest": "sha256:9f82c01a334e",
+              "status": "healthy",
+              "trace_id": null
+            }
+          ]
+        }"#;
+        let Input::RegCanaries(null_canaries) =
+            parse_fetch(&FetchKind::RegCanaries, null_trace_canaries).expect("null trace canaries")
+        else {
+            panic!("kind");
+        };
+        assert_eq!(null_canaries.len(), 1);
+        assert_eq!(null_canaries[0].trace_id, "tr-ci-9f82c0");
     }
 }

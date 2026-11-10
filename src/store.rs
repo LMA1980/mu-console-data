@@ -106,6 +106,8 @@ pub struct Store {
     sandboxes: Vec<SandboxProfileSummary>,
     registry: RegistryView,
     observe: ObserveView,
+    live_obs_metrics: Vec<HardwareMetricSeries>,
+    live_obs_problems: Vec<SloProblem>,
     ci_jobs: Vec<CiJobSummary>,
     job_id_strings: BTreeMap<u64, String>,
     job_logs: BTreeMap<u64, Vec<String>>,
@@ -148,6 +150,58 @@ fn upsert_sorted<T, K: Ord>(v: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {
         Ok(i) => v[i] = item,
         Err(i) => v.insert(i, item),
     }
+}
+
+fn canonical_service_group(compact: &str) -> Option<&'static str> {
+    match compact {
+        "muobserve" | "muobservecollector" | "muobservehub" | "muobservable"
+        | "muobservablehub" | "muobservablecli" | "muobservablemcp" => Some("mu-observable"),
+        "actionrunnercontroller" | "mucicontroller" => Some("mu-ci-controller"),
+        "actionrunnerrs" | "actionrunnerworker" | "muciworker" | "actionrunner" => {
+            Some("mu-ci-worker")
+        }
+        "actionrunnerweb" | "muconsole" => Some("mu-console"),
+        "mucondecontroller" | "mucdcontroller" => Some("mu-cd-controller"),
+        "mucondeagent" | "mucdagent" => Some("mu-cd-agent"),
+        "muregist" | "muregistry" => Some("mu-registry"),
+        "muisolation" => Some("mu-isolation"),
+        _ => None,
+    }
+}
+
+fn normalize_service_token(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    let without_prefix = trimmed.strip_prefix("svc:").unwrap_or(trimmed);
+    let base = without_prefix
+        .rsplit_once('/')
+        .map_or(without_prefix, |(_, name)| name);
+    let norm = base.to_ascii_lowercase();
+    let compact: String = norm
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .collect();
+    (norm, compact)
+}
+
+/// Match a service name or canary/deployment identifier against a repository name,
+/// normalizing hyphens/underscores and canonical platform service aliases.
+#[must_use]
+pub(crate) fn service_matches_repo(service: &str, repo_name: &str) -> bool {
+    let (norm_a, compact_a) = normalize_service_token(service);
+    let (norm_b, compact_b) = normalize_service_token(repo_name);
+    if compact_a.is_empty() || compact_b.is_empty() {
+        return false;
+    }
+    if norm_a == norm_b || compact_a == compact_b {
+        return true;
+    }
+    matches!(
+        (
+            canonical_service_group(&compact_a),
+            canonical_service_group(&compact_b),
+        ),
+        (Some(ga), Some(gb)) if ga == gb
+    )
 }
 
 fn default_leases() -> Vec<CdLease> {
@@ -1073,6 +1127,9 @@ impl Store {
                         });
                     }
                 }
+                if self.source == DataSource::Live {
+                    self.refresh_live_metrics();
+                }
                 true
             }
             Input::CiQueue(dto) => self.apply_ci_queue(dto),
@@ -1160,8 +1217,8 @@ impl Store {
                                 .repos
                                 .keys()
                                 .find(|id| {
-                                    id.repo.eq_ignore_ascii_case(repo_name)
-                                        || id.repo.eq_ignore_ascii_case(&d.service)
+                                    service_matches_repo(repo_name, &id.repo)
+                                        || service_matches_repo(&d.service, &id.repo)
                                 })
                                 .cloned()
                                 .unwrap_or_else(|| RepoId::new(owner, repo_name));
@@ -1178,6 +1235,7 @@ impl Store {
                         })
                         .collect();
                     self.refresh_live_cd();
+                    self.refresh_live_problems();
                 }
                 true
             }
@@ -1258,23 +1316,27 @@ impl Store {
             Input::ObsProblems(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if self.source == DataSource::Live || !list.is_empty() {
-                    self.observe.problems = list
-                        .into_iter()
-                        .map(|p| {
-                            let active = p.effective_active();
-                            SloProblem {
-                                problem_id: p.problem_id,
-                                title: sanitize_public_log(&p.title),
-                                category: p.category,
-                                severity: p.severity,
-                                burn_rate_bp: p.burn_rate_bp,
-                                impacted_entity: sanitize_public_log(&p.impacted_entity),
-                                root_cause_trace_id: p.root_cause_trace_id,
-                                active,
-                            }
-                        })
-                        .collect();
+                let mapped: Vec<SloProblem> = list
+                    .into_iter()
+                    .map(|p| {
+                        let active = p.effective_active();
+                        SloProblem {
+                            problem_id: p.problem_id,
+                            title: sanitize_public_log(&p.title),
+                            category: p.category,
+                            severity: p.severity,
+                            burn_rate_bp: p.burn_rate_bp,
+                            impacted_entity: sanitize_public_log(&p.impacted_entity),
+                            root_cause_trace_id: p.root_cause_trace_id,
+                            active,
+                        }
+                    })
+                    .collect();
+                if self.source == DataSource::Live {
+                    self.live_obs_problems = mapped;
+                    self.refresh_live_problems();
+                } else if !mapped.is_empty() {
+                    self.observe.problems = mapped;
                 }
                 true
             }
@@ -1319,6 +1381,7 @@ impl Store {
                         });
                     }
                 }
+                self.refresh_live_problems();
                 true
             }
             Input::ObsLogs(list) => {
@@ -1379,29 +1442,34 @@ impl Store {
                         }
                     }
                     self.observe.logs = merged;
+                    self.refresh_live_problems();
                 }
                 true
             }
             Input::ObsMetrics(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                if !list.is_empty() {
-                    self.observe.metrics = list
-                        .into_iter()
-                        .map(|m| HardwareMetricSeries {
-                            service: m.service,
-                            hardware_class: sanitize_public_log(&m.hardware_class),
-                            rps: m.rps,
-                            error_rate_bp: m.error_rate_bp,
-                            p50_ms: m.p50_ms,
-                            p95_ms: m.p95_ms,
-                            p99_ms: m.p99_ms,
-                            exemplar_trace_id: m.exemplar_trace_id,
-                            samples: m.samples,
-                        })
-                        .collect();
-                } else {
+                let mapped: Vec<HardwareMetricSeries> = list
+                    .into_iter()
+                    .map(|m| HardwareMetricSeries {
+                        service: m.service,
+                        hardware_class: sanitize_public_log(&m.hardware_class),
+                        rps: m.rps,
+                        error_rate_bp: m.error_rate_bp,
+                        p50_ms: m.p50_ms,
+                        p95_ms: m.p95_ms,
+                        p99_ms: m.p99_ms,
+                        exemplar_trace_id: m.exemplar_trace_id,
+                        samples: m.samples,
+                    })
+                    .collect();
+                if self.source == DataSource::Live {
+                    if !mapped.is_empty() {
+                        self.live_obs_metrics = mapped;
+                    }
                     self.refresh_live_metrics();
+                } else if !mapped.is_empty() {
+                    self.observe.metrics = mapped;
                 }
                 true
             }
@@ -1452,6 +1520,7 @@ impl Store {
                     c.state = CanaryBundleState::Tainted;
                     c.taint_reason = Some(sanitize_public_log(&e.reason));
                 }
+                self.refresh_live_problems();
                 gate_changed
             }
             Input::LeaseExpired(e) => self.with_gate(&e.deployment_id, |g| {
@@ -1550,6 +1619,7 @@ impl Store {
                     self.ci_jobs.insert(0, summary);
                 }
                 self.refresh_live_cd();
+                self.refresh_live_problems();
                 true
             }
             Input::JobLog { job_id, lines } => {
@@ -1964,6 +2034,7 @@ impl Store {
         self.observe.traces = live_traces;
         self.refresh_live_metrics();
         self.refresh_live_cd();
+        self.refresh_live_problems();
         true
     }
 
@@ -2040,7 +2111,141 @@ impl Store {
                 samples: vec![cpu_pct, ram_pct, n.active_slots],
             });
         }
+        for m in &self.live_obs_metrics {
+            if !series
+                .iter()
+                .any(|s| s.service == m.service && s.hardware_class == m.hardware_class)
+            {
+                let mut cloned = m.clone();
+                if cloned.exemplar_trace_id.is_empty()
+                    || matches!(
+                        cloned.exemplar_trace_id.as_str(),
+                        "tr-obs-p99-07" | "tr-ci-1234"
+                    )
+                {
+                    cloned.exemplar_trace_id.clone_from(&exemplar);
+                }
+                series.push(cloned);
+            }
+        }
         self.observe.metrics = series;
+    }
+
+    fn refresh_live_problems(&mut self) {
+        if self.source != DataSource::Live {
+            return;
+        }
+        let mut problems = self.live_obs_problems.clone();
+
+        for c in &self.registry.canaries {
+            if c.state == CanaryBundleState::Tainted {
+                let problem_id = format!("PRB-CANARY-{}", c.bundle_id);
+                if !problems.iter().any(|p| p.problem_id == problem_id) {
+                    let trace_id = if c.trace_id.is_empty() {
+                        format!("tr-reg-{}", c.bundle_id)
+                    } else {
+                        c.trace_id.clone()
+                    };
+                    problems.push(SloProblem {
+                        problem_id,
+                        title: sanitize_public_log(&format!(
+                            "Tainted canary bundle {} ({})",
+                            c.artifact_digest,
+                            c.taint_reason.as_deref().unwrap_or("policy violation")
+                        )),
+                        category: ProblemCategory::CanaryTaint,
+                        severity: "ERROR".into(),
+                        burn_rate_bp: 100,
+                        impacted_entity: format!("svc:{} ({})", c.service, c.bundle_id),
+                        root_cause_trace_id: trace_id,
+                        active: true,
+                    });
+                }
+            }
+        }
+
+        for j in &self.ci_jobs {
+            let is_failed = j.queue_state.eq_ignore_ascii_case("failed")
+                || j.stages.iter().any(|s| s.state == StageState::Failed);
+            if is_failed {
+                let disp_id = format_job_id(j.job_id);
+                let problem_id = format!("PRB-CI-{disp_id}");
+                if !problems.iter().any(|p| p.problem_id == problem_id) {
+                    let short_sha: String = j.commit_sha.chars().take(7).collect();
+                    let node = j
+                        .stages
+                        .iter()
+                        .find(|s| s.state == StageState::Failed)
+                        .or_else(|| j.stages.first())
+                        .and_then(|s| s.assigned_node.as_deref())
+                        .unwrap_or("cluster");
+                    let short_tr: String = if j.commit_sha.len() >= 6 {
+                        j.commit_sha.chars().take(6).collect()
+                    } else {
+                        disp_id.clone()
+                    };
+                    problems.push(SloProblem {
+                        problem_id,
+                        title: sanitize_public_log(&format!(
+                            "CI pipeline #{disp_id} failed on branch {} (@{})",
+                            j.ref_name,
+                            if short_sha.is_empty() {
+                                "HEAD"
+                            } else {
+                                &short_sha
+                            }
+                        )),
+                        category: ProblemCategory::FlakyTest,
+                        severity: "ERROR".into(),
+                        burn_rate_bp: 75,
+                        impacted_entity: format!("{} (Worker {node})", j.repo.repo),
+                        root_cause_trace_id: format!("tr-ci-{short_tr}"),
+                        active: true,
+                    });
+                }
+            }
+        }
+
+        let mut seen_log_services: Vec<String> = Vec::new();
+        for (idx, l) in self
+            .observe
+            .logs
+            .iter()
+            .filter(|l| l.severity == LogSeverity::Error)
+            .enumerate()
+        {
+            let svc_key = if l.service.is_empty() {
+                String::from("cluster")
+            } else {
+                l.service.clone()
+            };
+            if seen_log_services.contains(&svc_key) {
+                continue;
+            }
+            seen_log_services.push(svc_key.clone());
+            let problem_id = format!("PRB-LOG-{svc_key}-{}", idx + 1);
+            if !problems.iter().any(|p| p.problem_id == problem_id) {
+                let title: String = l.message.chars().take(88).collect();
+                let trace_id = if l.trace_id.is_empty() {
+                    format!("tr-log-{}", idx + 1)
+                } else {
+                    l.trace_id.clone()
+                };
+                problems.push(SloProblem {
+                    problem_id,
+                    title,
+                    category: ProblemCategory::ErrorRateSpike,
+                    severity: "ERROR".into(),
+                    burn_rate_bp: 50,
+                    impacted_entity: format!("svc:{svc_key}"),
+                    root_cause_trace_id: trace_id,
+                    active: true,
+                });
+            }
+        }
+
+        problems.truncate(8);
+        self.observe.problems = problems;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2051,8 +2256,8 @@ impl Store {
         let repo_keys: Vec<RepoId> = self.repos.keys().cloned().collect();
         for c in &mut self.registry.canaries {
             if let Some(matched) = repo_keys.iter().find(|id| {
-                id.repo.eq_ignore_ascii_case(&c.repo.repo)
-                    || id.repo.eq_ignore_ascii_case(&c.service)
+                service_matches_repo(&c.repo.repo, &id.repo)
+                    || service_matches_repo(&c.service, &id.repo)
             }) {
                 c.repo = matched.clone();
             }
@@ -2126,7 +2331,11 @@ impl Store {
             let job_stages = self
                 .ci_jobs
                 .iter()
-                .find(|j| j.repo.repo.eq_ignore_ascii_case(&repo_id.repo) && !j.stages.is_empty())
+                .find(|j| {
+                    (service_matches_repo(&j.repo.repo, &repo_id.repo)
+                        || service_matches_repo(&j.repo.repo, &c.service))
+                        && !j.stages.is_empty()
+                })
                 .map(|j| j.stages.clone());
             let tests: Vec<GateTest> = if let Some(stages) = job_stages {
                 stages
@@ -2599,6 +2808,7 @@ impl Store {
             {
                 j.queue_state = "Passed".into();
             }
+            self.refresh_live_problems();
             changed = true;
         }
         changed
@@ -2684,9 +2894,22 @@ impl Store {
         self.loaded = true;
         self.ensure_aux_defaults();
         let id = d.deployment_id.clone();
+        let raw_repo = RepoId::new(&d.owner, &d.repo);
+        let resolved_repo = if self.repos.contains_key(&raw_repo) {
+            raw_repo
+        } else {
+            self.repos
+                .keys()
+                .find(|k| {
+                    service_matches_repo(&d.repo, &k.repo)
+                        || service_matches_repo(&d.service, &k.repo)
+                })
+                .cloned()
+                .unwrap_or(raw_repo)
+        };
         let gate = DeploymentGate {
             deployment_id: d.deployment_id,
-            repo: RepoId::new(&d.owner, &d.repo),
+            repo: resolved_repo,
             service: d.service,
             artifact_digest: d.artifact_digest,
             target_node: sanitize_public_log(&d.target_node),
@@ -2757,20 +2980,41 @@ impl Store {
                 *e = summary.clone();
             }
         }
-        if self.latest.get(&g.repo).map(String::as_str) == Some(id) {
-            if let Some(r) = self.repos.get_mut(&g.repo) {
-                let active_slot = match g.outcome {
-                    GateOutcome::Promoted => g.staged_slot,
-                    GateOutcome::RolledBack | GateOutcome::Tainted => g.restore_slot,
-                    GateOutcome::Pending => r.cd.as_ref().map_or(g.restore_slot, |c| c.active_slot),
-                };
-                r.cd = Some(CdScore {
-                    deployment_id: id.to_owned(),
-                    active_slot,
-                    outcome: summary.outcome,
-                    it_passed: summary.it_passed,
-                    it_total: summary.it_total,
-                });
+        let target_repo = if self.repos.contains_key(&g.repo) {
+            Some(g.repo.clone())
+        } else {
+            self.repos
+                .keys()
+                .find(|k| {
+                    service_matches_repo(&g.repo.repo, &k.repo)
+                        || service_matches_repo(&g.service, &k.repo)
+                })
+                .cloned()
+        };
+        let is_latest = self.latest.get(&g.repo).map(String::as_str) == Some(id)
+            || target_repo
+                .as_ref()
+                .and_then(|tr| self.latest.get(tr))
+                .map(String::as_str)
+                == Some(id);
+        if is_latest {
+            if let Some(tr) = target_repo {
+                if let Some(r) = self.repos.get_mut(&tr) {
+                    let active_slot = match g.outcome {
+                        GateOutcome::Promoted => g.staged_slot,
+                        GateOutcome::RolledBack | GateOutcome::Tainted => g.restore_slot,
+                        GateOutcome::Pending => {
+                            r.cd.as_ref().map_or(g.restore_slot, |c| c.active_slot)
+                        }
+                    };
+                    r.cd = Some(CdScore {
+                        deployment_id: id.to_owned(),
+                        active_slot,
+                        outcome: summary.outcome,
+                        it_passed: summary.it_passed,
+                        it_total: summary.it_total,
+                    });
+                }
             }
         }
     }
@@ -2857,11 +3101,20 @@ impl Store {
             Some(t)
         });
         let parent = selection.as_ref().map(|s| &s.repo);
-        let gate = parent
+        let resolved_cd_repo = parent.and_then(|p| {
+            if self.latest.contains_key(p) {
+                Some(p)
+            } else {
+                self.latest
+                    .keys()
+                    .find(|k| service_matches_repo(&k.repo, &p.repo))
+            }
+        });
+        let gate = resolved_cd_repo
             .and_then(|p| self.latest.get(p))
             .and_then(|id| self.gates.get(id))
             .cloned();
-        let history = parent
+        let history = resolved_cd_repo
             .and_then(|p| self.history.get(p))
             .cloned()
             .unwrap_or_default();
@@ -3051,5 +3304,154 @@ mod tests {
         ));
         assert!(!s.is_dirty());
         assert_eq!(s.view(), ViewModel::default());
+    }
+
+    #[test]
+    fn service_matches_repo_normalizes_hyphens_and_canonical_aliases() {
+        assert!(service_matches_repo("muconsole", "mu-console"));
+        assert!(service_matches_repo("action-runner-web", "mu-console"));
+        assert!(service_matches_repo("muregist", "mu-registry"));
+        assert!(service_matches_repo("LMA1980/muregist", "MuRegist"));
+        assert!(service_matches_repo("muobserve", "mu-observable-hub"));
+        assert!(service_matches_repo(
+            "muobserve-collector",
+            "mu-observable-hub"
+        ));
+        assert!(service_matches_repo(
+            "action-runner-controller",
+            "mu-ci-controller"
+        ));
+        assert!(service_matches_repo("action-runner-rs", "mu-ci-worker"));
+        assert!(service_matches_repo(
+            "muconde-controller",
+            "mu-cd-controller"
+        ));
+        assert!(service_matches_repo("muconde-agent", "mu-cd-agent"));
+        assert!(service_matches_repo("muisolation", "mu-isolation"));
+        assert!(!service_matches_repo("muconsole", "mu-registry"));
+    }
+
+    #[test]
+    fn live_metrics_merge_and_problems_synthesize_from_canaries_jobs_and_logs() {
+        let mut s = Store::new(DataSource::Live);
+        s.apply(
+            Input::Repos(vec![RepoDto {
+                owner: "LMA1980".into(),
+                repo: "mu-console".into(),
+                visibility: mu_console_protocol::Visibility::Public,
+                default_branch: "main".into(),
+                commit_sha: "abc12345".into(),
+                latest_job_id: Some(42),
+                score: 98,
+                coverage: 92.0,
+                bench_delta: 0.0,
+                status: RepoStatus::Passing,
+                submodules: Vec::new(),
+                parents: Vec::new(),
+            }]),
+            10,
+        );
+        s.apply(
+            Input::Select(Selection {
+                repo: RepoId::new("LMA1980", "mu-console"),
+                submodule: None,
+            }),
+            12,
+        );
+        s.apply(
+            Input::ClusterNodes(vec![ClusterNodeDto {
+                node_id: "worker-riscv64".into(),
+                is_online: true,
+                arch: "riscv64".into(),
+                active_slots: 1,
+                max_slots: 1,
+                cpu_load_pct: 15.0,
+                ram_used_mb: 2048,
+                ram_total_mb: 32768,
+                btrfs_enabled: true,
+                exclusive_locked: false,
+                last_seen_secs_ago: 1,
+                tags: Vec::new(),
+                toolchains: Vec::new(),
+            }]),
+            15,
+        );
+        s.apply(
+            Input::ObsMetrics(vec![MetricSeriesDto {
+                service: "muobserve-collector · host.psi.memory.some_avg60 (%)".into(),
+                hardware_class: "worker-riscv64 · riscv64 · X100 · rvv-256".into(),
+                rps: 3,
+                error_rate_bp: 0,
+                p50_ms: 42,
+                p95_ms: 48,
+                p99_ms: 52,
+                exemplar_trace_id: String::new(),
+                samples: vec![38, 42, 52],
+            }]),
+            20,
+        );
+
+        let v = s.view();
+        assert!(v
+            .observe
+            .metrics
+            .iter()
+            .any(|m| m.service == "actionrunner-rs"));
+        assert!(v
+            .observe
+            .metrics
+            .iter()
+            .any(|m| m.service == "node:worker-riscv64"));
+        assert!(v
+            .observe
+            .metrics
+            .iter()
+            .any(|m| m.service == "muobserve-collector · host.psi.memory.some_avg60 (%)"));
+
+        // Canary with legacy alias "muconsole" matches repo "mu-console" and populates view.gate.
+        s.apply(
+            Input::RegCanaries(vec![CanaryBundleDto {
+                bundle_id: "cny-901".into(),
+                owner: "LMA1980".into(),
+                repo: String::new(),
+                service: "muconsole".into(),
+                artifact_digest: "sha256:9f82c01a334e".into(),
+                state: CanaryBundleState::Tainted,
+                taint_reason: Some("smoke test failed".into()),
+                deployment_id: "dep-9f82".into(),
+                trace_id: "tr-ci-9f82c0".into(),
+            }]),
+            25,
+        );
+        s.apply(
+            Input::ObsLogs(vec![OtelLogDto {
+                timestamp_ms: 1_700_000_000_000,
+                severity: LogSeverity::Error,
+                service: "muobserve-collector".into(),
+                span_id: None,
+                trace_id: "tr-err-log-1".into(),
+                message: "OTel exporter connection timeout on node-a".into(),
+            }]),
+            30,
+        );
+        s.apply(Input::ObsProblems(Vec::new()), 35);
+
+        let v2 = s.view();
+        assert_eq!(v2.registry.canaries[0].repo.repo, "mu-console");
+        assert!(v2.gate.is_some());
+        assert_eq!(
+            v2.repos[0].cd.as_ref().map(|c| c.outcome),
+            Some(GateOutcome::Tainted)
+        );
+        assert!(v2
+            .observe
+            .problems
+            .iter()
+            .any(|p| p.problem_id == "PRB-CANARY-cny-901"));
+        assert!(v2
+            .observe
+            .problems
+            .iter()
+            .any(|p| p.problem_id.starts_with("PRB-LOG-muobserve-collector-")));
     }
 }
