@@ -730,6 +730,7 @@ fn default_observe() -> ObserveView {
                 impacted_entity: "svc:muregist (cny-041 / dep-041)".into(),
                 root_cause_trace_id: "tr-reg-taint-01".into(),
                 active: true,
+                ..Default::default()
             },
             SloProblem {
                 problem_id: "PRB-101".into(),
@@ -740,6 +741,7 @@ fn default_observe() -> ObserveView {
                 impacted_entity: "k3-kernels-rvv (X100 VLEN=256 vs A100 VLEN=1024)".into(),
                 root_cause_trace_id: "tr-obs-p99-07".into(),
                 active: true,
+                ..Default::default()
             },
         ],
         logs: vec![
@@ -968,10 +970,10 @@ impl Store {
     }
 
     fn ensure_aux_defaults(&mut self) {
-        if self.sandboxes.is_empty() {
-            self.sandboxes = default_sandboxes();
-        }
         if matches!(self.source, DataSource::Scenario(_)) {
+            if self.sandboxes.is_empty() {
+                self.sandboxes = default_sandboxes();
+            }
             if self.leases.is_empty() {
                 self.leases = default_leases();
             }
@@ -1373,6 +1375,24 @@ impl Store {
                             impacted_entity: sanitize_public_log(&p.impacted_entity),
                             root_cause_trace_id: p.root_cause_trace_id,
                             active,
+                            causal_chain: p
+                                .causal_chain
+                                .into_iter()
+                                .map(|s| sanitize_public_log(&s))
+                                .collect(),
+                            confidence_score: (p.confidence_score * 100.0).round() as u32,
+                            root_cause_service: sanitize_public_log(&p.root_cause_service),
+                            root_cause_span_id: p.root_cause_span_id,
+                            root_cause_error_message: p
+                                .root_cause_error_message
+                                .map(|e| sanitize_public_log(&e)),
+                            summary: sanitize_public_log(&p.summary),
+                            affected_services: p
+                                .affected_services
+                                .into_iter()
+                                .map(|s| sanitize_public_log(&s))
+                                .collect(),
+                            ai_diagnosis: p.ai_diagnosis.map(|d| sanitize_public_log(&d)),
                         }
                     })
                     .collect();
@@ -1485,7 +1505,8 @@ impl Store {
                     }
                     let has_real_trace =
                         !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
-                    if has_real_trace
+                    if matches!(self.source, DataSource::Scenario(_))
+                        && has_real_trace
                         && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
                     {
                         self.observe.traces.push(PurePathTrace {
@@ -1530,7 +1551,21 @@ impl Store {
                 }
                 if self.source == DataSource::Live {
                     if !incoming.is_empty() {
-                        self.live_obs_logs = incoming;
+                        if incoming.len() == 1 {
+                            let entry = incoming.into_iter().next().unwrap();
+                            if !self.live_obs_logs.iter().any(|e| {
+                                e.timestamp_ms == entry.timestamp_ms
+                                    && e.trace_id == entry.trace_id
+                                    && e.message == entry.message
+                            }) {
+                                self.live_obs_logs.push(entry);
+                                self.live_obs_logs
+                                    .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+                                self.live_obs_logs.truncate(500);
+                            }
+                        } else {
+                            self.live_obs_logs = incoming;
+                        }
                     }
                     self.refresh_live_problems();
                     self.refresh_live_logs();
@@ -1632,7 +1667,40 @@ impl Store {
                     impacted_entity: sanitize_public_log(&p.impacted_entity),
                     root_cause_trace_id: p.root_cause_trace_id,
                     active,
+                    causal_chain: p
+                        .causal_chain
+                        .into_iter()
+                        .map(|s| sanitize_public_log(&s))
+                        .collect(),
+                    confidence_score: (p.confidence_score * 100.0).round() as u32,
+                    root_cause_service: sanitize_public_log(&p.root_cause_service),
+                    root_cause_span_id: p.root_cause_span_id,
+                    root_cause_error_message: p
+                        .root_cause_error_message
+                        .map(|e| sanitize_public_log(&e)),
+                    summary: sanitize_public_log(&p.summary),
+                    affected_services: p
+                        .affected_services
+                        .into_iter()
+                        .map(|s| sanitize_public_log(&s))
+                        .collect(),
+                    ai_diagnosis: p.ai_diagnosis.map(|d| sanitize_public_log(&d)),
                 };
+                if self.source == DataSource::Live {
+                    if let Some(pos) = self
+                        .live_obs_problems
+                        .iter()
+                        .position(|pr| pr.problem_id == problem.problem_id)
+                    {
+                        if active {
+                            self.live_obs_problems[pos] = problem.clone();
+                        } else {
+                            self.live_obs_problems.remove(pos);
+                        }
+                    } else if active {
+                        self.live_obs_problems.push(problem.clone());
+                    }
+                }
                 if let Some(pos) = self
                     .observe
                     .problems
@@ -2246,7 +2314,8 @@ impl Store {
             }) {
                 c.repo = matched.clone();
             }
-            if !c.trace_id.is_empty()
+            if matches!(self.source, DataSource::Scenario(_))
+                && !c.trace_id.is_empty()
                 && !self.observe.traces.iter().any(|t| t.trace_id == c.trace_id)
             {
                 let is_err = matches!(
@@ -2344,7 +2413,7 @@ impl Store {
                         )),
                     })
                     .collect()
-            } else {
+            } else if matches!(self.source, DataSource::Scenario(_)) {
                 [
                     ("it_fmt_check", 420),
                     ("it_clippy_strict", 1_180),
@@ -2365,6 +2434,8 @@ impl Store {
                     log_excerpt: Some(format!("checkpoint {name}: status ok (exit 0)")),
                 })
                 .collect()
+            } else {
+                Vec::new()
             };
             let gate = DeploymentGate {
                 deployment_id: c.deployment_id.clone(),
@@ -2393,7 +2464,7 @@ impl Store {
             }
             self.refresh_cd(&c.deployment_id);
         }
-        if self.leases.is_empty() {
+        if matches!(self.source, DataSource::Scenario(_)) && self.leases.is_empty() {
             self.leases = canaries
                 .iter()
                 .map(|c| {
@@ -2560,17 +2631,16 @@ impl Store {
                     queue_state,
                     elapsed_secs,
                     wait_secs: 0,
-                    quality_score: repo_score.map_or(95, |r| r.score),
-                    coverage_bp: repo_score.map_or(9_000, |r| r.coverage_bp),
+                    quality_score: repo_score.map_or(0, |r| r.score),
+                    coverage_bp: repo_score.map_or(0, |r| r.coverage_bp),
                     tests_passed: u32::try_from(
                         stages
                             .iter()
                             .filter(|s| s.state == StageState::Passed)
-                            .count()
-                            * 10,
+                            .count(),
                     )
                     .unwrap_or(0),
-                    tests_total: u32::try_from(stages.len().max(1) * 10).unwrap_or(10),
+                    tests_total: u32::try_from(stages.len()).unwrap_or(0),
                     benchmark_summary: String::new(),
                     stages,
                     raw_log_lines: self.job_logs.get(&tr.job_id).cloned().unwrap_or_default(),
@@ -3429,6 +3499,7 @@ mod tests {
                     root_cause_trace_id: "tr-ci-9f82c0".into(),
                     active: true,
                     status: "OPEN".into(),
+                    ..Default::default()
                 },
                 ProblemDto {
                     problem_id: "PRB-LOG-muobserve-collector-1".into(),
@@ -3440,6 +3511,7 @@ mod tests {
                     root_cause_trace_id: "tr-err-log-1".into(),
                     active: true,
                     status: "OPEN".into(),
+                    ..Default::default()
                 },
             ]),
             35,

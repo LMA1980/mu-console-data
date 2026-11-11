@@ -237,7 +237,11 @@ impl Engine {
                         SubView::Observe(ObserveSubView::Logs) | SubView::Ci(CiSubView::QueueLogs)
                     ) {
                         self.fetch(FetchKind::CiQueue, &mut fx);
-                        self.fetch(FetchKind::ObsLogs, &mut fx);
+                        if let Some(ref q) = route.filter.filter(|s| !s.trim().is_empty()) {
+                            self.fetch(FetchKind::ObsLogsQuery(q.clone()), &mut fx);
+                        } else {
+                            self.fetch(FetchKind::ObsLogs, &mut fx);
+                        }
                     }
                 }
             }
@@ -852,7 +856,11 @@ impl Engine {
                         }
                         _ => None,
                     };
+                    let is_ingress_changed = matches!(&input, Input::ObsIngressChanged);
                     self.store.apply(input, now_ms);
+                    if is_ingress_changed {
+                        self.fetch(FetchKind::ObsIngressOverview, &mut fx);
+                    }
                     if let Some(id) = unknown {
                         self.on_unknown_deployment(id, &mut fx);
                     }
