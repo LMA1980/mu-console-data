@@ -3,8 +3,9 @@
 
 use mu_console_protocol::dto::{
     AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
-    CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto, ItProgressDto, JobStageChangedDto,
-    LeaseDto, LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
+    CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto, IngressOverviewDto,
+    IngressRouteDto, IngressUpstreamDto, ItProgressDto, JobStageChangedDto, LeaseDto,
+    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
     PrStateChangedDto, ProblemDto, PromotedDto, RawMetricPointDto, RepoDto, RepoListResponseDto,
     RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto,
     TopologyDto, TraceDto,
@@ -38,6 +39,10 @@ pub enum FetchKind {
     ObsLogs,
     ObsMetrics,
     ObsStoreStatus,
+    ObsIngressOverview,
+    ObsIngressRoutes,
+    ObsIngressUpstreams,
+    ObsLogsQuery(String),
     AuthSession,
     AuthRedeem(String),
     RestartJob(u64),
@@ -56,10 +61,12 @@ pub enum StreamId {
     Ci,
     /// MuConDe-controller `/api/cd/events`.
     Cd,
+    /// MuObserve `/api/v1/events` or `/api/obs/v1/events`.
+    Obs,
 }
 
 impl StreamId {
-    pub const ALL: [Self; 2] = [Self::Ci, Self::Cd];
+    pub const ALL: [Self; 3] = [Self::Ci, Self::Cd, Self::Obs];
 
     /// Index into per-stream arrays.
     #[must_use]
@@ -67,6 +74,7 @@ impl StreamId {
         match self {
             Self::Ci => 0,
             Self::Cd => 1,
+            Self::Obs => 2,
         }
     }
 }
@@ -492,6 +500,20 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             Input::ObsMetrics(list)
         }
         FetchKind::ObsStoreStatus => Input::ObsStoreStatus(json::<StoreStatusDto>(body)?),
+        FetchKind::ObsIngressOverview => {
+            Input::ObsIngressOverview(json::<IngressOverviewDto>(body)?)
+        }
+        FetchKind::ObsIngressRoutes => Input::ObsIngressRoutes(json::<Vec<IngressRouteDto>>(body)?),
+        FetchKind::ObsIngressUpstreams => {
+            Input::ObsIngressUpstreams(json::<Vec<IngressUpstreamDto>>(body)?)
+        }
+        FetchKind::ObsLogsQuery(_) => {
+            let list = match json::<LogsEnvelope>(body)? {
+                LogsEnvelope::List(v) => v,
+                LogsEnvelope::Envelope { logs } => logs,
+            };
+            Input::ObsLogs(list)
+        }
         FetchKind::AuthSession | FetchKind::AuthRedeem(_) => {
             Input::AuthSession(parse_auth_session(body.as_bytes())?)
         }
@@ -571,6 +593,16 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         (StreamId::Cd, "rolled_back") => Input::RolledBack(json::<RolledBackDto>(data)?),
         (StreamId::Cd, "tainted") => Input::Tainted(json::<TaintedDto>(data)?),
         (StreamId::Cd, "lease_expired") => Input::LeaseExpired(json::<LeaseExpiredDto>(data)?),
+        (StreamId::Obs, "log_entry") => {
+            let entry = json::<OtelLogDto>(data)?;
+            Input::ObsLogs(vec![entry])
+        }
+        (StreamId::Obs, "problem_opened" | "problem_resolved") => {
+            let problem = json::<ProblemDto>(data)?;
+            Input::ObsProblemEvent(problem)
+        }
+        (StreamId::Obs, "ingress_changed") => Input::ObsIngressChanged,
+        (StreamId::Obs, "heartbeat") => return Ok(None),
         _ => return Ok(None),
     };
     Ok(Some(input))

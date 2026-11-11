@@ -100,7 +100,7 @@ pub struct Engine {
     store: Store,
     out: Coalescer,
     offline: OfflinePolicy,
-    streams: [StreamState; 2],
+    streams: [StreamState; 3],
     player: Option<ScenarioPlayer>,
     conn: Option<ConnState>,
     badges: Option<AreaBadges>,
@@ -127,6 +127,7 @@ impl Engine {
             streams: [
                 StreamState::new(seed),
                 StreamState::new(seed.rotate_left(17)),
+                StreamState::new(seed.rotate_left(33)),
             ],
             player: None,
             conn: None,
@@ -294,6 +295,9 @@ impl Engine {
                         }
                         SubView::Observe(ObserveSubView::DataStore) => {
                             self.fetch(FetchKind::ObsStoreStatus, &mut fx);
+                        }
+                        SubView::Observe(ObserveSubView::Ingress) => {
+                            self.fetch(FetchKind::ObsIngressOverview, &mut fx);
                         }
                         SubView::Fleet(_) => {
                             self.fetch(FetchKind::ClusterNodes, &mut fx);
@@ -517,6 +521,10 @@ impl Engine {
             FetchKind::ObsLogs => paths::OBS_LOGS.to_owned(),
             FetchKind::ObsMetrics => paths::OBS_METRICS.to_owned(),
             FetchKind::ObsStoreStatus => paths::OBS_STORE_STATUS.to_owned(),
+            FetchKind::ObsIngressOverview => paths::OBS_INGRESS_OVERVIEW.to_owned(),
+            FetchKind::ObsIngressRoutes => paths::OBS_INGRESS_ROUTES.to_owned(),
+            FetchKind::ObsIngressUpstreams => paths::OBS_INGRESS_UPSTREAMS.to_owned(),
+            FetchKind::ObsLogsQuery(q) => paths::obs_logs_query(q, 100),
             FetchKind::AuthSession => paths::AUTH_SESSION.to_owned(),
             FetchKind::AuthRedeem(_) => paths::AUTH_REDEEM.to_owned(),
             FetchKind::RestartJob(job_id) => {
@@ -557,6 +565,7 @@ impl Engine {
         let path = match s {
             StreamId::Ci => paths::CI_EVENTS,
             StreamId::Cd => paths::CD_EVENTS,
+            StreamId::Obs => paths::OBS_EVENTS,
         };
         let st = &mut self.streams[s.index()];
         st.parser.reset_connection();
@@ -593,8 +602,10 @@ impl Engine {
             Mode::Live => {
                 let ci = &self.streams[StreamId::Ci.index()];
                 let cd = &self.streams[StreamId::Cd.index()];
+                let obs = &self.streams[StreamId::Obs.index()];
                 if (ci.open && (cd.open || cd.backoff.attempt() > 0))
                     || (cd.open && (ci.open || ci.backoff.attempt() > 0))
+                    || obs.open
                 {
                     return ConnState::Live;
                 }
@@ -872,10 +883,10 @@ impl Engine {
         if self.mode != Mode::Live {
             return fx;
         }
-        let peer_open = match s {
-            StreamId::Ci => self.streams[StreamId::Cd.index()].open,
-            StreamId::Cd => self.streams[StreamId::Ci.index()].open,
-        };
+        let peer_open = StreamId::ALL
+            .iter()
+            .filter(|&&other| other != s)
+            .any(|&other| self.streams[other.index()].open);
         let st = &mut self.streams[s.index()];
         st.open = false;
         let delay = st.backoff.next_delay_ms();

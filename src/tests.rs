@@ -774,13 +774,29 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     eng.on_fetch_gen(
         gen0,
         &FetchKind::ObsLogs,
-        Ok(r#"{"severity":"all","total":1,"logs":[{"timestamp_ms":1793858300000,"trace_id":"0102030405060708090a0b0c0d0e0f12","span_id":"010203040506070a","severity_text":"INFO","service":"muobserve-collector","body":"Edge collector mTLS forwarding verified from worker-riscv64"}]}"#.into()),
+        Ok(r#"{"severity":"all","total":2,"logs":[{"timestamp_ms":1793858300000,"trace_id":"0102030405060708090a0b0c0d0e0f12","span_id":"010203040506070a","severity_text":"INFO","service":"muobserve-collector","body":"Edge collector mTLS forwarding verified from worker-riscv64"},{"timestamp_ms":1793858200000,"trace_id":"tr-ci-af7344","span_id":"010203040506070b","severity_text":"INFO","service":"actionrunner-rs","body":"Build step finished"}]}"#.into()),
         34,
     );
     eng.on_fetch_gen(
         gen0,
         &FetchKind::ObsMetrics,
-        Ok(r#"{"metric":"all","window":"1h","series":[],"cluster_efficiency":[]}"#.into()),
+        Ok(r#"{"metric":"all","window":"1h","series":[{"service":"node:worker-riscv64","hardware_class":"riscv64","rps":10,"error_rate_bp":0,"p50_ms":5,"p95_ms":15,"p99_ms":20,"exemplar_trace_id":"","samples":[5,10,15]}],"cluster_efficiency":[]}"#.into()),
+        34,
+    );
+    eng.on_fetch_gen(
+        gen0,
+        &FetchKind::ObsSmartscape,
+        Ok(r#"{
+            "window_secs": 300,
+            "services": [{"id":"svc:action-runner-controller","name":"action-runner-controller","request_rate_rps":8.9,"error_rate_pct":0.0,"p95_latency_ms":12.0,"health_state":"healthy"}],
+            "processes": [
+                {"id":"proc:action-runner@worker-riscv64","name":"action-runner@worker-riscv64","health_state":"healthy"},
+                {"id":"proc:mu-observable","name":"mu-observable","health_state":"healthy"},
+                {"id":"proc:duckdb-hot-store","name":"duckdb-hot-store","health_state":"healthy"}
+            ],
+            "hosts": [],
+            "edges": [{"source":"svc:action-runner-controller","target":"proc:action-runner@worker-riscv64","relation":"calls","request_rate_rps":8.9,"error_rate_pct":0.0,"p95_latency_ms":12.0}]
+        }"#.into()),
         34,
     );
     eng.on_fetch(&FetchKind::Deployments(repo_a.clone()), Ok("[]".into()), 35);
