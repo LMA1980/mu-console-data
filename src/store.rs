@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use mu_console_protocol::dto::{
     parse_job_id_str, AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto,
     CasStatusDto, CiQueueDto, CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto,
-    ItProgressDto, JobStageChangedDto, LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto,
-    OtelLogDto, PackageDto, PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoSummaryDto,
-    RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
+    IngressOverviewDto, IngressRouteDto, IngressUpstreamDto, ItProgressDto, JobStageChangedDto,
+    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
+    PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoSummaryDto, RolledBackDto,
+    SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
 };
 use mu_console_protocol::{
     format_job_id, sanitize_ansi_log_lines, sanitize_public_log, AreaBadges, AuthState, Branch,
@@ -56,6 +57,11 @@ pub enum Input {
     ObsLogs(Vec<OtelLogDto>),
     ObsMetrics(Vec<MetricSeriesDto>),
     ObsStoreStatus(StoreStatusDto),
+    ObsIngressOverview(IngressOverviewDto),
+    ObsIngressRoutes(Vec<IngressRouteDto>),
+    ObsIngressUpstreams(Vec<IngressUpstreamDto>),
+    ObsProblemEvent(ProblemDto),
+    ObsIngressChanged,
     BranchCreated(BranchCreatedDto),
     BranchDeleted(BranchDeletedDto),
     PrStateChanged(PrStateChangedDto),
@@ -210,15 +216,6 @@ pub(crate) fn service_matches_repo(service: &str, repo_name: &str) -> bool {
 
 fn clean_otel_message(raw: &str) -> String {
     sanitize_ansi_log_lines(raw, 8).join(" ").trim().to_owned()
-}
-
-fn push_unique_log(live: &mut Vec<OtelLogEntry>, entry: OtelLogEntry) {
-    if !live
-        .iter()
-        .any(|e| e.service == entry.service && e.message == entry.message)
-    {
-        live.push(entry);
-    }
 }
 
 fn default_leases() -> Vec<CdLease> {
@@ -832,6 +829,9 @@ fn default_observe() -> ObserveView {
             retention_days: 90,
             oldest_watermark_iso: "2026-08-05T00:00:00Z".into(),
         },
+        ingress_routes: Vec::new(),
+        ingress_upstreams: Vec::new(),
+        tls_health: None,
     }
 }
 
@@ -1604,6 +1604,52 @@ impl Store {
                 }
                 true
             }
+            Input::ObsIngressOverview(d) => {
+                self.loaded = true;
+                self.observe.ingress_routes = d.routes;
+                self.observe.ingress_upstreams = d.upstreams;
+                self.observe.tls_health = d.tls_health;
+                true
+            }
+            Input::ObsIngressRoutes(routes) => {
+                self.loaded = true;
+                self.observe.ingress_routes = routes;
+                true
+            }
+            Input::ObsIngressUpstreams(upstreams) => {
+                self.loaded = true;
+                self.observe.ingress_upstreams = upstreams;
+                true
+            }
+            Input::ObsProblemEvent(p) => {
+                let active = p.effective_active();
+                let problem = SloProblem {
+                    problem_id: p.problem_id.clone(),
+                    title: sanitize_public_log(&p.title),
+                    category: p.category,
+                    severity: p.severity,
+                    burn_rate_bp: p.burn_rate_bp,
+                    impacted_entity: sanitize_public_log(&p.impacted_entity),
+                    root_cause_trace_id: p.root_cause_trace_id,
+                    active,
+                };
+                if let Some(pos) = self
+                    .observe
+                    .problems
+                    .iter()
+                    .position(|pr| pr.problem_id == problem.problem_id)
+                {
+                    if active {
+                        self.observe.problems[pos] = problem;
+                    } else {
+                        self.observe.problems.remove(pos);
+                    }
+                } else if active {
+                    self.observe.problems.push(problem);
+                }
+                true
+            }
+            Input::ObsIngressChanged => true,
             Input::BranchCreated(e) => self.branch_created(&e),
             Input::BranchDeleted(e) => self.branch_deleted(&e, now_ms),
             Input::PrStateChanged(e) => self.pr_state(&e, now_ms),
@@ -2155,922 +2201,36 @@ impl Store {
         true
     }
 
-    #[allow(clippy::too_many_lines)]
     fn refresh_live_logs(&mut self) {
         if self.source != DataSource::Live {
             return;
         }
-        let prev_logs = std::mem::take(&mut self.observe.logs);
-        let mut live = self.live_obs_logs.clone();
-        let base_ts = live
-            .iter()
-            .map(|l| l.timestamp_ms)
-            .max()
-            .filter(|&t| t > 0)
-            .unwrap_or(1_762_742_400_000);
-
-        // 1. actionrunner-controller (CI Control Plane) & actionrunner-rs (CI Worker Daemon & Crate Stages)
-        for (j_idx, job) in self.ci_jobs.iter().take(10).enumerate() {
-            let disp_id = format_job_id(job.job_id);
-            let sha7: String = if job.commit_sha.is_empty() {
-                String::from("HEAD")
-            } else {
-                job.commit_sha.chars().take(7).collect()
-            };
-            let tr_id = format!(
-                "tr-ci-{}",
-                if job.commit_sha.len() >= 6 {
-                    job.commit_sha.chars().take(6).collect::<String>()
-                } else {
-                    job.job_id_str.clone()
-                }
-            );
-            let pipe_sev = if job.queue_state.eq_ignore_ascii_case("failed")
-                || job.stages.iter().any(|s| s.state == StageState::Failed)
-            {
-                LogSeverity::Error
-            } else {
-                LogSeverity::Info
-            };
-            let j_off = u64::try_from(j_idx).unwrap_or(0) * 3_500;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(j_off + 200),
-                    severity: pipe_sev,
-                    service: "actionrunner-controller".into(),
-                    span_id: Some(format!("sp-ci-pipe-{}", j_idx + 1)),
-                    trace_id: tr_id.clone(),
-                    message: format!(
-                        "[pipeline #{disp_id}] {}/{} @{} ({sha7}) state={} · {} stages · tests={}/{} · cov={:.1}% · elapsed={}s",
-                        job.repo.owner,
-                        job.repo.repo,
-                        job.ref_name,
-                        job.queue_state,
-                        job.stages.len(),
-                        job.tests_passed,
-                        job.tests_total,
-                        f64::from(job.coverage_bp) / 100.0,
-                        job.elapsed_secs,
-                    ),
-                },
-            );
-            for (s_idx, st) in job.stages.iter().enumerate() {
-                if j_idx >= 4 && !matches!(st.state, StageState::Failed | StageState::Running) {
-                    continue;
-                }
-                let worker = sanitize_public_log(st.assigned_node.as_deref().unwrap_or("node-a"));
-                let st_sev = if st.state == StageState::Failed || st.exit_code != 0 {
-                    LogSeverity::Error
-                } else {
-                    LogSeverity::Info
-                };
-                let st_name = if st.name.is_empty() { &st.id } else { &st.name };
-                let s_off = (u64::try_from(s_idx).unwrap_or(0) + 1) * 350;
-                push_unique_log(
-                    &mut live,
-                    OtelLogEntry {
-                        timestamp_ms: base_ts.saturating_sub(j_off + s_off),
-                        severity: st_sev,
-                        service: "actionrunner-rs".into(),
-                        span_id: Some(format!("sp-ci-{}-{}", j_idx + 1, s_idx + 1)),
-                        trace_id: tr_id.clone(),
-                        message: format!(
-                            "[pipeline #{disp_id}] [stage #{} {st_name}] repo={} worker={worker} threads={} state={:?} duration={}s exit={}",
-                            s_idx + 1,
-                            job.repo.repo,
-                            st.threads,
-                            st.state,
-                            st.duration_secs,
-                            st.exit_code,
-                        ),
-                    },
-                );
-            }
-            if job.stages.is_empty() && j_idx < 4 {
-                push_unique_log(
-                    &mut live,
-                    OtelLogEntry {
-                        timestamp_ms: base_ts.saturating_sub(j_off + 350),
-                        severity: pipe_sev,
-                        service: "actionrunner-rs".into(),
-                        span_id: Some(format!("sp-ci-{}-1", j_idx + 1)),
-                        trace_id: tr_id,
-                        message: format!(
-                            "[pipeline #{disp_id}] [stage #1 dispatch] repo={} worker=node-a state={} elapsed={}s",
-                            job.repo.repo, job.queue_state, job.elapsed_secs
-                        ),
-                    },
-                );
-            }
-        }
-
-        // 2. muconde-controller (CD Control Plane) & muconde-agent (CD Slot & Gate Agent)
-        for (g_idx, gate) in self.gates.values().take(8).enumerate() {
-            let passed = gate
-                .tests
-                .iter()
-                .filter(|t| t.state == TestState::Passed)
-                .count();
-            let g_sev = if matches!(gate.outcome, GateOutcome::RolledBack | GateOutcome::Tainted) {
-                LogSeverity::Error
-            } else {
-                LogSeverity::Info
-            };
-            let tr_id = format!("tr-cd-{}", gate.deployment_id);
-            let g_off = u64::try_from(g_idx).unwrap_or(0) * 4_200;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(g_off + 500),
-                    severity: g_sev,
-                    service: "muconde-controller".into(),
-                    span_id: Some(format!("sp-cd-gate-{}", g_idx + 1)),
-                    trace_id: tr_id.clone(),
-                    message: format!(
-                        "[cd-gate] Deployment {} ({}/{}) on {} :: staged_slot={:?} restore_slot={:?} outcome={:?} · {}/{} IT checks passed",
-                        gate.deployment_id,
-                        gate.repo.owner,
-                        gate.repo.repo,
-                        gate.target_node,
-                        gate.staged_slot,
-                        gate.restore_slot,
-                        gate.outcome,
-                        passed,
-                        gate.tests.len(),
-                    ),
-                },
-            );
-            for (t_idx, tc) in gate.tests.iter().take(4).enumerate() {
-                let tc_sev = if tc.state == TestState::Failed {
-                    LogSeverity::Error
-                } else {
-                    LogSeverity::Info
-                };
-                let crate_name = tc.crate_name.as_deref().unwrap_or(&gate.repo.repo);
-                let t_off = (u64::try_from(t_idx).unwrap_or(0) + 1) * 400;
-                push_unique_log(
-                    &mut live,
-                    OtelLogEntry {
-                        timestamp_ms: base_ts.saturating_sub(g_off + t_off),
-                        severity: tc_sev,
-                        service: "muconde-agent".into(),
-                        span_id: Some(format!("sp-cd-it-{}-{}", g_idx + 1, t_idx + 1)),
-                        trace_id: tr_id.clone(),
-                        message: format!(
-                            "[cd-it-check] [{}] crate={crate_name} test={} state={:?} duration={}ms critical={}",
-                            gate.deployment_id, tc.name, tc.state, tc.duration_ms, tc.critical
-                        ),
-                    },
-                );
-            }
-        }
-        for (l_idx, lease) in self.leases.iter().take(6).enumerate() {
-            let l_off = u64::try_from(l_idx).unwrap_or(0) * 5_000;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(l_off + 800),
-                    severity: LogSeverity::Info,
-                    service: "muconde-agent".into(),
-                    span_id: Some(format!("sp-cd-lease-{}", l_idx + 1)),
-                    trace_id: format!("tr-cd-{}", lease.deployment_id),
-                    message: format!(
-                        "[slot-lease] Lease {} on {} :: service={} active_slot={:?} candidate_slot={:?} digest={} ttl={}s promoted={}",
-                        lease.lease_id,
-                        lease.target_node,
-                        lease.service,
-                        lease.active_slot,
-                        lease.candidate_slot,
-                        lease.artifact_digest,
-                        lease.ttl_remaining_ms / 1_000,
-                        lease.promoted,
-                    ),
-                },
-            );
-        }
-
-        // 3. muregist (Artifact & Crate Registry) & cas-blob-store (Content-Addressed Storage Sidecar)
-        let cas = &self.registry.cas;
-        let cas_sev = if cas.corrupt_blobs > 0 {
-            LogSeverity::Error
-        } else {
-            LogSeverity::Info
-        };
-        push_unique_log(
-            &mut live,
-            OtelLogEntry {
-                timestamp_ms: base_ts.saturating_sub(1_100),
-                severity: cas_sev,
-                service: "cas-blob-store".into(),
-                span_id: Some("sp-cas-scrub-1".into()),
-                trace_id: String::new(),
-                message: format!(
-                    "[cas-scrub] Content-addressed store verified: {} blobs ({} KiB raw -> {} KiB dedup, ratio={:.2}x) · gc_watermark={}% · corrupt_blobs={}",
-                    cas.blob_count,
-                    cas.raw_bytes / 1_024,
-                    cas.dedup_bytes / 1_024,
-                    f64::from(cas.dedup_ratio_bp) / 100.0,
-                    cas.gc_watermark_pct,
-                    cas.corrupt_blobs,
-                ),
-            },
-        );
-        for (c_idx, c) in self.registry.canaries.iter().take(8).enumerate() {
-            let c_sev = match c.state {
-                CanaryBundleState::Tainted => LogSeverity::Error,
-                CanaryBundleState::RolledBack => LogSeverity::Warn,
-                CanaryBundleState::Promoted | CanaryBundleState::Candidate => LogSeverity::Info,
-            };
-            let taint_suffix = c
-                .taint_reason
-                .as_deref()
-                .map_or_else(String::new, |r| format!(" reason={r}"));
-            let c_off = u64::try_from(c_idx).unwrap_or(0) * 4_000;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(c_off + 1_300),
-                    severity: c_sev,
-                    service: "muregist".into(),
-                    span_id: Some(format!("sp-reg-cny-{}", c_idx + 1)),
-                    trace_id: c.trace_id.clone(),
-                    message: format!(
-                        "[canary-bundle] [{}] service={} ({}/{}) digest={} state={:?} deploy={}{taint_suffix}",
-                        c.bundle_id,
-                        c.service,
-                        c.repo.owner,
-                        c.repo.repo,
-                        c.artifact_digest,
-                        c.state,
-                        c.deployment_id,
-                    ),
-                },
-            );
-        }
-        for (p_idx, pkg) in self.registry.packages.iter().take(8).enumerate() {
-            let p_sev = if pkg.yanked || pkg.tainted {
-                LogSeverity::Warn
-            } else {
-                LogSeverity::Info
-            };
-            let p_off = u64::try_from(p_idx).unwrap_or(0) * 4_500;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(p_off + 1_600),
-                    severity: p_sev,
-                    service: "muregist".into(),
-                    span_id: Some(format!("sp-reg-pkg-{}", p_idx + 1)),
-                    trace_id: String::new(),
-                    message: format!(
-                        "[crate-index] [{}] package={} v{} ({} versions, {} deps) sha256={} yanked={} tainted={}",
-                        pkg.ecosystem.label(),
-                        pkg.name,
-                        pkg.latest_version,
-                        pkg.versions_count,
-                        pkg.deps_count,
-                        pkg.sha256_prefix,
-                        pkg.yanked,
-                        pkg.tainted,
-                    ),
-                },
-            );
-        }
-
-        // 4. muobserve-hub (Observability Analytics Hub) & duckdb-hot-store (DuckDB / Parquet Storage Sidecar)
-        let st = &self.observe.store;
-        push_unique_log(
-            &mut live,
-            OtelLogEntry {
-                timestamp_ms: base_ts.saturating_sub(900),
-                severity: LogSeverity::Info,
-                service: "duckdb-hot-store".into(),
-                span_id: Some("sp-obs-store-1".into()),
-                trace_id: String::new(),
-                message: format!(
-                    "[storage-tier] Hot DuckDB store: {} rows ({} KiB) · Cold Parquet Zstd archive: {} rows across {} partitions (zstd={:.2}x, retention={}d)",
-                    st.hot_duckdb_rows,
-                    st.hot_duckdb_bytes / 1_024,
-                    st.cold_parquet_rows,
-                    st.cold_parquet_partitions,
-                    f64::from(st.zstd_compression_bp) / 100.0,
-                    st.retention_days,
-                ),
-            },
-        );
-        for (m_idx, m) in self.observe.metrics.iter().take(6).enumerate() {
-            let m_sev = if m.error_rate_bp >= 500 {
-                LogSeverity::Warn
-            } else {
-                LogSeverity::Info
-            };
-            let m_off = u64::try_from(m_idx).unwrap_or(0) * 3_800;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(m_off + 1_900),
-                    severity: m_sev,
-                    service: "muobserve-hub".into(),
-                    span_id: Some(format!("sp-obs-met-{}", m_idx + 1)),
-                    trace_id: m.exemplar_trace_id.clone(),
-                    message: format!(
-                        "[golden-signals] Service {} [{}] :: rps={} p50={}ms p95={}ms p99={}ms err={:.2}%",
-                        m.service,
-                        m.hardware_class,
-                        m.rps,
-                        m.p50_ms,
-                        m.p95_ms,
-                        m.p99_ms,
-                        f64::from(m.error_rate_bp) / 100.0,
-                    ),
-                },
-            );
-        }
-        for (p_idx, p) in self.observe.problems.iter().take(6).enumerate() {
-            let p_sev = if p.severity.eq_ignore_ascii_case("error") {
-                LogSeverity::Error
-            } else {
-                LogSeverity::Warn
-            };
-            let p_off = u64::try_from(p_idx).unwrap_or(0) * 2_500;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(p_off + 400),
-                    severity: p_sev,
-                    service: "muobserve-hub".into(),
-                    span_id: Some(format!("sp-obs-prb-{}", p_idx + 1)),
-                    trace_id: p.root_cause_trace_id.clone(),
-                    message: format!(
-                        "[slo-alert] [{}] {}: {} · impacted={} · burn={:.2}x",
-                        p.problem_id,
-                        p.category.label(),
-                        p.title,
-                        p.impacted_entity,
-                        f64::from(p.burn_rate_bp) / 100.0,
-                    ),
-                },
-            );
-        }
-
-        // 5. mu-isolation (Fleet & KernelSandbox Enforcement)
-        for (n_idx, n) in self.nodes.values().enumerate() {
-            let n_sev = if n.online {
-                LogSeverity::Info
-            } else {
-                LogSeverity::Warn
-            };
-            let n_off = u64::try_from(n_idx).unwrap_or(0) * 3_200;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(n_off + 2_100),
-                    severity: n_sev,
-                    service: "mu-isolation".into(),
-                    span_id: Some(format!("sp-flt-node-{}", n_idx + 1)),
-                    trace_id: String::new(),
-                    message: format!(
-                        "[node-heartbeat] Worker {} ({}) online={} slots={}/{} cpu={:.1}% ram={}/{}MiB btrfs={} toolchains=[{}]",
-                        n.id,
-                        n.arch,
-                        n.online,
-                        n.active_slots,
-                        n.max_slots,
-                        f64::from(n.cpu_load_bp) / 100.0,
-                        n.ram_used_mb,
-                        n.ram_total_mb,
-                        n.btrfs_enabled,
-                        n.toolchains.join(","),
-                    ),
-                },
-            );
-        }
-        for (sb_idx, sb) in self.sandboxes.iter().take(4).enumerate() {
-            let sb_off = u64::try_from(sb_idx).unwrap_or(0) * 5_500;
-            push_unique_log(
-                &mut live,
-                OtelLogEntry {
-                    timestamp_ms: base_ts.saturating_sub(sb_off + 2_400),
-                    severity: LogSeverity::Info,
-                    service: "mu-isolation".into(),
-                    span_id: Some(format!("sp-flt-sb-{}", sb_idx + 1)),
-                    trace_id: String::new(),
-                    message: format!(
-                        "[sandbox-policy] Profile {} ({}) :: target={} max_slots={} threads={} max_pids={}",
-                        sb.profile_name,
-                        sb.backend,
-                        sb.hardware_target,
-                        sb.max_slots,
-                        sb.thread_budget,
-                        sb.max_pids,
-                    ),
-                },
-            );
-        }
-
-        // Preserve up to 6 external correlated trace logs from ObsTraceDetail.
-        let mut correlated_count = 0_usize;
-        for existing in prev_logs {
-            if matches!(
-                existing.trace_id.as_str(),
-                "tr-reg-taint-01" | "tr-obs-p99-07" | "tr-ci-1234" | "tr-cd-0042"
-            ) || existing.message.starts_with('[')
-                || existing.trace_id.starts_with("tr-ci-")
-                || existing.trace_id.starts_with("tr-cd-")
-            {
-                continue;
-            }
-            if !live
-                .iter()
-                .any(|e| e.service == existing.service && e.message == existing.message)
-                && correlated_count < 6
-            {
-                live.push(existing);
-                correlated_count += 1;
-            }
-        }
-
-        live.sort_by_key(|a| std::cmp::Reverse(a.timestamp_ms));
-        live.truncate(120);
-        self.observe.logs = live;
+        let mut clean_logs = self.live_obs_logs.clone();
+        clean_logs.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+        clean_logs.truncate(200);
+        self.observe.logs = clean_logs;
     }
 
-    #[allow(clippy::too_many_lines)]
     fn refresh_live_smartscape(&mut self) {
         if self.source != DataSource::Live {
             return;
         }
-        if !self.live_smartscape_nodes.is_empty() {
-            self.observe.smartscape_nodes = self.live_smartscape_nodes.clone();
-            if !self.live_smartscape_edges.is_empty() {
-                self.observe.smartscape_edges = self.live_smartscape_edges.clone();
-            }
-            return;
-        }
-
-        let mut nodes: Vec<SmartscapeNode> = Vec::new();
-        let mut edges: Vec<SmartscapeEdge> = Vec::new();
-
-        // 1. Host nodes from live cluster nodes (or canonical fabric fallback).
-        if self.nodes.is_empty() {
-            for (id, label, rps_bp, p95_ms) in [
-                ("host:node-a", "node-a (x86_64)", 210, 5),
-                ("host:node-b", "node-b (x86_64)", 340, 6),
-                ("host:worker-riscv64", "worker-riscv64 (riscv64)", 480, 7),
-            ] {
-                nodes.push(SmartscapeNode {
-                    id: id.into(),
-                    label: label.into(),
-                    layer: SmartscapeLayer::Host,
-                    req_per_sec_bp: rps_bp,
-                    error_rate_bp: 0,
-                    p95_ms,
-                    healthy: true,
-                });
-            }
-        } else {
-            for n in self.nodes.values() {
-                let host_id = format!("host:{}", n.id);
-                let host_label = format!("{} ({})", n.id, n.arch);
-                nodes.push(SmartscapeNode {
-                    id: host_id,
-                    label: host_label,
-                    layer: SmartscapeLayer::Host,
-                    req_per_sec_bp: (n.active_slots * 100).max(n.cpu_load_bp),
-                    error_rate_bp: if n.online { 0 } else { 10_000 },
-                    p95_ms: (n.cpu_load_bp / 100).max(4),
-                    healthy: n.online,
-                });
-            }
-        }
-
-        // 2. Process nodes (per-host CI workers + core platform crates/daemons/sidecars).
-        for n in self.nodes.values() {
-            let host_id = format!("host:{}", n.id);
-            let proc_id = format!("proc:action-runner@{}", n.id);
-            let proc_label = format!(
-                "action-runner ({}, {}/{} slots)",
-                n.id,
-                n.active_slots,
-                n.max_slots.max(1)
-            );
-            nodes.push(SmartscapeNode {
-                id: proc_id.clone(),
-                label: proc_label,
-                layer: SmartscapeLayer::Process,
-                req_per_sec_bp: n.cpu_load_bp.max(100),
-                error_rate_bp: if n.online { 0 } else { 10_000 },
-                p95_ms: 12,
-                healthy: n.online,
-            });
-            edges.push(SmartscapeEdge {
-                from_id: "svc:action-runner-controller".into(),
-                to_id: proc_id.clone(),
-                protocol: "HTTPS/mTLS".into(),
-                call_rate_rps: 4,
-                error_rate_bp: 0,
-                p95_ms: 8,
-            });
-            edges.push(SmartscapeEdge {
-                from_id: proc_id,
-                to_id: host_id,
-                protocol: "cgroupv2/MuIsolation".into(),
-                call_rate_rps: 4,
-                error_rate_bp: 0,
-                p95_ms: 2,
-            });
-        }
-
-        let primary_host = nodes
-            .iter()
-            .find(|n| n.layer == SmartscapeLayer::Host)
-            .map_or_else(|| String::from("host:node-a"), |n| n.id.clone());
-        for (proc_id, proc_label, rps_bp, p95_ms) in [
-            (
-                "proc:mu-observable",
-                "muobserve-collector / hub (OTel + DuckDB)",
-                320,
-                4,
-            ),
-            (
-                "proc:actionrunner-controller",
-                "actionrunner-controller (CI Control Plane)",
-                420,
-                8,
-            ),
-            (
-                "proc:actionrunner-rs",
-                "actionrunner-rs (CI Worker Daemon)",
-                380,
-                12,
-            ),
-            (
-                "proc:muconde-controller",
-                "muconde-controller (CD Control Plane)",
-                160,
-                6,
-            ),
-            (
-                "proc:muconde-agent",
-                "muconde-agent (CD Slot Agent)",
-                140,
-                9,
-            ),
-            ("proc:muregist", "muregist (CAS & Release Registry)", 210, 5),
-            (
-                "proc:duckdb-hot-store",
-                "duckdb-hot-store (Sidecar Analytics Engine)",
-                260,
-                3,
-            ),
-        ] {
-            if !nodes.iter().any(|n| n.id == proc_id) {
-                nodes.push(SmartscapeNode {
-                    id: proc_id.into(),
-                    label: proc_label.into(),
-                    layer: SmartscapeLayer::Process,
-                    req_per_sec_bp: rps_bp,
-                    error_rate_bp: 0,
-                    p95_ms,
-                    healthy: true,
-                });
-                edges.push(SmartscapeEdge {
-                    from_id: proc_id.into(),
-                    to_id: primary_host.clone(),
-                    protocol: "systemd/mTLS".into(),
-                    call_rate_rps: 3,
-                    error_rate_bp: 0,
-                    p95_ms: 2,
-                });
-            }
-        }
-
-        // 3. Service nodes (core services + distinct services observed in logs, metrics, leases, canaries).
-        for (svc_id, svc_label, proc_id, proto, rps_bp, p95_ms) in [
-            (
-                "svc:action-runner-controller",
-                "ActionRunner Controller (CI)",
-                "proc:actionrunner-controller",
-                "HTTPS/mTLS",
-                420,
-                8,
-            ),
-            (
-                "svc:muconde-controller",
-                "MuConDe Controller (CD)",
-                "proc:muconde-controller",
-                "HTTPS/mTLS",
-                120,
-                6,
-            ),
-            (
-                "svc:muregist",
-                "MuRegist Artifact CAS (REG)",
-                "proc:muregist",
-                "HTTPS/mTLS",
-                180,
-                5,
-            ),
-            (
-                "svc:muobserve-collector",
-                "MuObserve OTel Collector (OBS)",
-                "proc:mu-observable",
-                "OTLP/mTLS",
-                310,
-                4,
-            ),
-        ] {
-            let bare_name = svc_id.strip_prefix("svc:").unwrap_or(svc_id);
-            let err_logs = self
-                .live_obs_logs
-                .iter()
-                .filter(|l| {
-                    l.service.eq_ignore_ascii_case(bare_name) && l.severity == LogSeverity::Error
-                })
-                .count();
-            let err_bp = u32::try_from(err_logs * 50).unwrap_or(0);
-            nodes.push(SmartscapeNode {
-                id: svc_id.into(),
-                label: svc_label.into(),
-                layer: SmartscapeLayer::Service,
-                req_per_sec_bp: rps_bp,
-                error_rate_bp: err_bp,
-                p95_ms,
-                healthy: err_logs == 0,
-            });
-            edges.push(SmartscapeEdge {
-                from_id: svc_id.into(),
-                to_id: proc_id.into(),
-                protocol: proto.into(),
-                call_rate_rps: (rps_bp / 100).max(1),
-                error_rate_bp: err_bp,
-                p95_ms,
-            });
-        }
-
-        let mut extra_services: Vec<String> = Vec::new();
-        for s in self
-            .live_obs_logs
-            .iter()
-            .map(|l| l.service.as_str())
-            .chain(self.live_obs_metrics.iter().map(|m| m.service.as_str()))
-            .chain(self.leases.iter().map(|l| l.service.as_str()))
-            .chain(self.registry.canaries.iter().map(|c| c.service.as_str()))
-        {
-            let trimmed = s.trim().trim_start_matches("svc:");
-            if !trimmed.is_empty()
-                && !trimmed.starts_with("node:")
-                && !extra_services
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case(trimmed))
-            {
-                extra_services.push(trimmed.to_owned());
-            }
-        }
-        for svc_name in extra_services {
-            let svc_id = format!("svc:{svc_name}");
-            if nodes.iter().any(|n| n.id.eq_ignore_ascii_case(&svc_id)) {
-                continue;
-            }
-            let err_logs = self
-                .live_obs_logs
-                .iter()
-                .filter(|l| {
-                    l.service.eq_ignore_ascii_case(&svc_name) && l.severity == LogSeverity::Error
-                })
-                .count();
-            let err_bp = u32::try_from(err_logs * 50).unwrap_or(0);
-            nodes.push(SmartscapeNode {
-                id: svc_id.clone(),
-                label: format!("{svc_name} (Observed Service)"),
-                layer: SmartscapeLayer::Service,
-                req_per_sec_bp: 150,
-                error_rate_bp: err_bp,
-                p95_ms: 6,
-                healthy: err_logs == 0,
-            });
-            edges.push(SmartscapeEdge {
-                from_id: svc_id,
-                to_id: "proc:mu-observable".into(),
-                protocol: "OTLP/mTLS".into(),
-                call_rate_rps: 2,
-                error_rate_bp: err_bp,
-                p95_ms: 4,
-            });
-        }
-
-        self.observe.smartscape_nodes = nodes;
-        self.observe.smartscape_edges = edges;
+        self.observe.smartscape_nodes = self.live_smartscape_nodes.clone();
+        self.observe.smartscape_edges = self.live_smartscape_edges.clone();
     }
 
     fn refresh_live_metrics(&mut self) {
         if self.source != DataSource::Live {
             return;
         }
-        let exemplar = self
-            .observe
-            .traces
-            .first()
-            .map_or_else(|| "tr-ci-live".into(), |t| t.trace_id.clone());
-        let mut stage_secs: Vec<u32> = self
-            .ci_jobs
-            .iter()
-            .flat_map(|j| j.stages.iter())
-            .filter_map(|s| u32::try_from(s.duration_secs).ok())
-            .filter(|&d| d > 0)
-            .take(12)
-            .collect();
-        if stage_secs.is_empty() {
-            stage_secs = self
-                .ci_jobs
-                .iter()
-                .filter_map(|j| u32::try_from(j.elapsed_secs).ok())
-                .filter(|&d| d > 0)
-                .take(8)
-                .collect();
-        }
-        if stage_secs.is_empty() {
-            stage_secs.push(12);
-        }
-        let mut sorted = stage_secs.clone();
-        sorted.sort_unstable();
-        let p50 = sorted[sorted.len() / 2];
-        let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
-        let p99 = *sorted.last().unwrap_or(&p95);
-        let mut series = Vec::new();
-        series.push(HardwareMetricSeries {
-            service: "actionrunner-rs".into(),
-            hardware_class: "Fabric CI Stage Latency (max_slots=1, single-slot stages)".into(),
-            rps: u32::try_from(self.ci_jobs.len()).unwrap_or(1).max(1),
-            error_rate_bp: 0,
-            p50_ms: p50,
-            p95_ms: p95,
-            p99_ms: p99,
-            exemplar_trace_id: exemplar.clone(),
-            samples: stage_secs,
-        });
-        for n in self.nodes.values() {
-            let hw = if n.arch == "riscv64" {
-                format!(
-                    "{} ({} · SpacemiT K3 X100 VLEN=256 / A100 VLEN=1024)",
-                    n.id, n.arch
-                )
-            } else {
-                format!("{} ({} · max_slots={})", n.id, n.arch, n.max_slots.max(1))
-            };
-            let cpu_pct = (n.cpu_load_bp / 100).max(1);
-            let ram_pct = (n.ram_used_mb * 100)
-                .checked_div(n.ram_total_mb)
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(10)
-                .max(1);
-            series.push(HardwareMetricSeries {
-                service: format!("node:{}", n.id),
-                hardware_class: hw,
-                rps: n.active_slots.max(1),
-                error_rate_bp: if n.online { 0 } else { 10_000 },
-                p50_ms: cpu_pct,
-                p95_ms: ram_pct,
-                p99_ms: ram_pct.max(cpu_pct),
-                exemplar_trace_id: exemplar.clone(),
-                samples: vec![cpu_pct, ram_pct, n.active_slots],
-            });
-        }
-        for m in &self.live_obs_metrics {
-            if !series
-                .iter()
-                .any(|s| s.service == m.service && s.hardware_class == m.hardware_class)
-            {
-                let mut cloned = m.clone();
-                if cloned.exemplar_trace_id.is_empty()
-                    || matches!(
-                        cloned.exemplar_trace_id.as_str(),
-                        "tr-obs-p99-07" | "tr-ci-1234"
-                    )
-                {
-                    cloned.exemplar_trace_id.clone_from(&exemplar);
-                }
-                series.push(cloned);
-            }
-        }
-        self.observe.metrics = series;
+        self.observe.metrics = self.live_obs_metrics.clone();
     }
 
     fn refresh_live_problems(&mut self) {
         if self.source != DataSource::Live {
             return;
         }
-        let mut problems = self.live_obs_problems.clone();
-
-        for c in &self.registry.canaries {
-            if c.state == CanaryBundleState::Tainted {
-                let problem_id = format!("PRB-CANARY-{}", c.bundle_id);
-                if !problems.iter().any(|p| p.problem_id == problem_id) {
-                    let trace_id = if c.trace_id.is_empty() {
-                        format!("tr-reg-{}", c.bundle_id)
-                    } else {
-                        c.trace_id.clone()
-                    };
-                    problems.push(SloProblem {
-                        problem_id,
-                        title: sanitize_public_log(&format!(
-                            "Tainted canary bundle {} ({})",
-                            c.artifact_digest,
-                            c.taint_reason.as_deref().unwrap_or("policy violation")
-                        )),
-                        category: ProblemCategory::CanaryTaint,
-                        severity: "ERROR".into(),
-                        burn_rate_bp: 100,
-                        impacted_entity: format!("svc:{} ({})", c.service, c.bundle_id),
-                        root_cause_trace_id: trace_id,
-                        active: true,
-                    });
-                }
-            }
-        }
-
-        for j in &self.ci_jobs {
-            let is_failed = j.queue_state.eq_ignore_ascii_case("failed")
-                || j.stages.iter().any(|s| s.state == StageState::Failed);
-            if is_failed {
-                let disp_id = format_job_id(j.job_id);
-                let problem_id = format!("PRB-CI-{disp_id}");
-                if !problems.iter().any(|p| p.problem_id == problem_id) {
-                    let short_sha: String = j.commit_sha.chars().take(7).collect();
-                    let node = j
-                        .stages
-                        .iter()
-                        .find(|s| s.state == StageState::Failed)
-                        .or_else(|| j.stages.first())
-                        .and_then(|s| s.assigned_node.as_deref())
-                        .unwrap_or("cluster");
-                    let short_tr: String = if j.commit_sha.len() >= 6 {
-                        j.commit_sha.chars().take(6).collect()
-                    } else {
-                        disp_id.clone()
-                    };
-                    problems.push(SloProblem {
-                        problem_id,
-                        title: sanitize_public_log(&format!(
-                            "CI pipeline #{disp_id} failed on branch {} (@{})",
-                            j.ref_name,
-                            if short_sha.is_empty() {
-                                "HEAD"
-                            } else {
-                                &short_sha
-                            }
-                        )),
-                        category: ProblemCategory::FlakyTest,
-                        severity: "ERROR".into(),
-                        burn_rate_bp: 75,
-                        impacted_entity: format!("{} (Worker {node})", j.repo.repo),
-                        root_cause_trace_id: format!("tr-ci-{short_tr}"),
-                        active: true,
-                    });
-                }
-            }
-        }
-
-        let mut seen_log_services: Vec<String> = Vec::new();
-        for (idx, l) in self
-            .live_obs_logs
-            .iter()
-            .filter(|l| l.severity == LogSeverity::Error)
-            .enumerate()
-        {
-            let svc_key = if l.service.is_empty() {
-                String::from("cluster")
-            } else {
-                l.service.clone()
-            };
-            if seen_log_services.contains(&svc_key) {
-                continue;
-            }
-            seen_log_services.push(svc_key.clone());
-            let problem_id = format!("PRB-LOG-{svc_key}-{}", idx + 1);
-            if !problems.iter().any(|p| p.problem_id == problem_id) {
-                let title: String = l.message.chars().take(88).collect();
-                let trace_id = if l.trace_id.is_empty() {
-                    format!("tr-log-{}", idx + 1)
-                } else {
-                    l.trace_id.clone()
-                };
-                problems.push(SloProblem {
-                    problem_id,
-                    title,
-                    category: ProblemCategory::ErrorRateSpike,
-                    severity: "ERROR".into(),
-                    burn_rate_bp: 50,
-                    impacted_entity: format!("svc:{svc_key}"),
-                    root_cause_trace_id: trace_id,
-                    active: true,
-                });
-            }
-        }
-
-        problems.truncate(8);
-        self.observe.problems = problems;
+        self.observe.problems = self.live_obs_problems.clone();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4229,16 +3389,6 @@ mod tests {
             .observe
             .metrics
             .iter()
-            .any(|m| m.service == "actionrunner-rs"));
-        assert!(v
-            .observe
-            .metrics
-            .iter()
-            .any(|m| m.service == "node:worker-riscv64"));
-        assert!(v
-            .observe
-            .metrics
-            .iter()
             .any(|m| m.service == "muobserve-collector · host.psi.memory.some_avg60 (%)"));
 
         // Canary with legacy alias "muconsole" matches repo "mu-console" and populates view.gate.
@@ -4267,7 +3417,33 @@ mod tests {
             }]),
             30,
         );
-        s.apply(Input::ObsProblems(Vec::new()), 35);
+        s.apply(
+            Input::ObsProblems(vec![
+                ProblemDto {
+                    problem_id: "PRB-CANARY-cny-901".into(),
+                    title: "Tainted canary bundle sha256:9f82c01a334e".into(),
+                    category: ProblemCategory::CanaryTaint,
+                    severity: "ERROR".into(),
+                    burn_rate_bp: 100,
+                    impacted_entity: "svc:muconsole (cny-901)".into(),
+                    root_cause_trace_id: "tr-ci-9f82c0".into(),
+                    active: true,
+                    status: "OPEN".into(),
+                },
+                ProblemDto {
+                    problem_id: "PRB-LOG-muobserve-collector-1".into(),
+                    title: "OTel exporter connection timeout on node-a".into(),
+                    category: ProblemCategory::ErrorRateSpike,
+                    severity: "ERROR".into(),
+                    burn_rate_bp: 50,
+                    impacted_entity: "svc:muobserve-collector".into(),
+                    root_cause_trace_id: "tr-err-log-1".into(),
+                    active: true,
+                    status: "OPEN".into(),
+                },
+            ]),
+            35,
+        );
 
         let v2 = s.view();
         assert_eq!(v2.registry.canaries[0].repo.repo, "mu-console");
@@ -4415,21 +3591,5 @@ mod tests {
             .collect();
         assert_eq!(dstates.len(), 3);
         assert!(dstates.iter().all(|l| l.severity == LogSeverity::Warn));
-
-        // Verify multi-service & sidecar operational log synthesis.
-        for svc in [
-            "muconde-controller",
-            "muconde-agent",
-            "muregist",
-            "cas-blob-store",
-            "duckdb-hot-store",
-            "muobserve-hub",
-            "mu-isolation",
-        ] {
-            assert!(
-                v.observe.logs.iter().any(|l| l.service == svc),
-                "expected synthesized operational log for service {svc}"
-            );
-        }
     }
 }

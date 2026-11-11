@@ -24,7 +24,7 @@ use crate::offline::{CACHE_KEY, CACHE_NAME};
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
-    static STREAMS: RefCell<[Option<(u32, AbortController)>; 2]> = const { RefCell::new([None, None]) };
+    static STREAMS: RefCell<[Option<(u32, AbortController)>; 3]> = const { RefCell::new([None, None, None]) };
     static GENERATION: Cell<u32> = const { Cell::new(0) };
 }
 
