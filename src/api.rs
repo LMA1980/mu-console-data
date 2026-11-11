@@ -486,7 +486,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                             p50_ms: ns_to_ms(ce.min_ns_per_iter),
                             p95_ms: ns_to_ms(ce.avg_ns_per_iter),
                             p99_ms: ns_to_ms(ce.max_ns_per_iter),
-                            exemplar_trace_id: "tr-obs-p99-07".into(),
+                            exemplar_trace_id: String::new(),
                             samples: vec![
                                 ns_to_u32(ce.min_ns_per_iter),
                                 ns_to_u32(ce.avg_ns_per_iter),
@@ -512,7 +512,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
                 LogsEnvelope::List(v) => v,
                 LogsEnvelope::Envelope { logs } => logs,
             };
-            Input::ObsLogs(list)
+            Input::ObsLogsQueryResult(list)
         }
         FetchKind::AuthSession | FetchKind::AuthRedeem(_) => {
             Input::AuthSession(parse_auth_session(body.as_bytes())?)
@@ -595,7 +595,7 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         (StreamId::Cd, "lease_expired") => Input::LeaseExpired(json::<LeaseExpiredDto>(data)?),
         (StreamId::Obs, "log_entry") => {
             let entry = json::<OtelLogDto>(data)?;
-            Input::ObsLogs(vec![entry])
+            Input::ObsLogEntry(entry)
         }
         (StreamId::Obs, "problem_opened" | "problem_resolved") => {
             let problem = json::<ProblemDto>(data)?;
@@ -1169,6 +1169,7 @@ pub(crate) mod tests {
         assert_eq!(metrics[0].p50_ms, 11);
         assert_eq!(metrics[0].p95_ms, 14);
         assert_eq!(metrics[0].p99_ms, 17);
+        assert_eq!(metrics[0].exemplar_trace_id, "");
 
         let raw_obs_metrics = r#"{
           "metric": "all",
@@ -1233,5 +1234,38 @@ pub(crate) mod tests {
         };
         assert_eq!(null_canaries.len(), 1);
         assert_eq!(null_canaries[0].trace_id, "tr-ci-9f82c0");
+
+        let logs_query_json = r#"{
+          "logs": [
+            {
+              "timestamp_ns": 1700000000000000000,
+              "severity": "INFO",
+              "service": "mu-query",
+              "span_id": "sp-q-1",
+              "trace_id": "tr-q-1",
+              "message": "Filtered query result"
+            }
+          ]
+        }"#;
+        let Input::ObsLogsQueryResult(query_results) =
+            parse_fetch(&FetchKind::ObsLogsQuery("query".into()), logs_query_json)
+                .expect("obs logs query")
+        else {
+            panic!("expected ObsLogsQueryResult");
+        };
+        assert_eq!(query_results.len(), 1);
+        assert_eq!(query_results[0].message, "Filtered query result");
+
+        let sse_entry_json = r#"{
+          "timestamp_ns": 1700000001000000000,
+          "severity": "WARN",
+          "service": "mu-sse",
+          "span_id": "sp-sse-1",
+          "trace_id": "tr-sse-1",
+          "message": "Streaming log entry"
+        }"#;
+        let ev =
+            parse_event(StreamId::Obs, "log_entry", sse_entry_json).expect("parse stream event");
+        assert!(matches!(ev, Some(Input::ObsLogEntry(entry)) if entry.service == "mu-sse"));
     }
 }

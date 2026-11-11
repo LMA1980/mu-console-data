@@ -55,6 +55,8 @@ pub enum Input {
     ObsTraces(Vec<TraceDto>),
     ObsTraceDetail(TraceDto),
     ObsLogs(Vec<OtelLogDto>),
+    ObsLogEntry(OtelLogDto),
+    ObsLogsQueryResult(Vec<OtelLogDto>),
     ObsMetrics(Vec<MetricSeriesDto>),
     ObsStoreStatus(StoreStatusDto),
     ObsIngressOverview(IngressOverviewDto),
@@ -123,6 +125,7 @@ pub struct Store {
     job_logs: BTreeMap<u64, Vec<String>>,
     selection: Option<Selection>,
     auth: AuthState,
+    active_log_query: bool,
     /// Offline snapshot shown until live data arrives.
     offline: Option<(u64, ViewModel)>,
     loaded: bool,
@@ -866,6 +869,22 @@ impl Store {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Whether an explicit log search query is currently active in the view.
+    #[must_use]
+    pub fn is_active_log_query(&self) -> bool {
+        self.active_log_query
+    }
+
+    /// Clear any active log search query and restore the live logs view.
+    pub fn clear_active_log_query(&mut self) {
+        if self.active_log_query {
+            self.active_log_query = false;
+            if self.source == DataSource::Live {
+                self.refresh_live_logs();
+            }
+        }
+    }
+
     /// Whether live (or scenario) data has arrived.
     #[must_use]
     pub fn has_live_data(&self) -> bool {
@@ -984,6 +1003,96 @@ impl Store {
                 self.observe = default_observe();
             }
         }
+    }
+
+    fn normalize_log_dtos(&mut self, list: Vec<OtelLogDto>) -> Vec<OtelLogEntry> {
+        let mut incoming = Vec::with_capacity(list.len());
+        let mut dstate_alert_count = 0_usize;
+        for l in list {
+            let clean_msg = clean_otel_message(&l.message);
+            if self.source == DataSource::Live
+                && (clean_msg.is_empty() || clean_msg.eq_ignore_ascii_case("running 0 tests"))
+            {
+                continue;
+            }
+            let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
+                String::from("actionrunner-controller")
+            } else {
+                l.service
+            };
+            let mut severity = l.severity;
+            if severity == LogSeverity::Error
+                && (clean_msg.contains("test result: ok.")
+                    || (clean_msg.contains("0 failed") && !clean_msg.contains("FAILED"))
+                    || clean_msg.starts_with("Running ")
+                    || clean_msg.starts_with("Compiling ")
+                    || clean_msg.starts_with("Finished ")
+                    || clean_msg.starts_with("Doc-tests "))
+            {
+                severity = LogSeverity::Info;
+            }
+            let is_dstate_alert = clean_msg.contains("Host pressure / D-state alert");
+            if is_dstate_alert {
+                if dstate_alert_count >= 3 {
+                    continue;
+                }
+                if severity == LogSeverity::Error
+                    && clean_msg.contains("wchan=0")
+                    && (clean_msg.contains("io_some_avg10=0.")
+                        || clean_msg.contains("io_some_avg10=1.")
+                        || clean_msg.contains("io_some_avg10=2.")
+                        || clean_msg.contains("io_some_avg10=3.")
+                        || clean_msg.contains("io_some_avg10=4."))
+                {
+                    severity = LogSeverity::Warn;
+                }
+            }
+            let has_real_trace = !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
+            if matches!(self.source, DataSource::Scenario(_))
+                && has_real_trace
+                && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
+            {
+                self.observe.traces.push(PurePathTrace {
+                    trace_id: l.trace_id.clone(),
+                    root_service: service.clone(),
+                    root_operation: clean_msg.clone(),
+                    domain: "OBS".into(),
+                    duration_ms: 12,
+                    error: severity == LogSeverity::Error,
+                    slow_p99: false,
+                    started_epoch_ms: l.timestamp_ms,
+                    spans: vec![TraceSpan {
+                        span_id: l.span_id.clone().unwrap_or_else(|| "sp-obs-log-1".into()),
+                        parent_span_id: None,
+                        service: service.clone(),
+                        operation: clean_msg.clone(),
+                        start_offset_us: 0,
+                        duration_us: 12_000,
+                        self_time_us: 12_000,
+                        critical_path: true,
+                        error: severity == LogSeverity::Error,
+                        hardware_class: "fabric-collector".into(),
+                    }],
+                });
+            }
+            if !incoming
+                .iter()
+                .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
+            {
+                if is_dstate_alert {
+                    dstate_alert_count += 1;
+                }
+                incoming.push(OtelLogEntry {
+                    timestamp_ms: l.timestamp_ms,
+                    severity,
+                    service,
+                    span_id: l.span_id,
+                    trace_id: l.trace_id,
+                    message: clean_msg,
+                });
+            }
+        }
+        incoming
     }
 
     /// Apply one input. Returns whether anything changed.
@@ -1458,117 +1567,69 @@ impl Store {
                 self.refresh_live_logs();
                 true
             }
+            Input::ObsLogsQueryResult(list) => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                let query_results = self.normalize_log_dtos(list);
+                self.active_log_query = true;
+                self.observe.logs = query_results;
+                if self.source == DataSource::Live {
+                    self.refresh_live_problems();
+                    self.refresh_live_smartscape();
+                }
+                true
+            }
+            Input::ObsLogEntry(entry) => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                let entries = self.normalize_log_dtos(vec![entry]);
+                if let Some(entry) = entries.into_iter().next() {
+                    if self.source == DataSource::Live {
+                        if !self.live_obs_logs.iter().any(|e| {
+                            e.timestamp_ms == entry.timestamp_ms
+                                && e.trace_id == entry.trace_id
+                                && e.message == entry.message
+                        }) {
+                            self.live_obs_logs.push(entry);
+                            self.live_obs_logs
+                                .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+                            self.live_obs_logs.truncate(500);
+                        }
+                        if !self.active_log_query {
+                            self.refresh_live_logs();
+                        }
+                        self.refresh_live_problems();
+                        self.refresh_live_smartscape();
+                    } else {
+                        self.observe.logs.insert(0, entry);
+                        self.observe.logs.truncate(500);
+                    }
+                }
+                true
+            }
             Input::ObsLogs(list) => {
                 self.loaded = true;
                 self.ensure_aux_defaults();
-                let mut incoming = Vec::with_capacity(list.len());
-                let mut dstate_alert_count = 0_usize;
-                for l in list {
-                    let clean_msg = clean_otel_message(&l.message);
-                    if self.source == DataSource::Live
-                        && (clean_msg.is_empty()
-                            || clean_msg.eq_ignore_ascii_case("running 0 tests"))
-                    {
-                        continue;
-                    }
-                    let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
-                        String::from("actionrunner-controller")
-                    } else {
-                        l.service
-                    };
-                    let mut severity = l.severity;
-                    if severity == LogSeverity::Error
-                        && (clean_msg.contains("test result: ok.")
-                            || (clean_msg.contains("0 failed") && !clean_msg.contains("FAILED"))
-                            || clean_msg.starts_with("Running ")
-                            || clean_msg.starts_with("Compiling ")
-                            || clean_msg.starts_with("Finished ")
-                            || clean_msg.starts_with("Doc-tests "))
-                    {
-                        severity = LogSeverity::Info;
-                    }
-                    let is_dstate_alert = clean_msg.contains("Host pressure / D-state alert");
-                    if is_dstate_alert {
-                        if dstate_alert_count >= 3 {
-                            continue;
-                        }
-                        if severity == LogSeverity::Error
-                            && clean_msg.contains("wchan=0")
-                            && (clean_msg.contains("io_some_avg10=0.")
-                                || clean_msg.contains("io_some_avg10=1.")
-                                || clean_msg.contains("io_some_avg10=2.")
-                                || clean_msg.contains("io_some_avg10=3.")
-                                || clean_msg.contains("io_some_avg10=4."))
-                        {
-                            severity = LogSeverity::Warn;
-                        }
-                    }
-                    let has_real_trace =
-                        !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
-                    if matches!(self.source, DataSource::Scenario(_))
-                        && has_real_trace
-                        && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
-                    {
-                        self.observe.traces.push(PurePathTrace {
-                            trace_id: l.trace_id.clone(),
-                            root_service: service.clone(),
-                            root_operation: clean_msg.clone(),
-                            domain: "OBS".into(),
-                            duration_ms: 12,
-                            error: severity == LogSeverity::Error,
-                            slow_p99: false,
-                            started_epoch_ms: l.timestamp_ms,
-                            spans: vec![TraceSpan {
-                                span_id: l.span_id.clone().unwrap_or_else(|| "sp-obs-log-1".into()),
-                                parent_span_id: None,
-                                service: service.clone(),
-                                operation: clean_msg.clone(),
-                                start_offset_us: 0,
-                                duration_us: 12_000,
-                                self_time_us: 12_000,
-                                critical_path: true,
-                                error: severity == LogSeverity::Error,
-                                hardware_class: "fabric-collector".into(),
-                            }],
-                        });
-                    }
-                    if !incoming
-                        .iter()
-                        .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
-                    {
-                        if is_dstate_alert {
-                            dstate_alert_count += 1;
-                        }
-                        incoming.push(OtelLogEntry {
-                            timestamp_ms: l.timestamp_ms,
-                            severity,
-                            service,
-                            span_id: l.span_id,
-                            trace_id: l.trace_id,
-                            message: clean_msg,
-                        });
-                    }
-                }
+                let incoming = self.normalize_log_dtos(list);
                 if self.source == DataSource::Live {
                     if !incoming.is_empty() {
-                        if incoming.len() == 1 {
-                            let entry = incoming.into_iter().next().unwrap();
+                        for entry in incoming {
                             if !self.live_obs_logs.iter().any(|e| {
                                 e.timestamp_ms == entry.timestamp_ms
                                     && e.trace_id == entry.trace_id
                                     && e.message == entry.message
                             }) {
                                 self.live_obs_logs.push(entry);
-                                self.live_obs_logs
-                                    .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-                                self.live_obs_logs.truncate(500);
                             }
-                        } else {
-                            self.live_obs_logs = incoming;
                         }
+                        self.live_obs_logs
+                            .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+                        self.live_obs_logs.truncate(500);
+                    }
+                    if !self.active_log_query {
+                        self.refresh_live_logs();
                     }
                     self.refresh_live_problems();
-                    self.refresh_live_logs();
                     self.refresh_live_smartscape();
                 } else if !incoming.is_empty() {
                     let mut merged: Vec<OtelLogEntry> = self
@@ -1585,6 +1646,8 @@ impl Store {
                             merged.push(entry);
                         }
                     }
+                    merged.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+                    merged.truncate(500);
                     self.observe.logs = merged;
                 }
                 true
@@ -2159,11 +2222,12 @@ impl Store {
             "{repo_label} @{ref_clean} [{status_label}] stages={} tests={passed_t}/{total_t} cov={cov_str} on {node_hw}",
             rec.stages.len(),
         ));
-        if !self
-            .observe
-            .logs
-            .iter()
-            .any(|l| l.trace_id == trace_id && l.message == log_msg)
+        if matches!(self.source, DataSource::Scenario(_))
+            && !self
+                .observe
+                .logs
+                .iter()
+                .any(|l| l.trace_id == trace_id && l.message == log_msg)
         {
             self.observe.logs.push(OtelLogEntry {
                 timestamp_ms: 1_700_000_900_000_u64
@@ -2244,23 +2308,27 @@ impl Store {
                     next_jobs.push(summary);
                 }
             }
-            live_traces.push(self.build_ci_trace_and_log(&rec, q_hint, job_idx));
+            if matches!(self.source, DataSource::Scenario(_)) {
+                live_traces.push(self.build_ci_trace_and_log(&rec, q_hint, job_idx));
+            }
         }
         self.ci_jobs = next_jobs;
-        if let Some(first_tr) = live_traces.first() {
-            let tid = first_tr.trace_id.clone();
-            for m in &mut self.observe.metrics {
-                if matches!(m.exemplar_trace_id.as_str(), "tr-obs-p99-07" | "tr-ci-1234") {
-                    m.exemplar_trace_id.clone_from(&tid);
+        if matches!(self.source, DataSource::Scenario(_)) {
+            if let Some(first_tr) = live_traces.first() {
+                let tid = first_tr.trace_id.clone();
+                for m in &mut self.observe.metrics {
+                    if matches!(m.exemplar_trace_id.as_str(), "tr-obs-p99-07" | "tr-ci-1234") {
+                        m.exemplar_trace_id.clone_from(&tid);
+                    }
                 }
             }
-        }
-        for existing in std::mem::take(&mut self.observe.traces) {
-            if !live_traces.iter().any(|t| t.trace_id == existing.trace_id) {
-                live_traces.push(existing);
+            for existing in std::mem::take(&mut self.observe.traces) {
+                if !live_traces.iter().any(|t| t.trace_id == existing.trace_id) {
+                    live_traces.push(existing);
+                }
             }
+            self.observe.traces = live_traces;
         }
-        self.observe.traces = live_traces;
         self.refresh_live_metrics();
         self.refresh_live_cd();
         self.refresh_live_problems();
@@ -2270,12 +2338,12 @@ impl Store {
     }
 
     fn refresh_live_logs(&mut self) {
-        if self.source != DataSource::Live {
+        if self.source != DataSource::Live || self.active_log_query {
             return;
         }
         let mut clean_logs = self.live_obs_logs.clone();
         clean_logs.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-        clean_logs.truncate(200);
+        clean_logs.truncate(500);
         self.observe.logs = clean_logs;
     }
 
@@ -2437,19 +2505,25 @@ impl Store {
             } else {
                 Vec::new()
             };
-            let gate = DeploymentGate {
-                deployment_id: c.deployment_id.clone(),
-                repo: repo_id.clone(),
-                service: c.service.clone(),
-                artifact_digest: c.artifact_digest.clone(),
-                target_node: "node-b".into(),
-                staged_slot: Slot::B,
-                restore_slot: Slot::A,
-                lease_expires_epoch_ms: 180_000,
-                outcome,
-                rollback_reason: None,
-                tainted: outcome == GateOutcome::Tainted,
-                tests,
+            let gate = if let Some(existing) = self.gates.get(&c.deployment_id) {
+                existing.clone()
+            } else if matches!(self.source, DataSource::Scenario(_)) {
+                DeploymentGate {
+                    deployment_id: c.deployment_id.clone(),
+                    repo: repo_id.clone(),
+                    service: c.service.clone(),
+                    artifact_digest: c.artifact_digest.clone(),
+                    target_node: "node-b".into(),
+                    staged_slot: Slot::B,
+                    restore_slot: Slot::A,
+                    lease_expires_epoch_ms: 180_000,
+                    outcome,
+                    rollback_reason: None,
+                    tainted: outcome == GateOutcome::Tainted,
+                    tests,
+                }
+            } else {
+                continue;
             };
             let summary = gate.summary();
             self.gates.insert(c.deployment_id.clone(), gate);
@@ -2969,7 +3043,7 @@ impl Store {
         };
         let gate = DeploymentGate {
             deployment_id: d.deployment_id,
-            repo: resolved_repo,
+            repo: resolved_repo.clone(),
             service: d.service,
             artifact_digest: d.artifact_digest,
             target_node: sanitize_public_log(&d.target_node),
@@ -2993,8 +3067,12 @@ impl Store {
                 .collect(),
         };
         self.gates.insert(id.clone(), gate);
+        self.latest
+            .entry(resolved_repo)
+            .or_insert_with(|| id.clone());
         self.refresh_cd(&id);
         if self.source == DataSource::Live {
+            self.refresh_live_cd();
             self.refresh_live_logs();
         }
         true
@@ -3477,6 +3555,24 @@ mod tests {
             25,
         );
         s.apply(
+            Input::Gate(GateDto {
+                deployment_id: "dep-9f82".into(),
+                owner: "LMA1980".into(),
+                repo: "mu-console".into(),
+                service: "muconsole".into(),
+                artifact_digest: "sha256:9f82c01a334e".into(),
+                target_node: "worker-riscv64".into(),
+                staged_slot: Slot::B,
+                restore_slot: Slot::A,
+                lease_expires_epoch_ms: 180_000,
+                outcome: GateOutcome::Tainted,
+                rollback_reason: Some(RollbackReason::CriticalTestFailed),
+                tainted: true,
+                tests: Vec::new(),
+            }),
+            26,
+        );
+        s.apply(
             Input::ObsLogs(vec![OtelLogDto {
                 timestamp_ms: 1_700_000_000_000,
                 severity: LogSeverity::Error,
@@ -3663,5 +3759,168 @@ mod tests {
             .collect();
         assert_eq!(dstates.len(), 3);
         assert!(dstates.iter().all(|l| l.severity == LogSeverity::Warn));
+    }
+
+    #[test]
+    fn test_log_query_disentanglement_and_500_capacity() {
+        let mut s = Store::new(DataSource::Live);
+
+        // 1. Send 550 live logs via polling
+        let poll_logs: Vec<OtelLogDto> = (0..550)
+            .map(|i| OtelLogDto {
+                timestamp_ms: 1_700_000_000_000 + i,
+                severity: LogSeverity::Info,
+                service: "mu-service".into(),
+                span_id: Some(format!("sp-{i}")),
+                trace_id: format!("tr-{i}"),
+                message: format!("Log entry number {i}"),
+            })
+            .collect();
+
+        s.apply(Input::ObsLogs(poll_logs), 100);
+
+        let v = s.view();
+        // Preserves full 500 capacity (not truncated to 200)
+        assert_eq!(v.observe.logs.len(), 500);
+        assert_eq!(s.live_obs_logs.len(), 500);
+        assert_eq!(v.observe.logs[0].timestamp_ms, 1_700_000_000_549);
+        assert!(!s.is_active_log_query());
+
+        // 2. 0-hit search query: renders empty observe.logs without wiping live_obs_logs
+        s.apply(Input::ObsLogsQueryResult(Vec::new()), 101);
+        assert!(s.is_active_log_query());
+        let v_empty = s.view();
+        assert_eq!(v_empty.observe.logs.len(), 0);
+        assert_eq!(s.live_obs_logs.len(), 500);
+
+        // 3. Background polling while search query is active: merges into live_obs_logs but does not wipe active search
+        let poll_update = vec![OtelLogDto {
+            timestamp_ms: 1_700_000_000_600,
+            severity: LogSeverity::Warn,
+            service: "mu-service".into(),
+            span_id: Some("sp-poll-new".into()),
+            trace_id: "tr-poll-new".into(),
+            message: "Fresh poll log while searching".into(),
+        }];
+        s.apply(Input::ObsLogs(poll_update), 102);
+        assert!(s.is_active_log_query());
+        assert_eq!(s.view().observe.logs.len(), 0);
+        assert!(s.live_obs_logs.iter().any(|l| l.trace_id == "tr-poll-new"));
+
+        // 4. SSE log entry while search query is active: appends to live_obs_logs without wiping active search
+        let sse_entry = OtelLogDto {
+            timestamp_ms: 1_700_000_000_601,
+            severity: LogSeverity::Error,
+            service: "mu-service".into(),
+            span_id: Some("sp-sse-1".into()),
+            trace_id: "tr-sse-1".into(),
+            message: "Live SSE streaming log".into(),
+        };
+        s.apply(Input::ObsLogEntry(sse_entry), 103);
+        assert!(s.is_active_log_query());
+        assert_eq!(s.view().observe.logs.len(), 0);
+        assert!(s.live_obs_logs.iter().any(|l| l.trace_id == "tr-sse-1"));
+
+        // 5. 1-hit search query: isolates single log and does not pollute live buffer
+        let single_hit = OtelLogDto {
+            timestamp_ms: 1_700_000_000_700,
+            severity: LogSeverity::Info,
+            service: "special-service".into(),
+            span_id: Some("sp-hit-1".into()),
+            trace_id: "tr-hit-1".into(),
+            message: "Unique needle in haystack".into(),
+        };
+        s.apply(Input::ObsLogsQueryResult(vec![single_hit]), 104);
+        assert!(s.is_active_log_query());
+        let v_single = s.view();
+        assert_eq!(v_single.observe.logs.len(), 1);
+        assert_eq!(v_single.observe.logs[0].trace_id, "tr-hit-1");
+        assert!(!s.live_obs_logs.iter().any(|l| l.trace_id == "tr-hit-1"));
+
+        // 6. Clear active log query: restores full 500 live logs view
+        s.clear_active_log_query();
+        assert!(!s.is_active_log_query());
+        let v_restored = s.view();
+        assert_eq!(v_restored.observe.logs.len(), 500);
+        assert!(v_restored
+            .observe
+            .logs
+            .iter()
+            .any(|l| l.trace_id == "tr-sse-1"));
+        assert!(v_restored
+            .observe
+            .logs
+            .iter()
+            .any(|l| l.trace_id == "tr-poll-new"));
+    }
+
+    #[test]
+    fn test_zero_synthetic_live_fabrications() {
+        let mut s = Store::new(DataSource::Live);
+
+        // 1. In Live mode, canary bundles do NOT fabricate synthetic "node-b" DeploymentGate
+        s.apply(
+            Input::RegCanaries(vec![CanaryBundleDto {
+                bundle_id: "cny-200".into(),
+                owner: "LMA1980".into(),
+                repo: "mu-console".into(),
+                service: "muconsole".into(),
+                artifact_digest: "sha256:abcd1234ef56".into(),
+                state: CanaryBundleState::Candidate,
+                taint_reason: None,
+                deployment_id: "dep-live-200".into(),
+                trace_id: "tr-live-200".into(),
+            }]),
+            100,
+        );
+        assert!(!s.gates.contains_key("dep-live-200"));
+        assert!(s.view().gate.is_none());
+
+        // 2. In Live mode, apply_ci_queue does NOT fabricate 2023 traces or logs
+        let ci_dto: CiQueueDto = serde_json::from_str(
+            r#"{
+            "queue_depth": 1,
+            "concurrency": 2,
+            "active_jobs": [
+                {
+                    "job": {
+                        "id": "job-live-9999",
+                        "repo": "LMA1980/mu-console",
+                        "git_ref": "main",
+                        "commit_sha": "abcd1234abcd1234"
+                    },
+                    "status": {
+                        "state": "RUNNING"
+                    },
+                    "stages": []
+                }
+            ],
+            "queued_jobs": [],
+            "recent_jobs": []
+        }"#,
+        )
+        .unwrap();
+        s.apply(Input::CiQueue(ci_dto), 101);
+        assert!(!s
+            .view()
+            .observe
+            .logs
+            .iter()
+            .any(|l| l.timestamp_ms >= 1_700_000_800_000 && l.timestamp_ms <= 1_700_000_999_999));
+        assert!(s.view().observe.traces.is_empty());
+
+        // 3. In Live mode, Input::ObsLogs does NOT fabricate 12ms "fabric-collector" spans
+        s.apply(
+            Input::ObsLogs(vec![OtelLogDto {
+                timestamp_ms: 1_762_742_500_000,
+                severity: LogSeverity::Info,
+                service: "mu-test".into(),
+                span_id: Some("sp-live-1".into()),
+                trace_id: "tr-live-has-real-trace-42".into(),
+                message: "Valid live log with trace ID".into(),
+            }]),
+            102,
+        );
+        assert!(s.view().observe.traces.is_empty());
     }
 }

@@ -240,6 +240,7 @@ impl Engine {
                         if let Some(ref q) = route.filter.filter(|s| !s.trim().is_empty()) {
                             self.fetch(FetchKind::ObsLogsQuery(q.clone()), &mut fx);
                         } else {
+                            self.store.clear_active_log_query();
                             self.fetch(FetchKind::ObsLogs, &mut fx);
                         }
                     }
@@ -250,6 +251,7 @@ impl Engine {
             }
             UiCommand::SelectSubView(subview) => {
                 self.active_subview = Some(subview);
+                self.store.clear_active_log_query();
                 if self.mode == Mode::Live {
                     match subview {
                         SubView::Ci(CiSubView::QueueLogs) => {
