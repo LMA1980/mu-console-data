@@ -773,6 +773,12 @@ fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     eng.on_fetch_gen(gen0, &FetchKind::ObsProblems, Ok("[]".into()), 33);
     eng.on_fetch_gen(
         gen0,
+        &FetchKind::ObsTraces,
+        Ok(r#"{"domain":"all","total":1,"traces":[{"trace_id":"tr-ci-af7344","root_service":"actionrunner-controller","root_operation":"queue.dispatch","domain":"CI","duration_ms":120,"error":false,"slow_p99":false,"started_epoch_ms":1793858200000,"spans":[]}]}"#.into()),
+        33,
+    );
+    eng.on_fetch_gen(
+        gen0,
         &FetchKind::ObsLogs,
         Ok(r#"{"severity":"all","total":2,"logs":[{"timestamp_ms":1793858300000,"trace_id":"0102030405060708090a0b0c0d0e0f12","span_id":"010203040506070a","severity_text":"INFO","service":"muobserve-collector","body":"Edge collector mTLS forwarding verified from worker-riscv64"},{"timestamp_ms":1793858200000,"trace_id":"tr-ci-af7344","span_id":"010203040506070b","severity_text":"INFO","service":"actionrunner-rs","body":"Build step finished"}]}"#.into()),
         34,
