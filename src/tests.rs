@@ -942,7 +942,7 @@ fn operator_restart_job_dispatches_post_and_transitions_failed_stages() {
 
     // SetSkin is a UI-local preference and must be a clean no-op in the data worker.
     assert!(eng
-        .handle(UiCommand::SetSkin(ConsoleSkin::Avionics), 5)
+        .handle(UiCommand::SetSkin(ConsoleSkin::Wireframe), 5)
         .is_empty());
 
     // Anonymous RestartJob in Live mode must be rejected with 403 and emit no HTTP requests.
