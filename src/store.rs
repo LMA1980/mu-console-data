@@ -298,6 +298,30 @@ fn clean_otel_message(raw: &str) -> String {
     sanitize_ansi_log_lines(raw, 8).join(" ").trim().to_owned()
 }
 
+fn merge_unique_logs<K: Ord>(
+    target: &mut Vec<OtelLogEntry>,
+    incoming: Vec<OtelLogEntry>,
+    key_fn: impl Fn(&OtelLogEntry) -> K,
+) {
+    if incoming.len() > 8 {
+        let mut seen: std::collections::BTreeSet<K> = target.iter().map(&key_fn).collect();
+        for entry in incoming {
+            if seen.insert(key_fn(&entry)) {
+                target.push(entry);
+            }
+        }
+    } else {
+        for entry in incoming {
+            let k = key_fn(&entry);
+            if !target.iter().any(|e| key_fn(e) == k) {
+                target.push(entry);
+            }
+        }
+    }
+    target.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+    target.truncate(500);
+}
+
 fn default_leases() -> Vec<CdLease> {
     vec![
         CdLease {
@@ -1770,7 +1794,9 @@ impl Store {
     }
 
     fn normalize_log_dtos(&mut self, list: Vec<OtelLogDto>) -> Vec<OtelLogEntry> {
+        let use_set = list.len() > 8;
         let mut incoming = Vec::with_capacity(list.len());
+        let mut seen_incoming = std::collections::BTreeSet::new();
         let mut dstate_alert_count = 0_usize;
         for l in list {
             let clean_msg = clean_otel_message(&l.message);
@@ -1839,10 +1865,14 @@ impl Store {
                     }],
                 });
             }
-            if !incoming
-                .iter()
-                .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
-            {
+            let already_seen = if use_set {
+                !seen_incoming.insert((l.trace_id.clone(), clean_msg.clone()))
+            } else {
+                incoming
+                    .iter()
+                    .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
+            };
+            if !already_seen {
                 if is_dstate_alert {
                     dstate_alert_count += 1;
                 }
@@ -2395,18 +2425,9 @@ impl Store {
                 let incoming = self.normalize_log_dtos(list);
                 if self.source == DataSource::Live {
                     if !incoming.is_empty() {
-                        for entry in incoming {
-                            if !self.live_obs_logs.iter().any(|e| {
-                                e.timestamp_ms == entry.timestamp_ms
-                                    && e.trace_id == entry.trace_id
-                                    && e.message == entry.message
-                            }) {
-                                self.live_obs_logs.push(entry);
-                            }
-                        }
-                        self.live_obs_logs
-                            .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-                        self.live_obs_logs.truncate(500);
+                        merge_unique_logs(&mut self.live_obs_logs, incoming, |e| {
+                            (e.timestamp_ms, e.trace_id.clone(), e.message.clone())
+                        });
                     }
                     if !self.active_log_query {
                         self.refresh_live_logs();
@@ -2420,16 +2441,9 @@ impl Store {
                         .drain(..)
                         .filter(|l| l.trace_id.starts_with("tr-ci-") && l.trace_id != "tr-ci-1234")
                         .collect();
-                    for entry in incoming {
-                        if !merged
-                            .iter()
-                            .any(|e| e.trace_id == entry.trace_id && e.message == entry.message)
-                        {
-                            merged.push(entry);
-                        }
-                    }
-                    merged.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-                    merged.truncate(500);
+                    merge_unique_logs(&mut merged, incoming, |e| {
+                        (e.trace_id.clone(), e.message.clone())
+                    });
                     self.observe.logs = merged;
                 }
                 true
