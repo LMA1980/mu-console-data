@@ -388,11 +388,17 @@ fn deterministic_scenario_player_aliases_stepping_and_speed_control() {
         assert_eq!(Scenario::from_name(alias), Some(expected), "alias {alias}");
     }
 
-    // Replay every canonical scenario end-to-end and verify mirror consistency.
-    for sc in Scenario::ALL {
-        if cfg!(miri) && matches!(sc, Scenario::Repos40) {
-            continue;
-        }
+    // Replay every canonical scenario end-to-end (representative subset under Miri) and verify mirror consistency.
+    let scenarios: &[Scenario] = if cfg!(miri) {
+        &[
+            Scenario::PrMerged,
+            Scenario::ItCriticalFailure,
+            Scenario::Offline,
+        ]
+    } else {
+        &Scenario::ALL
+    };
+    for &sc in scenarios {
         let mut eng = Engine::new(1);
         let mut mirror = None;
         let cfg = WorkerConfig {
@@ -408,7 +414,7 @@ fn deterministic_scenario_player_aliases_stepping_and_speed_control() {
         assert!(fx.contains(&Effect::Post(DataEvent::Connection(expected_conn))));
 
         let end = sc.duration_ms();
-        let tick_step = if cfg!(miri) { 500 } else { MIN_INTERVAL_MS };
+        let tick_step = if cfg!(miri) { 2_000 } else { MIN_INTERVAL_MS };
         let mut now = 0;
         while now <= end {
             let fx = eng.tick(now);
