@@ -2067,3 +2067,289 @@ fn m2_eight_area_subview_polling_commands_and_sse_round_trip() {
     eng.handle(UiCommand::CloseDialog, 85);
     assert!(eng.store().view().active_dialog.is_none());
 }
+
+#[test]
+fn cold_boot_elevated_non_admin_expiry_preserves_baseline_and_blocks_maintenance_activity_leak() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        PlatformSubView, RoleActivationDto, RoleLeaseView, RoleSpecDto, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(306);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // Non-admin user boots cold ALREADY holding an active Timed role (`ci-operator`) and an
+    // Elective role (`cd-reader`), without `platform:folios.read` (no folios catalog fetched).
+    let cold_elevated = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("bob".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        passkey_enrollment_required: false,
+        baseline_role: Some("viewer".into()),
+        bound_roles: vec!["viewer".into(), "cd-reader".into(), "ci-operator".into()],
+        active_roles: vec![
+            RoleSpecDto {
+                id: "viewer".into(),
+                display_name: Some("Viewer".into()),
+                description: "Baseline".into(),
+                activation: RoleActivationDto::pinned_baseline(),
+                step_up: StepUpRequirement::None,
+            },
+            RoleSpecDto {
+                id: "cd-reader".into(),
+                display_name: Some("CD Reader".into()),
+                description: "Elective CD reads".into(),
+                activation: RoleActivationDto::elective(),
+                step_up: StepUpRequirement::None,
+            },
+            RoleSpecDto {
+                id: "ci-operator".into(),
+                display_name: Some("CI Operator".into()),
+                description: "Timed CI ops".into(),
+                activation: RoleActivationDto::timed(4, 4),
+                step_up: StepUpRequirement::Passkey,
+            },
+        ],
+        leases: vec![RoleLeaseView {
+            role_id: "ci-operator".into(),
+            display_name: Some("CI Operator".into()),
+            activated_at_ms: 10,
+            last_activity_at_ms: 10,
+            hard_ttl_secs: 4,
+            idle_ttl_secs: 4,
+            seconds_remaining: 4,
+            hard_expires_at_ms: 4_010,
+            idle_timer: 4,
+            idle_expires_at_ms: 4_010,
+        }],
+        active_folios: vec![
+            "folio:system:dashboard".into(),
+            "folio:ci:anon-queue".into(),
+            "folio:cd:read".into(),
+            "folio:ci:operate".into(),
+        ],
+        active_policies: vec![
+            "system:status.read".into(),
+            "system:dashboard.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+            "cd:steps.read".into(),
+            "ci:jobs.read".into(),
+            "ci:jobs.restart".into(),
+        ],
+        ..AuthSessionDto::default()
+    };
+
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&cold_elevated).unwrap()),
+        10,
+    );
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 15);
+    eng.on_fetch(
+        &FetchKind::CdRuns {
+            repo: RepoId::new(OWNER, SUPERPROJECT),
+            ecosystem: None,
+            limit: 25,
+        },
+        Ok(r#"[{"run_id":"cd-1","ecosystem":"cargo","repo":{"owner":"lma1980","repo":"lero"},"ref_name":"main","commit_sha":"deadbeef","state":"succeeded","started_epoch_ms":10,"steps":[]}]"#.into()),
+        16,
+    );
+
+    // Navigating to Platform::Maintenance must NOT emit POST /api/auth/activity nor extend idle_timer.
+    let maint_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Platform(PlatformSubView::Maintenance)),
+        1_010,
+    );
+    assert!(maint_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsSubsystemStatus,
+            ..
+        }
+    )));
+    assert!(!maint_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthActivity,
+            ..
+        }
+    )));
+    eng.tick(1_500);
+    assert_eq!(eng.store().view().auth.leases[0].idle_timer, 3);
+
+    // At 4_010 ms, `ci-operator` expires locally BEFORE `/api/auth/session` resolves (`folios` absent).
+    let exp_fx = eng.tick(4_010);
+    assert!(exp_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))));
+    assert!(exp_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+
+    let v_after = eng.store().view();
+    assert!(!v_after.auth.has_policy("ci:jobs.restart"));
+    // Baseline + elective read policies remain preserved rather than wiping active_policies to [].
+    assert!(v_after.auth.has_policy("system:status.read"));
+    assert!(v_after.auth.has_policy("system:dashboard.read"));
+    assert!(v_after.auth.has_policy("ci:queue.read"));
+    assert!(v_after.auth.has_policy("ci:repos.public.read"));
+    assert!(v_after.auth.has_policy("cd:runs.read"));
+    assert!(v_after.auth.has_policy("cd:steps.read"));
+    assert!(!v_after.repos.is_empty());
+    assert!(!v_after.cd_runs.is_empty());
+
+    // Mutating command requiring expired `ci:jobs.restart` is fail-closed denied (403).
+    let restart_fx = eng.handle(UiCommand::RestartJob { job_id: 1 }, 4_020);
+    assert!(restart_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
+    )));
+}
+
+#[test]
+fn timed_elevation_refreshes_active_subview_and_elective_toggle_prunes_non_timed() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        AbDeploySubView, RoleActivationDto, RoleLeaseView, RoleSpecDto, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(307);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let baseline = RoleSpecDto {
+        id: "viewer".into(),
+        display_name: Some("Viewer".into()),
+        description: "Baseline".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let cd_reader = RoleSpecDto {
+        id: "cd-reader".into(),
+        display_name: Some("CD Reader".into()),
+        description: "Elective CD".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let ab_responder = RoleSpecDto {
+        id: "ab-responder".into(),
+        display_name: Some("AB Responder".into()),
+        description: "Timed AB".into(),
+        activation: RoleActivationDto::timed(5, 5),
+        step_up: StepUpRequirement::Passkey,
+    };
+
+    // 1. Start active with baseline + elective `cd-reader` while viewing AbDeploy::DeploymentsSlots.
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("carol".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("viewer".into()),
+        bound_roles: vec!["viewer".into(), "cd-reader".into(), "ab-responder".into()],
+        active_roles: vec![baseline.clone(), cd_reader.clone()],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+        ],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        10,
+    );
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 15);
+    eng.handle(
+        UiCommand::SelectSubView(SubView::AbDeploy(AbDeploySubView::DeploymentsSlots)),
+        20,
+    );
+
+    // 2. Elevate Timed `ab-responder` -> must immediately refresh active AbDeploy subview + selection!
+    let s2 = AuthSessionDto {
+        active_roles: vec![baseline.clone(), cd_reader, ab_responder.clone()],
+        leases: vec![RoleLeaseView {
+            role_id: "ab-responder".into(),
+            display_name: Some("AB Responder".into()),
+            activated_at_ms: 30,
+            last_activity_at_ms: 30,
+            hard_ttl_secs: 5,
+            idle_ttl_secs: 5,
+            seconds_remaining: 5,
+            hard_expires_at_ms: 5_030,
+            idle_timer: 5,
+            idle_expires_at_ms: 5_030,
+        }],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+            "ab:slots.read".into(),
+            "ab:gate.logs.read".into(),
+            "ab:rollback".into(),
+        ],
+        ..s1.clone()
+    };
+    let elev_fx = eng.on_fetch(
+        &FetchKind::AuthElevateFinish {
+            role_id: "ab-responder".into(),
+            assertion_json: "{}".into(),
+        },
+        Ok(serde_json::to_string(&s2).unwrap()),
+        30,
+    );
+    assert!(elev_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Deployments(_),
+            ..
+        }
+    )));
+    // Wait until a Canary read policy is granted before RegCanaries fires.
+    assert!(!elev_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::RegCanaries,
+            ..
+        }
+    )));
+
+    // 3. Disable Elective `cd-reader` while Timed `ab-responder` remains active (folios unavailable).
+    let s3 = AuthSessionDto {
+        active_roles: vec![baseline, ab_responder],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "ab:slots.read".into(),
+            "ab:gate.logs.read".into(),
+            "ab:rollback".into(),
+        ],
+        ..s2
+    };
+    eng.on_fetch(
+        &FetchKind::AuthDisableRole("cd-reader".into()),
+        Ok(serde_json::to_string(&s3).unwrap()),
+        40,
+    );
+
+    // 4. When `ab-responder` later reaches 00:00 (no folios table), `cd:runs.read` was pruned from
+    // non_timed_policies (`!is_empty` fix) while baseline policies remain active.
+    eng.tick(5_030);
+    let v_final = eng.store().view();
+    assert!(!v_final.auth.has_policy("cd:runs.read"));
+    assert!(!v_final.auth.has_policy("ab:rollback"));
+    assert!(!v_final.auth.has_policy("ab:slots.read"));
+    assert!(v_final.auth.has_policy("system:status.read"));
+    assert!(v_final.auth.has_policy("ci:queue.read"));
+    assert!(v_final.auth.has_policy("ci:repos.public.read"));
+}

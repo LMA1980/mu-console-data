@@ -841,7 +841,6 @@ impl Engine {
             }
             SubView::Platform(PlatformSubView::Maintenance) => {
                 self.fetch(FetchKind::ObsSubsystemStatus, fx);
-                self.fetch(FetchKind::AuthActivity, fx);
             }
             SubView::Platform(PlatformSubView::UsersAndInvites) => {
                 self.fetch(FetchKind::AuthUsers, fx);
@@ -982,7 +981,14 @@ impl Engine {
                 self.fetch(kind, fx);
             }
         }
-        if !prev_allowed {
+        let gained_any = !prev_allowed
+            || self
+                .store
+                .auth()
+                .active_policies
+                .iter()
+                .any(|p| !prev_policies.iter().any(|x| x == p));
+        if gained_any {
             self.fetch_selection(fx);
         }
         if let Some(sv) = self.active_subview {
@@ -993,7 +999,7 @@ impl Engine {
                         ObservabilitySubView::Logs | ObservabilitySubView::DataStore
                     )
                     | SubView::Repository(_)
-            ) && !prev_allowed
+            ) && gained_any
             {
                 self.fetch_subview(sv, None, fx);
             }

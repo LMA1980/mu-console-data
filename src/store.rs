@@ -187,6 +187,7 @@ pub struct Store {
     model_runner: ModelRunnerView,
     platform: PlatformSnapshotDto,
     non_timed_policies: BTreeSet<String>,
+    non_timed_policies_known: bool,
     timed_added_policies: BTreeMap<String, BTreeSet<String>>,
     force_snapshot_pending: bool,
     session_refresh_pending: bool,
@@ -228,6 +229,17 @@ fn upsert_sorted<T, K: Ord>(v: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {
         Ok(i) => v[i] = item,
         Err(i) => v.insert(i, item),
     }
+}
+
+fn is_elevated_step_up_policy(policy: &str) -> bool {
+    policy.ends_with(".write")
+        || policy.ends_with(".restart")
+        || policy.ends_with(".resume")
+        || policy == "ab:rollback"
+        || policy.starts_with("platform:users.")
+        || policy.starts_with("platform:invites.")
+        || policy.starts_with("platform:roles.")
+        || policy.starts_with("platform:folios.")
 }
 
 fn canonical_service_group(compact: &str) -> Option<&'static str> {
@@ -1113,6 +1125,12 @@ impl Store {
     }
 
     fn record_auth_policy_diffs(&mut self, prev: &AuthState, next: &AuthState) {
+        if !next.is_operator() || (prev.is_resolved() && prev.github_login != next.github_login) {
+            self.non_timed_policies.clear();
+            self.non_timed_policies_known = false;
+            self.timed_added_policies.clear();
+            return;
+        }
         let prev_timed: BTreeSet<String> = prev.leases.iter().map(|l| l.role_id.clone()).collect();
         let next_timed: BTreeSet<String> = next.leases.iter().map(|l| l.role_id.clone()).collect();
         let next_policies: BTreeSet<String> = next.active_policies.iter().cloned().collect();
@@ -1120,31 +1138,37 @@ impl Store {
 
         if next_timed.is_empty() {
             self.non_timed_policies = next_policies;
+            self.non_timed_policies_known = true;
             self.timed_added_policies.clear();
             return;
         }
-        if prev_timed.is_empty() && prev.is_operator() && prev.github_login == next.github_login {
-            self.non_timed_policies = prev_policies
-                .intersection(&next_policies)
-                .cloned()
-                .collect();
-        }
         let added_roles: Vec<String> = next_timed.difference(&prev_timed).cloned().collect();
-        if added_roles.len() == 1 {
-            let exclusive: BTreeSet<String> =
-                next_policies.difference(&prev_policies).cloned().collect();
-            self.timed_added_policies
-                .entry(added_roles[0].clone())
-                .or_default()
-                .extend(exclusive);
+        if prev.is_operator() && prev.github_login == next.github_login {
+            if prev_timed.is_empty() {
+                self.non_timed_policies = prev_policies
+                    .intersection(&next_policies)
+                    .cloned()
+                    .collect();
+                self.non_timed_policies_known = true;
+            } else if self.non_timed_policies_known {
+                // Preserve non-timed subset once known; intersect with surviving policies and
+                // fold in newly toggled Elective permissions when no Timed role changed.
+                self.non_timed_policies
+                    .retain(|p| next_policies.contains(p));
+                if added_roles.is_empty() && next_timed == prev_timed {
+                    self.non_timed_policies
+                        .extend(next_policies.difference(&prev_policies).cloned());
+                }
+            }
+            if added_roles.len() == 1 {
+                let exclusive: BTreeSet<String> =
+                    next_policies.difference(&prev_policies).cloned().collect();
+                self.timed_added_policies
+                    .insert(added_roles[0].clone(), exclusive);
+            }
         }
         self.timed_added_policies
             .retain(|k, _| next_timed.contains(k));
-        if self.non_timed_policies.is_empty() {
-            // Preserve non-timed subset once known; intersect with surviving policies.
-            self.non_timed_policies
-                .retain(|p| next_policies.contains(p));
-        }
     }
 
     fn resolve_folio_policies(&self, role_ids: &[String]) -> Option<(Vec<String>, Vec<String>)> {
@@ -1279,6 +1303,7 @@ impl Store {
     }
 
     fn deactivate_expired_roles(&mut self, expired_roles: &[String]) -> bool {
+        let prev_policies: BTreeSet<String> = self.auth.active_policies.iter().cloned().collect();
         let expired_set: BTreeSet<&str> = expired_roles.iter().map(String::as_str).collect();
         self.auth
             .leases
@@ -1286,9 +1311,6 @@ impl Store {
         self.auth
             .active_roles
             .retain(|r| !expired_set.contains(r.role_id.as_str()));
-        for role in expired_roles {
-            self.timed_added_policies.remove(role);
-        }
 
         let surviving_roles: Vec<String> = self
             .auth
@@ -1296,17 +1318,54 @@ impl Store {
             .iter()
             .map(|r| r.role_id.clone())
             .collect();
+        let surviving_timed: Vec<String> =
+            self.auth.leases.iter().map(|l| l.role_id.clone()).collect();
         if let Some((folios, policies)) = self.resolve_folio_policies(&surviving_roles) {
             self.auth.active_folios = folios;
             self.auth.active_policies = policies;
-        } else {
+        } else if self.non_timed_policies_known
+            && surviving_timed
+                .iter()
+                .all(|r| self.timed_added_policies.contains_key(r))
+        {
             let mut surviving: BTreeSet<String> = self.non_timed_policies.clone();
-            for r in &surviving_roles {
+            for r in &surviving_timed {
                 if let Some(extra) = self.timed_added_policies.get(r) {
                     surviving.extend(extra.iter().cloned());
                 }
             }
             self.auth.active_policies = surviving.into_iter().collect();
+        } else {
+            // Cold-boot elevated or simultaneous multi-timed sessions lack folio tables when
+            // `platform:folios.read` is absent: remove tracked expired additions and strip
+            // elevated step-up/write/admin capabilities while preserving baseline & elective reads
+            // until `/api/auth/session` (`session_refresh_pending`) returns exact policies.
+            let mut retained_known = if self.non_timed_policies_known {
+                self.non_timed_policies.clone()
+            } else {
+                BTreeSet::new()
+            };
+            for r in &surviving_timed {
+                if let Some(extra) = self.timed_added_policies.get(r) {
+                    retained_known.extend(extra.iter().cloned());
+                }
+            }
+            let mut surviving = prev_policies;
+            let mut has_untracked_expired = false;
+            for role in expired_roles {
+                if let Some(expired_only) = self.timed_added_policies.get(role) {
+                    surviving.retain(|p| retained_known.contains(p) || !expired_only.contains(p));
+                } else {
+                    has_untracked_expired = true;
+                }
+            }
+            if has_untracked_expired {
+                surviving.retain(|p| retained_known.contains(p) || !is_elevated_step_up_policy(p));
+            }
+            self.auth.active_policies = surviving.into_iter().collect();
+        }
+        for role in expired_roles {
+            self.timed_added_policies.remove(role);
         }
         self.scrub_for_current_auth();
         self.force_snapshot_pending = true;

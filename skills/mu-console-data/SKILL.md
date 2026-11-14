@@ -1,6 +1,7 @@
-______________________________________________________________________
-
-## name: mu-console-data description: "Implement, test, and consume the mu-console-data crate for dedicated Web Worker state management, fail-closed folio RBAC gating, event coalescing, and offline data storage in MuConsole."
+---
+name: mu-console-data
+description: "Implement, test, and consume the mu-console-data crate for dedicated Web Worker state management, fail-closed folio RBAC gating, event coalescing, and offline data storage in MuConsole."
+---
 
 # `mu-console-data` Architecture & Guidelines
 
@@ -37,5 +38,5 @@ Use these guidelines when developing or integrating `mu-console-data`, the dedic
 ## 4. Privacy & Lab Boundary Invariants
 
 - **Public Repository Cleanliness**:
-  - Public documentation, logs, tests, and skills must never expose internal hostnames, private LAN ranges (`192.168.*`), or internal domains.
+  - Public documentation, logs, tests, and skills must never expose internal hostnames, private network ranges, or internal domains.
   - Use generic placeholders (`node-a`, `worker-riscv64`, `192.0.2.x`, `console.example.org`) across all tests and documentation.

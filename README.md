@@ -16,7 +16,7 @@ Dedicated Web Worker WASM data module for MuConsole (Protocol v6): fail-closed f
 
 ```bash
 cargo fmt --all -- --check
-mdformat --check --wrap keep README.md skills/mu-console-data/SKILL.md
+./scripts/format_docs.sh --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 cargo test --all-targets
