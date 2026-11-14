@@ -13,7 +13,7 @@ tasks:
 
   docs-task:
     tool: "mdformat"
-    args: ["--check", "--wrap", "keep", "README.md", "skills/mu-console-data/SKILL.md"]
+    args: ["--check", "--wrap", "keep", "README.md"]
     timeout_seconds: 120
     sandbox_profile: "default_ci"
 

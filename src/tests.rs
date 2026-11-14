@@ -5,10 +5,10 @@
 //! resync, and offline cache watermark persistence.
 
 use mu_console_protocol::{
-    apply_all, encode, Area, CiSubView, ConnState, CrtFont, DataEvent, DataSource, FadeReason,
-    GateOutcome, ObserveSubView, PanelId, PrState, RegistrySubView, RepoId, Route, Selection,
-    SidingPhase, SubView, SubmoduleId, UiCommand, UiError, ViewModel, WorkerConfig,
-    PROTOCOL_VERSION,
+    apply_all, encode, Area, AuthReasonCode, AuthStatus, CiSubView, ConnState, CrtFont, DataEvent,
+    DataSource, FadeReason, GateOutcome, ObservabilitySubView, PanelId, PrState, RepoId,
+    RepositorySubView, Route, Selection, SidingPhase, SubView, SubmoduleId, UiCommand, UiError,
+    ViewModel, WorkerConfig, PROTOCOL_VERSION,
 };
 
 use crate::api::tests::{GATE, REPOS, TOPOLOGY};
@@ -18,6 +18,42 @@ use crate::engine::{Effect, Engine, HttpError, OFFLINE_AFTER_ATTEMPTS, SELECT_SE
 use crate::offline::{OfflineSnapshot, SAVE_INTERVAL_MS};
 use crate::scenario::{offline_snapshot, Scenario, OWNER, SUPERPROJECT};
 use crate::store::FADE_MS;
+
+const OPERATOR_SESSION_JSON: &str = r#"{
+    "authenticated": true,
+    "github_login": "operator",
+    "invite_bound": true,
+    "passkey_count": 1,
+    "passkey_enrollment_required": false,
+    "baseline_role": "operator",
+    "bound_roles": ["operator"],
+    "active_policies": [
+        "system:status.read", "system:dashboard.read",
+        "ci:queue.read", "ci:repos.public.read", "ci:repos.private.read",
+        "ci:jobs.read", "ci:jobs.logs.read", "ci:nodes.read", "ci:sandboxes.read",
+        "ci:ha.read", "ci:jobs.restart", "ci:jobs.resume",
+        "cd:runs.read", "cd:steps.read",
+        "ab:slots.read", "ab:gate.logs.read", "ab:rollback",
+        "reg:packages.read", "reg:canaries.read", "reg:taints.read", "reg:cas.read",
+        "obs:logs.read", "obs:smartscape.read", "obs:traces.read",
+        "obs:problems.read", "obs:metrics.read", "obs:store.read", "obs:ingress.read",
+        "mr:models.read", "mr:queue.read", "mr:openai_api.read", "mr:wireguard_vpn.read",
+        "platform:maintenance.read", "platform:maintenance.write",
+        "platform:users.read", "platform:users.write",
+        "platform:invites.read", "platform:invites.write",
+        "platform:roles.read", "platform:roles.write",
+        "platform:folios.read", "platform:folios.write",
+        "platform:activity.read"
+    ]
+}"#;
+
+fn resolve_operator_session(eng: &mut Engine, now_ms: u64) -> Vec<Effect> {
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(OPERATOR_SESSION_JSON.into()),
+        now_ms,
+    )
+}
 
 /// Feed `Effect::Post` events into a mirrored [`ViewModel`] and verify that
 /// `apply_all(mirror, patch)` always matches the engine's projected store view.
@@ -51,7 +87,10 @@ fn live_fetch_and_sse_coalesce_at_most_ten_hz() {
         source: DataSource::Live,
     })));
     assert!(fx.contains(&Effect::Post(DataEvent::Connection(ConnState::Connecting))));
-    assert!(fx.contains(&Effect::LoadOffline));
+    // Fail-closed cold boot (t = 0): LoadOffline and non-auth fetches wait for AuthSession.
+    assert!(!fx.contains(&Effect::LoadOffline));
+    let auth_fx = resolve_operator_session(&mut eng, 5);
+    assert!(auth_fx.contains(&Effect::LoadOffline));
 
     // Both SSE streams open -> ConnState::Live.
     eng.on_stream_open(StreamId::Ci, 10);
@@ -126,6 +165,7 @@ fn live_fetch_and_sse_coalesce_at_most_ten_hz() {
 fn rotary_settle_debounce_and_stale_generation_rejection() {
     let mut eng = Engine::new(7);
     eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    resolve_operator_session(&mut eng, 5);
     eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 10);
 
     let initial_gen = eng.selection_gen();
@@ -220,6 +260,7 @@ fn tab_hidden_throttles_to_heartbeats_and_resyncs_on_visible() {
     let mut eng = Engine::new(9);
     let mut mirror = None;
     eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    resolve_operator_session(&mut eng, 5);
     eng.on_stream_open(StreamId::Ci, 10);
     eng.on_stream_open(StreamId::Cd, 10);
     eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 20);
@@ -266,7 +307,7 @@ fn tab_hidden_throttles_to_heartbeats_and_resyncs_on_visible() {
         .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))));
     assert!(fx
         .iter()
-        .any(|e| matches!(e, Effect::Post(DataEvent::AreaBadges(b)) if b.fleet == 1)));
+        .any(|e| matches!(e, Effect::Post(DataEvent::AreaBadges(b)) if b.ci == 1)));
     drain_view_events(&fx, &mut mirror);
     assert_eq!(mirror.as_ref(), Some(&eng.store().view()));
 }
@@ -276,6 +317,7 @@ fn tab_hidden_throttles_to_heartbeats_and_resyncs_on_visible() {
 fn offline_snapshot_watermark_and_live_recovery() {
     let mut eng = Engine::new(100);
     eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    resolve_operator_session(&mut eng, 5);
 
     // Restore an offline snapshot before any live data arrives.
     let snap = offline_snapshot();
@@ -468,8 +510,9 @@ fn engine_handles_unknown_scenarios_routes_and_wire_errors() {
         protocol: PROTOCOL_VERSION,
         source: DataSource::Live,
     })));
+    resolve_operator_session(&mut eng, 5);
 
-    // Subscribe route selects repo + submodule; Page and SetCrtFont are no-ops on the worker.
+    // Subscribe route selects repo + submodule; Page and SetCrtFont emit no upstream effects.
     let fx = eng.handle(
         UiCommand::Subscribe(Route {
             area: Area::Ci,
@@ -487,7 +530,7 @@ fn engine_handles_unknown_scenarios_routes_and_wire_errors() {
     );
     assert!(!fx.is_empty());
     let reg_fx = eng.handle(
-        UiCommand::SelectSubView(SubView::Registry(RegistrySubView::Packages)),
+        UiCommand::SelectSubView(SubView::Repository(RepositorySubView::Packages)),
         15,
     );
     assert!(reg_fx.iter().any(|e| matches!(
@@ -498,7 +541,7 @@ fn engine_handles_unknown_scenarios_routes_and_wire_errors() {
         }
     )));
     let obs_fx = eng.handle(
-        UiCommand::SelectSubView(SubView::Observe(ObserveSubView::PurePath)),
+        UiCommand::SelectSubView(SubView::Observability(ObservabilitySubView::PurePath)),
         16,
     );
     assert!(obs_fx.iter().any(|e| matches!(
@@ -574,29 +617,49 @@ fn auth_session_probe_and_invite_redemption_emit_auth_delta_and_refresh_repos() 
         kind: FetchKind::AuthSession,
         url: "/api/auth/session".into(),
     }));
-    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 10);
-    let fx = eng.tick(100);
+    let fx = eng.tick(0);
     drain_view_events(&fx, &mut mirror);
     assert_eq!(
         mirror.as_ref().map(|v| &v.auth),
-        Some(&AuthState::Anonymous)
+        Some(&AuthState::unresolved())
     );
 
-    // Uninvited GitHub user session transitions view.auth to InviteRequired.
-    let uninvited_json =
-        r#"{"authenticated":false,"github_login":"guest-user","invite_bound":false,"role":null}"#;
-    eng.on_fetch(&FetchKind::AuthSession, Ok(uninvited_json.into()), 110);
-    let fx = eng.tick(200);
+    // Non-lockdown anonymous session allows public read access without authentication.
+    let anon_public_json = r#"{
+        "authenticated":false,"github_login":null,"invite_bound":false,"anonymous_lockdown":false,
+        "active_policies":["system:status.read","ci:repos.public.read","ci:queue.read"]
+    }"#;
+    eng.on_fetch(&FetchKind::AuthSession, Ok(anon_public_json.into()), 80);
+    let fx = eng.tick(110);
     assert!(fx.iter().any(|e| matches!(
         e,
         Effect::Post(DataEvent::Patch(deltas))
-            if deltas.contains(&Delta::Auth(AuthState::InviteRequired {
-                github_login: "guest-user".into()
-            }))
+            if deltas.iter().any(|d| matches!(
+                d,
+                Delta::Auth(a) if a.status == AuthStatus::Anonymous && !a.anonymous_lockdown
+            ))
+    )));
+    drain_view_events(&fx, &mut mirror);
+    assert_eq!(
+        mirror.as_ref().map(|v| v.auth.status),
+        Some(AuthStatus::Anonymous)
+    );
+
+    // Uninvited GitHub user session transitions view.auth to AuthorizationDenied and forces a clean Snapshot.
+    let uninvited_json =
+        r#"{"authenticated":false,"github_login":"guest-user","invite_bound":false,"role":null}"#;
+    eng.on_fetch(&FetchKind::AuthSession, Ok(uninvited_json.into()), 120);
+    let fx = eng.tick(220);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Snapshot(v))
+            if v.auth.status == AuthStatus::AuthorizationDenied
+                && v.auth.github_login.as_deref() == Some("guest-user")
+                && v.auth.reason_code == Some(AuthReasonCode::AuthorizationDenied)
     )));
     drain_view_events(&fx, &mut mirror);
 
-    // Redeeming a valid invite token issues FetchKind::AuthRedeem, transitions to Operator,
+    // Redeeming a valid invite token issues FetchKind::AuthRedeem, transitions to Active operator,
     // and refreshes /api/repos so private repos become visible.
     let fx = eng.handle(
         UiCommand::RedeemInvite {
@@ -609,7 +672,11 @@ fn auth_session_probe_and_invite_redemption_emit_auth_delta_and_refresh_repos() 
         url: "/api/auth/redeem".into(),
     }));
 
-    let redeemed_json = r#"{"authenticated":true,"github_login":"guest-user","invite_bound":true,"role":"operator"}"#;
+    let redeemed_json = r#"{
+        "authenticated":true,"github_login":"guest-user","invite_bound":true,"passkey_count":1,
+        "baseline_role":"operator","bound_roles":["operator"],
+        "active_policies":["system:status.read","ci:queue.read","ci:repos.public.read","ci:repos.private.read"]
+    }"#;
     let fx = eng.on_fetch(
         &FetchKind::AuthRedeem("inv_019a4f8c_secret".into()),
         Ok(redeemed_json.into()),
@@ -624,26 +691,36 @@ fn auth_session_probe_and_invite_redemption_emit_auth_delta_and_refresh_repos() 
     )));
     let fx = eng.tick(350);
     drain_view_events(&fx, &mut mirror);
-    assert_eq!(
-        mirror.as_ref().map(|v| &v.auth),
-        Some(&AuthState::Operator {
-            github_login: "guest-user".into(),
-            role: Some("operator".into()),
-        })
-    );
+    let auth = mirror.as_ref().map(|v| &v.auth).expect("auth");
+    assert_eq!(auth.status, AuthStatus::Active);
+    assert_eq!(auth.github_login.as_deref(), Some("guest-user"));
+    assert_eq!(auth.baseline_role.as_deref(), Some("operator"));
 
-    // Direct SetAuthSession command also updates Store.auth.
+    // Direct SetAuthSession command resets cleanly to fail-closed Anonymous lockdown.
     eng.handle(UiCommand::SetAuthSession(AuthSessionDto::default()), 360);
-    assert_eq!(eng.store().auth(), &AuthState::Anonymous);
+    assert_eq!(eng.store().auth().status, AuthStatus::Anonymous);
+    assert!(eng.store().auth().anonymous_lockdown);
 }
 
 #[test]
 fn live_cluster_nodes_ci_queue_and_non_empty_aux_views_regression() {
     let mut eng = Engine::new(77);
     let fx = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
-    assert!(fx.contains(&Effect::Fetch {
+    assert!(!fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+    let auth_fx = resolve_operator_session(&mut eng, 5);
+    assert!(auth_fx.contains(&Effect::Fetch {
         kind: FetchKind::CiQueue,
         url: "/api/queue".into(),
+    }));
+    assert!(auth_fx.contains(&Effect::Fetch {
+        kind: FetchKind::ObsSubsystemStatus,
+        url: "/api/obs/v1/status/subsystems".into(),
     }));
 
     // Capture gen = 0 before /api/repos auto-selects the first repository (which increments selection_gen).
@@ -969,8 +1046,12 @@ fn operator_restart_job_dispatches_post_and_transitions_failed_stages() {
     let _ = eng.on_fetch(
         &FetchKind::AuthSession,
         Ok(
-            r#"{"authenticated":true,"invite_bound":true,"github_login":"LMA1980","role":"operator"}"#
-                .into(),
+            r#"{
+                "authenticated":true,"invite_bound":true,"github_login":"LMA1980","role":"operator",
+                "passkey_count":1,"baseline_role":"operator","bound_roles":["operator"],
+                "active_policies":["ci:jobs.restart","ci:jobs.resume","ci:queue.read","ci:repos.public.read","system:status.read"]
+            }"#
+            .into(),
         ),
         15,
     );
@@ -1035,6 +1116,20 @@ fn live_sse_push_and_active_job_log_tailing() {
 
     let mut eng = Engine::new(42);
     let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    // Authenticated observer holding ci:queue.read + ci:jobs.read + obs:logs.read (no ci:jobs.logs.read)
+    // tails build logs via the sanitized MuObserve fallback endpoint.
+    let _ = eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(
+            r#"{
+                "authenticated":true,"invite_bound":true,"github_login":"viewer","passkey_count":1,
+                "baseline_role":"viewer","bound_roles":["viewer"],
+                "active_policies":["system:status.read","ci:queue.read","ci:repos.public.read","ci:jobs.read","obs:logs.read"]
+            }"#
+            .into(),
+        ),
+        2,
+    );
     let _ = eng.on_stream_open(StreamId::Ci, 5);
 
     // 1. SSE event: queue populates active job in Store.ci_jobs.
@@ -1080,7 +1175,7 @@ fn live_sse_push_and_active_job_log_tailing() {
 
     // 4. Switching to OBS > Logs polls ObsLogs + CiQueue on live tick even when no CI job is running.
     let _ = eng.handle(
-        UiCommand::SelectSubView(SubView::Observe(ObserveSubView::Logs)),
+        UiCommand::SelectSubView(SubView::Observability(ObservabilitySubView::Logs)),
         2_200,
     );
     let obs_tick_fx = eng.tick(4_020);
@@ -1119,4 +1214,1142 @@ fn live_sse_push_and_active_job_log_tailing() {
             url,
         } if *id == job_id && url == "/api/obs/v1/jobs/job-1794054805-5cec9056/log"
     )));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cold_boot_fails_closed_until_session_resolves() {
+    use mu_console_protocol::AreaBadges;
+
+    let mut eng = Engine::new(301);
+    let fx = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // At t = 0: ONLY AuthSession + Ready + Connecting; zero LoadOffline, SSE, or non-auth REST.
+    assert!(fx.contains(&Effect::Fetch {
+        kind: FetchKind::AuthSession,
+        url: "/api/auth/session".into(),
+    }));
+    assert!(!fx.contains(&Effect::LoadOffline));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(!fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind, .. } if !matches!(kind, FetchKind::AuthSession)
+    )));
+    assert_eq!(eng.store().auth().status, AuthStatus::Unresolved);
+    assert_eq!(eng.store().view(), ViewModel::default());
+    assert_eq!(eng.store().badges(), AreaBadges::default());
+
+    // Navigating subviews before session resolution emits zero operational fetches.
+    assert!(eng
+        .handle(
+            UiCommand::SelectSubView(SubView::Observability(ObservabilitySubView::Logs)),
+            10,
+        )
+        .is_empty());
+
+    // Even if offline bytes arrive pre-session, Store::view stays fail-closed empty.
+    let bytes = offline_snapshot().to_bytes().expect("encode offline");
+    eng.on_offline_loaded(Some(&bytes), 20);
+    assert_eq!(eng.store().view(), ViewModel::default());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
+    use mu_console_protocol::{AreaBadges, DialogModel};
+
+    // 1. Anonymous lockdown mode withholds LoadOffline, SSE, and all non-auth REST calls.
+    let mut eng = Engine::new(302);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let lockdown_fx = eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(r#"{"authenticated":false,"anonymous_lockdown":true,"active_policies":[]}"#.into()),
+        10,
+    );
+    assert!(!lockdown_fx.contains(&Effect::LoadOffline));
+    assert!(!lockdown_fx
+        .iter()
+        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(!lockdown_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind, .. } if !matches!(kind, FetchKind::AuthSession)
+    )));
+    assert!(eng
+        .handle(
+            UiCommand::SelectSubView(SubView::Ci(CiSubView::QueueLogs)),
+            20
+        )
+        .is_empty());
+    assert_eq!(eng.store().badges(), AreaBadges::default());
+
+    // 2. Authenticated 0-Passkey session opens non-dismissible PasskeyEnrollmentGate,
+    // blocks non-auth REST/LoadOffline/SSE, permits auth profile & passkey enrollment,
+    // and unblocks once Passkey enrollment + session refresh completes.
+    let zero_pk_json = r#"{
+        "authenticated": true,
+        "github_login": "alice",
+        "invite_bound": true,
+        "passkey_count": 0,
+        "passkey_enrollment_required": true,
+        "baseline_role": "operator",
+        "bound_roles": ["operator"],
+        "active_policies": []
+    }"#;
+    let gate_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(zero_pk_json.into()), 30);
+    assert!(!gate_fx.contains(&Effect::LoadOffline));
+    assert!(!gate_fx
+        .iter()
+        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(!gate_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind, .. }
+            if !matches!(
+                kind,
+                FetchKind::AuthSession | FetchKind::AuthProfile | FetchKind::AuthPasskeys
+            )
+    )));
+
+    let v_gate = eng.store().view();
+    assert_eq!(v_gate.auth.status, AuthStatus::PasskeyEnrollmentRequired);
+    assert!(matches!(
+        v_gate.active_dialog,
+        Some(DialogModel::PasskeyEnrollmentGate(ref g)) if g.github_login == "alice" && g.passkey_count == 0
+    ));
+
+    // CloseDialog cannot dismiss PasskeyEnrollmentGate.
+    eng.handle(UiCommand::CloseDialog, 40);
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::PasskeyEnrollmentGate(_))
+    ));
+    assert!(eng
+        .handle(
+            UiCommand::SelectSubView(SubView::Repository(RepositorySubView::Packages)),
+            45,
+        )
+        .is_empty());
+
+    // Profile queries and Passkey enrollment DO dispatch in 0-Passkey state.
+    let enroll_fx = eng.handle(
+        UiCommand::EnrollPasskey {
+            label: Some("YubiKey".into()),
+            attestation_json: r#"{"id":"pk-1"}"#.into(),
+        },
+        50,
+    );
+    assert!(enroll_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthPasskeyRegisterFinish { .. },
+            url,
+        } if url == "/api/auth/passkeys/register/finish"
+    )));
+
+    let finish_fx = eng.on_fetch(
+        &FetchKind::AuthPasskeyRegisterFinish {
+            label: Some("YubiKey".into()),
+            attestation_json: r#"{"id":"pk-1"}"#.into(),
+        },
+        Ok(r#"{"credential_id":"pk-1","label":"YubiKey","created_at_ms":55}"#.into()),
+        55,
+    );
+    assert!(finish_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+    assert!(finish_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthPasskeys,
+            ..
+        }
+    )));
+
+    // Refreshing AuthSession with passkey_count == 1 closes PasskeyEnrollmentGate and unlocks workspace.
+    let unlock_fx = resolve_operator_session(&mut eng, 60);
+    assert!(unlock_fx.contains(&Effect::LoadOffline));
+    assert!(unlock_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Ci,
+            ..
+        }
+    )));
+    assert!(eng.store().view().active_dialog.is_none());
+}
+
+#[test]
+fn anonymous_bounded_polling_eliminates_log_node_and_registry_leaks() {
+    let mut eng = Engine::new(303);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // Non-lockdown anonymous grants ONLY system:status.read, ci:queue.read, ci:repos.public.read.
+    let anon_json = r#"{
+        "authenticated": false,
+        "github_login": null,
+        "invite_bound": false,
+        "anonymous_lockdown": false,
+        "active_policies": ["system:status.read", "ci:queue.read", "ci:repos.public.read"]
+    }"#;
+    let boot_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(anon_json.into()), 10);
+
+    // Must fetch ONLY authorized public endpoints and open ONLY Ci + Obs streams.
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsSubsystemStatus,
+            url,
+        } if url == "/api/obs/v1/status/subsystems"
+    )));
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Ci,
+            ..
+        }
+    )));
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Obs,
+            ..
+        }
+    )));
+    assert!(!boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Cd,
+            ..
+        }
+    )));
+    assert!(!boot_fx.contains(&Effect::LoadOffline));
+
+    for forbidden in &boot_fx {
+        assert!(
+            !matches!(
+                forbidden,
+                Effect::Fetch {
+                    kind: FetchKind::ClusterNodes
+                        | FetchKind::ObsLogs
+                        | FetchKind::ObsStoreStatus
+                        | FetchKind::RegPackages
+                        | FetchKind::RegCanaries
+                        | FetchKind::RegCasStatus
+                        | FetchKind::JobDetail(_)
+                        | FetchKind::JobLog(_),
+                    ..
+                }
+            ),
+            "anonymous bootstrap leaked forbidden fetch: {forbidden:?}"
+        );
+    }
+
+    // Deliver CiQueue, open QueueLogs, SelectJob, and tick past 2s poll interval:
+    // ZERO raw /api/jobs/{id}/log or /api/obs/v1/jobs/{id}/log or /api/obs/v1/logs or /api/cluster/nodes!
+    let queue_json = r#"{
+        "queue_depth": 0,
+        "concurrency": 1,
+        "active_jobs": [{
+            "elapsed_secs": 8, "wait_secs": 0, "position": 0,
+            "record": {
+                "job": { "id": "job-1794054805-5cec9056", "repo_name": "LMA1980/mu-console", "ref_name": "main", "commit_sha": "5cec90561234", "event_type": "push" },
+                "status": { "state": "Running" },
+                "stages": [{ "id": "fmt-check", "name": "fmt-check", "threads": 6, "status": { "state": "Running", "details": { "duration_secs": 2, "exit_code": 0 } } }]
+            }
+        }],
+        "queued_jobs": [],
+        "recent_jobs": []
+    }"#;
+    let q_fx = eng.on_fetch(&FetchKind::CiQueue, Ok(queue_json.into()), 20);
+    assert!(!q_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::JobLog(_) | FetchKind::JobDetail(_),
+            ..
+        }
+    )));
+
+    let job_id = eng.store().view().ci_jobs[0].job_id;
+    let sub_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Ci(CiSubView::QueueLogs)),
+        30,
+    );
+    let sel_fx = eng.handle(UiCommand::SelectJob { job_id }, 40);
+    let tick_fx = eng.tick(2_500);
+    let nodes_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Ci(CiSubView::WorkerNodes)),
+        2_600,
+    );
+    let fb_fx = eng.on_fetch(
+        &FetchKind::JobLog(job_id),
+        Err(HttpError {
+            status: 401,
+            message: "Unauthorized".into(),
+        }),
+        2_700,
+    );
+
+    for fx_batch in [&sub_fx, &sel_fx, &tick_fx, &nodes_fx, &fb_fx] {
+        for e in fx_batch {
+            assert!(
+                !matches!(
+                    e,
+                    Effect::Fetch {
+                        kind: FetchKind::JobLog(_)
+                            | FetchKind::JobDetail(_)
+                            | FetchKind::ObsLogs
+                            | FetchKind::ClusterNodes
+                            | FetchKind::RegPackages
+                            | FetchKind::RegCanaries
+                            | FetchKind::RegCasStatus,
+                        ..
+                    }
+                ),
+                "anonymous polling leaked restricted endpoint: {e:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn independent_role_lease_countdown_activity_reset_and_single_role_expiry_scrubbing() {
+    use mu_console_protocol::dto::{
+        FolioOrigin, PolicyFolioDto, RoleActivationDto, RoleFolioIndexDto, RoleSpecDto,
+    };
+
+    let mut eng = Engine::new(304);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let mut mirror = None;
+
+    // Session at t = 1_000 ms has:
+    // - baseline "viewer" (PinnedBaseline)
+    // - elective "ci-operator" (Elective)
+    // - timed "ab-responder" (hard 10s -> 11_000 ms, idle 5s -> 6_000 ms)
+    // - timed "obs-investigator" (hard 30s -> 31_000 ms, idle 20s -> 21_000 ms)
+    let session_json = r#"{
+        "authenticated": true,
+        "github_login": "responder",
+        "invite_bound": true,
+        "passkey_count": 1,
+        "passkey_enrollment_required": false,
+        "baseline_role": "viewer",
+        "bound_roles": ["viewer", "ci-operator", "ab-responder", "obs-investigator"],
+        "active_roles": [
+            { "id": "viewer", "activation": { "kind": "pinned_baseline" } },
+            { "id": "ci-operator", "activation": { "kind": "elective" } },
+            { "id": "ab-responder", "activation": { "kind": "timed", "hard_ttl_secs": 10, "idle_ttl_secs": 5 } },
+            { "id": "obs-investigator", "activation": { "kind": "timed", "hard_ttl_secs": 30, "idle_ttl_secs": 20 } }
+        ],
+        "leases": [
+            {
+                "role_id": "ab-responder",
+                "activated_at_ms": 1000,
+                "last_activity_at_ms": 1000,
+                "hard_expires_at_ms": 11000,
+                "idle_expires_at_ms": 6000,
+                "hard_ttl_secs": 10,
+                "idle_ttl_secs": 5,
+                "seconds_remaining": 10,
+                "idle_timer": 5
+            },
+            {
+                "role_id": "obs-investigator",
+                "activated_at_ms": 1000,
+                "last_activity_at_ms": 1000,
+                "hard_expires_at_ms": 31000,
+                "idle_expires_at_ms": 21000,
+                "hard_ttl_secs": 30,
+                "idle_ttl_secs": 20,
+                "seconds_remaining": 30,
+                "idle_timer": 20
+            }
+        ],
+        "active_folios": [
+            "folio:baseline",
+            "folio:ci-ops",
+            "folio:ab-ops",
+            "folio:obs-ops",
+            "folio:plat-read"
+        ],
+        "active_policies": [
+            "system:status.read", "ci:repos.public.read", "ci:queue.read",
+            "ci:jobs.read", "ci:nodes.read",
+            "ab:slots.read", "ab:rollback", "cd:runs.read",
+            "obs:logs.read", "obs:traces.read",
+            "platform:folios.read"
+        ]
+    }"#;
+    let boot_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(session_json.into()), 1_000);
+    assert!(boot_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Cd,
+            ..
+        }
+    )));
+    eng.on_stream_open(StreamId::Ci, 1_005);
+    eng.on_stream_open(StreamId::Cd, 1_005);
+    eng.on_stream_open(StreamId::Obs, 1_005);
+
+    // Load RoleCatalog, PolicyFolio catalog & RoleFolioIndex + operational slices for all 4 roles.
+    let roles_dto = vec![
+        RoleSpecDto {
+            id: "viewer".into(),
+            display_name: None,
+            description: String::new(),
+            activation: RoleActivationDto::pinned_baseline(),
+            step_up: Default::default(),
+        },
+        RoleSpecDto {
+            id: "ci-operator".into(),
+            display_name: None,
+            description: String::new(),
+            activation: RoleActivationDto::elective(),
+            step_up: Default::default(),
+        },
+        RoleSpecDto {
+            id: "ab-responder".into(),
+            display_name: None,
+            description: String::new(),
+            activation: RoleActivationDto::timed(10, 5),
+            step_up: Default::default(),
+        },
+        RoleSpecDto {
+            id: "obs-investigator".into(),
+            display_name: None,
+            description: String::new(),
+            activation: RoleActivationDto::timed(30, 20),
+            step_up: Default::default(),
+        },
+    ];
+    let folios_json = serde_json::json!({
+        "folios": [
+            PolicyFolioDto {
+                id: "folio:baseline".into(),
+                display_name: "Baseline".into(),
+                description: String::new(),
+                origin: FolioOrigin::Operator,
+                owner_subsystem: None,
+                includes: Vec::new(),
+                policies: vec!["system:status.read".into(), "ci:repos.public.read".into(), "ci:queue.read".into()],
+            },
+            PolicyFolioDto {
+                id: "folio:ci-ops".into(),
+                display_name: "CI Ops".into(),
+                description: String::new(),
+                origin: FolioOrigin::Operator,
+                owner_subsystem: None,
+                includes: Vec::new(),
+                policies: vec!["ci:jobs.read".into(), "ci:nodes.read".into()],
+            },
+            PolicyFolioDto {
+                id: "folio:ab-ops".into(),
+                display_name: "AB Ops".into(),
+                description: String::new(),
+                origin: FolioOrigin::Operator,
+                owner_subsystem: None,
+                includes: Vec::new(),
+                policies: vec!["ab:slots.read".into(), "ab:rollback".into(), "cd:runs.read".into()],
+            },
+            PolicyFolioDto {
+                id: "folio:obs-ops".into(),
+                display_name: "OBS Ops".into(),
+                description: String::new(),
+                origin: FolioOrigin::Operator,
+                owner_subsystem: None,
+                includes: Vec::new(),
+                policies: vec!["obs:logs.read".into(), "obs:traces.read".into()],
+            },
+            PolicyFolioDto {
+                id: "folio:plat-read".into(),
+                display_name: "Plat".into(),
+                description: String::new(),
+                origin: FolioOrigin::Operator,
+                owner_subsystem: None,
+                includes: Vec::new(),
+                policies: vec!["platform:folios.read".into()],
+            }
+        ],
+        "policies": []
+    });
+    let mut role_folios = std::collections::BTreeMap::new();
+    role_folios.insert(
+        "viewer".into(),
+        vec!["folio:baseline".into(), "folio:plat-read".into()],
+    );
+    role_folios.insert("ci-operator".into(), vec!["folio:ci-ops".into()]);
+    role_folios.insert("ab-responder".into(), vec!["folio:ab-ops".into()]);
+    role_folios.insert("obs-investigator".into(), vec!["folio:obs-ops".into()]);
+    let rfi = RoleFolioIndexDto {
+        anonymous: Vec::new(),
+        role_folios,
+    };
+
+    eng.on_fetch(
+        &FetchKind::AuthRoles,
+        Ok(serde_json::to_string(&roles_dto).unwrap()),
+        1_010,
+    );
+    eng.on_fetch(&FetchKind::AuthFolios, Ok(folios_json.to_string()), 1_010);
+    eng.on_fetch(
+        &FetchKind::AuthRoleFolioIndex,
+        Ok(serde_json::to_string(&rfi).unwrap()),
+        1_010,
+    );
+
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 1_020);
+    eng.on_fetch(
+        &FetchKind::ClusterNodes,
+        Ok(r#"[{"node_id":"worker-riscv64","is_online":true,"arch":"riscv64","active_slots":0,"max_slots":1,"cpu_load_pct":10.0,"ram_used_mb":1024,"ram_total_mb":32768,"btrfs_enabled":true,"exclusive_locked":false,"last_seen_secs_ago":1}]"#.into()),
+        1_020,
+    );
+    eng.on_fetch(
+        &FetchKind::Leases,
+        Ok(r#"[{"deployment_id":"dep-42","service":"muconsole","target_node":"worker-riscv64","slot":"b","remaining_secs":120}]"#.into()),
+        1_020,
+    );
+    eng.on_fetch(
+        &FetchKind::CdRuns {
+            repo: RepoId::new("LMA1980", "engine"),
+            ecosystem: None,
+            limit: 25,
+        },
+        Ok(r#"[{"run_id":"run-1","ecosystem":"cargo","repo":{"owner":"LMA1980","repo":"engine"},"state":"succeeded","started_epoch_ms":1000}]"#.into()),
+        1_020,
+    );
+    eng.on_fetch(
+        &FetchKind::ObsLogs,
+        Ok(r#"[{"timestamp_ms":1000,"severity":"INFO","service":"obs","trace_id":"t1","message":"log stays"}]"#.into()),
+        1_020,
+    );
+    let fx = eng.tick(1_100);
+    drain_view_events(&fx, &mut mirror);
+
+    // Passive ticks & telemetry polls at t = 3_000 ms MUST count down BOTH clocks independently
+    // WITHOUT resetting idle_timer!
+    eng.on_fetch(&FetchKind::ObsMetrics, Ok("[]".into()), 2_000);
+    let _ = eng.tick(3_000);
+    let v3 = eng.store().view();
+    let ab3 = v3
+        .auth
+        .leases
+        .iter()
+        .find(|l| l.role_id == "ab-responder")
+        .expect("ab lease");
+    let obs3 = v3
+        .auth
+        .leases
+        .iter()
+        .find(|l| l.role_id == "obs-investigator")
+        .expect("obs lease");
+    assert_eq!((ab3.seconds_remaining, ab3.idle_timer), (8, 3));
+    assert_eq!((obs3.seconds_remaining, obs3.idle_timer), (28, 18));
+
+    // Explicit RecordUserActivity at t = 3_100 resets idle_timer cleanly while preserving fixed hard_expires_at_ms!
+    let act_fx = eng.handle(UiCommand::RecordUserActivity, 3_100);
+    assert!(act_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthActivity,
+            url,
+        } if url == "/api/auth/activity"
+    )));
+    let v_act = eng.store().view();
+    let ab_act = v_act
+        .auth
+        .leases
+        .iter()
+        .find(|l| l.role_id == "ab-responder")
+        .expect("ab lease after activity");
+    let obs_act = v_act
+        .auth
+        .leases
+        .iter()
+        .find(|l| l.role_id == "obs-investigator")
+        .expect("obs lease after activity");
+    assert_eq!(ab_act.hard_expires_at_ms, 11_000);
+    assert_eq!(ab_act.idle_expires_at_ms, 8_100);
+    assert_eq!(ab_act.seconds_remaining, 8);
+    assert_eq!(ab_act.idle_timer, 5);
+    assert_eq!(obs_act.idle_timer, 20);
+
+    // Advance past ab-responder's idle deadline (8_100 ms) WITHOUT activity:
+    // ONLY ab-responder expires; baseline + ci-operator + obs-investigator survive!
+    let exp_fx = eng.tick(8_100);
+    assert!(
+        exp_fx
+            .iter()
+            .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))),
+        "single-role 00:00 expiration must force a full DataEvent::Snapshot"
+    );
+    assert!(exp_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+    assert!(exp_fx.contains(&Effect::CloseStream(StreamId::Cd)));
+
+    let v_after = eng.store().view();
+    assert_eq!(v_after.auth.status, AuthStatus::Active);
+    let active_role_ids: Vec<&str> = v_after
+        .auth
+        .active_roles
+        .iter()
+        .map(|r| r.role_id.as_str())
+        .collect();
+    assert_eq!(
+        active_role_ids,
+        vec!["viewer", "ci-operator", "obs-investigator"]
+    );
+    assert!(!v_after.auth.has_policy("ab:slots.read"));
+    assert!(!v_after.auth.has_policy("cd:runs.read"));
+    assert!(v_after.auth.has_policy("ci:nodes.read"));
+    assert!(v_after.auth.has_policy("obs:logs.read"));
+
+    // Exclusively AB/CD slices are scrubbed while surviving CI/OBS slices remain intact!
+    assert!(v_after.leases.is_empty());
+    assert!(v_after.cd_runs.is_empty());
+    assert!(v_after.gate.is_none());
+    assert!(!v_after.repos.is_empty());
+    assert!(!v_after.nodes.is_empty());
+    assert!(!v_after.observe.logs.is_empty());
+}
+
+#[test]
+fn m2_eight_area_subview_polling_commands_and_sse_round_trip() {
+    use mu_console_protocol::{
+        AbDeploySubView, CdRunState, CdSubView, DialogModel, MaintenanceMode, ModelRunnerSubView,
+        PlatformSubView, SubsystemId, SubsystemStatus,
+    };
+
+    let mut eng = Engine::new(305);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    resolve_operator_session(&mut eng, 5);
+    eng.on_stream_open(StreamId::Obs, 6);
+
+    // 1. Subsystems SSE live update -> updates subsystem_health + AreaBadges::dashboard / platform.
+    let sse_sub = concat!(
+        "event: subsystem_status_changed\n",
+        "data: {\"subsystem\":\"cd\",\"effective_status\":\"in-maintenance\",\"probe_status\":\"live\",\"mode\":\"manual\",\"summary\":\"Window\",\"updated_at_ms\":10}\n\n"
+    );
+    eng.on_stream_chunk(StreamId::Obs, sse_sub.as_bytes(), 10);
+    assert_eq!(
+        eng.store().view().subsystem_health.cd.status,
+        SubsystemStatus::InMaintenance
+    );
+    assert_eq!(eng.store().badges().platform, 1);
+
+    // 2. Maintenance override command + refresh.
+    let maint_fx = eng.handle(
+        UiCommand::SetSubsystemMaintenance {
+            subsystem: SubsystemId::Repository,
+            mode: MaintenanceMode::Manual(SubsystemStatus::Offline),
+            reason: Some("CAS maintenance".into()),
+            auto_clear_secs: Some(600),
+        },
+        20,
+    );
+    assert!(maint_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::SetSubsystemMaintenance {
+                subsystem: SubsystemId::Repository,
+                ..
+            },
+            url,
+        } if url == "/api/obs/v1/status/subsystems/repository/maintenance"
+    )));
+
+    // 3. Area::Cd Runs polling -> badge increments on failed run.
+    let repo = RepoId::new("LMA1980", "mu-console");
+    eng.handle(
+        UiCommand::SelectRepo {
+            repo: repo.clone(),
+            submodule: None,
+        },
+        30,
+    );
+    let cd_fx = eng.handle(UiCommand::SelectSubView(SubView::Cd(CdSubView::Runs)), 35);
+    assert!(cd_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CdRuns { .. },
+            ..
+        }
+    )));
+    eng.on_fetch(
+        &FetchKind::CdRuns {
+            repo,
+            ecosystem: None,
+            limit: 25,
+        },
+        Ok(r#"[{"run_id":"cd-1","ecosystem":"cargo","repo":{"owner":"LMA1980","repo":"mu-console"},"state":"failed","started_epoch_ms":35}]"#.into()),
+        40,
+    );
+    assert_eq!(eng.store().view().cd_runs.len(), 1);
+    assert_eq!(eng.store().view().cd_runs[0].state, CdRunState::Failed);
+    assert_eq!(eng.store().badges().cd, 1);
+
+    // 4. Area::AbDeploy emergency symmetric rollback command & gate update.
+    eng.handle(
+        UiCommand::SelectSubView(SubView::AbDeploy(AbDeploySubView::IntegrationGate)),
+        45,
+    );
+    eng.on_fetch(&FetchKind::Gate("dep-42".into()), Ok(GATE.into()), 46);
+    let rb_fx = eng.handle(
+        UiCommand::TriggerAbRollback {
+            deployment_id: "dep-42".into(),
+            note: Some("regression".into()),
+        },
+        50,
+    );
+    assert!(rb_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AbRollback { deployment_id, .. },
+            url,
+        } if deployment_id == "dep-42" && url == "/api/cd/deployments/dep-42/rollback"
+    )));
+    let rb_follow = eng.on_fetch(
+        &FetchKind::AbRollback {
+            deployment_id: "dep-42".into(),
+            note: Some("regression".into()),
+        },
+        Ok(
+            r#"{"deployment_id":"dep-42","restored_slot":"a","tainted_digest":"sha256:bad"}"#
+                .into(),
+        ),
+        55,
+    );
+    assert!(rb_follow.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Deployments(_),
+            ..
+        }
+    )));
+
+    // 5. Area::ModelRunner subviews -> populates ModelRunnerView & degraded WireGuard badge.
+    let mr_q_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::ModelRunner(ModelRunnerSubView::RuntimeQueue)),
+        60,
+    );
+    assert!(mr_q_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::MrStatus,
+            url,
+        } if url == "/api/mr/v1/status"
+    )));
+    let mr_c_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::ModelRunner(ModelRunnerSubView::ConnectionVpn)),
+        61,
+    );
+    assert!(mr_c_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::MrConnection,
+            url,
+        } if url == "/api/mr/v1/connection"
+    )));
+    eng.on_fetch(
+        &FetchKind::MrConnection,
+        Ok(r#"{"openai_base_url":"https://192.0.2.1/v1","interface_state":"down"}"#.into()),
+        65,
+    );
+    assert_eq!(eng.store().badges().model_runner, 1);
+
+    // 6. Area::Platform -> UsersAndInvites, CreateInvite opens InviteCreatedOnce dialog cleanly.
+    let p_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Platform(PlatformSubView::UsersAndInvites)),
+        70,
+    );
+    assert!(p_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthUsers,
+            ..
+        }
+    )));
+    assert!(p_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthInvites,
+            ..
+        }
+    )));
+    let rf_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Platform(PlatformSubView::RolesAndFolios)),
+        72,
+    );
+    assert!(rf_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthRoles,
+            ..
+        }
+    )));
+    assert!(rf_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthFolios,
+            ..
+        }
+    )));
+    assert!(rf_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthRoleFolioIndex,
+            ..
+        }
+    )));
+
+    let inv_fx = eng.handle(
+        UiCommand::CreateInvite {
+            note: Some("oncall".into()),
+            ttl_secs: Some(3600),
+        },
+        75,
+    );
+    assert!(inv_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthCreateInvite { .. },
+            url,
+        } if url == "/api/auth/invites"
+    )));
+    let created_fx = eng.on_fetch(
+        &FetchKind::AuthCreateInvite {
+            note: Some("oncall".into()),
+            ttl_secs: Some(3600),
+        },
+        Ok(r#"{
+          "invite_id": "inv-01",
+          "token": "secret-token",
+          "url": "https://console.example.org/?invite=secret-token",
+          "granted_role": "viewer",
+          "expires_at_ms": 3600075,
+          "note": "oncall"
+        }"#
+        .into()),
+        80,
+    );
+    assert!(created_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthInvites,
+            ..
+        }
+    )));
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::InviteCreatedOnce(ref dlg)) if dlg.invite_id == "inv-01" && dlg.granted_role == "viewer"
+    ));
+    eng.handle(UiCommand::CloseDialog, 85);
+    assert!(eng.store().view().active_dialog.is_none());
+}
+
+#[test]
+fn cold_boot_elevated_non_admin_expiry_preserves_baseline_and_blocks_maintenance_activity_leak() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        PlatformSubView, RoleActivationDto, RoleLeaseView, RoleSpecDto, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(306);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // Non-admin user boots cold ALREADY holding an active Timed role (`ci-operator`) and an
+    // Elective role (`cd-reader`), without `platform:folios.read` (no folios catalog fetched).
+    let cold_elevated = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("bob".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        passkey_enrollment_required: false,
+        baseline_role: Some("viewer".into()),
+        bound_roles: vec!["viewer".into(), "cd-reader".into(), "ci-operator".into()],
+        active_roles: vec![
+            RoleSpecDto {
+                id: "viewer".into(),
+                display_name: Some("Viewer".into()),
+                description: "Baseline".into(),
+                activation: RoleActivationDto::pinned_baseline(),
+                step_up: StepUpRequirement::None,
+            },
+            RoleSpecDto {
+                id: "cd-reader".into(),
+                display_name: Some("CD Reader".into()),
+                description: "Elective CD reads".into(),
+                activation: RoleActivationDto::elective(),
+                step_up: StepUpRequirement::None,
+            },
+            RoleSpecDto {
+                id: "ci-operator".into(),
+                display_name: Some("CI Operator".into()),
+                description: "Timed CI ops".into(),
+                activation: RoleActivationDto::timed(4, 4),
+                step_up: StepUpRequirement::Passkey,
+            },
+        ],
+        leases: vec![RoleLeaseView {
+            role_id: "ci-operator".into(),
+            display_name: Some("CI Operator".into()),
+            activated_at_ms: 10,
+            last_activity_at_ms: 10,
+            hard_ttl_secs: 4,
+            idle_ttl_secs: 4,
+            seconds_remaining: 4,
+            hard_expires_at_ms: 4_010,
+            idle_timer: 4,
+            idle_expires_at_ms: 4_010,
+        }],
+        active_folios: vec![
+            "folio:system:dashboard".into(),
+            "folio:ci:anon-queue".into(),
+            "folio:cd:read".into(),
+            "folio:ci:operate".into(),
+        ],
+        active_policies: vec![
+            "system:status.read".into(),
+            "system:dashboard.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+            "cd:steps.read".into(),
+            "ci:jobs.read".into(),
+            "ci:jobs.restart".into(),
+        ],
+        ..AuthSessionDto::default()
+    };
+
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&cold_elevated).unwrap()),
+        10,
+    );
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 15);
+    eng.on_fetch(
+        &FetchKind::CdRuns {
+            repo: RepoId::new(OWNER, SUPERPROJECT),
+            ecosystem: None,
+            limit: 25,
+        },
+        Ok(r#"[{"run_id":"cd-1","ecosystem":"cargo","repo":{"owner":"lma1980","repo":"lero"},"ref_name":"main","commit_sha":"deadbeef","state":"succeeded","started_epoch_ms":10,"steps":[]}]"#.into()),
+        16,
+    );
+
+    // Navigating to Platform::Maintenance must NOT emit POST /api/auth/activity nor extend idle_timer.
+    let maint_fx = eng.handle(
+        UiCommand::SelectSubView(SubView::Platform(PlatformSubView::Maintenance)),
+        1_010,
+    );
+    assert!(maint_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsSubsystemStatus,
+            ..
+        }
+    )));
+    assert!(!maint_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthActivity,
+            ..
+        }
+    )));
+    eng.tick(1_500);
+    assert_eq!(eng.store().view().auth.leases[0].idle_timer, 3);
+
+    // At 4_010 ms, `ci-operator` expires locally BEFORE `/api/auth/session` resolves (`folios` absent).
+    let exp_fx = eng.tick(4_010);
+    assert!(exp_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))));
+    assert!(exp_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+
+    let v_after = eng.store().view();
+    assert!(!v_after.auth.has_policy("ci:jobs.restart"));
+    // Baseline + elective read policies remain preserved rather than wiping active_policies to [].
+    assert!(v_after.auth.has_policy("system:status.read"));
+    assert!(v_after.auth.has_policy("system:dashboard.read"));
+    assert!(v_after.auth.has_policy("ci:queue.read"));
+    assert!(v_after.auth.has_policy("ci:repos.public.read"));
+    assert!(v_after.auth.has_policy("cd:runs.read"));
+    assert!(v_after.auth.has_policy("cd:steps.read"));
+    assert!(!v_after.repos.is_empty());
+    assert!(!v_after.cd_runs.is_empty());
+
+    // Mutating command requiring expired `ci:jobs.restart` is fail-closed denied (403).
+    let restart_fx = eng.handle(UiCommand::RestartJob { job_id: 1 }, 4_020);
+    assert!(restart_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
+    )));
+}
+
+#[test]
+fn timed_elevation_refreshes_active_subview_and_elective_toggle_prunes_non_timed() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        AbDeploySubView, RoleActivationDto, RoleLeaseView, RoleSpecDto, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(307);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let baseline = RoleSpecDto {
+        id: "viewer".into(),
+        display_name: Some("Viewer".into()),
+        description: "Baseline".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let cd_reader = RoleSpecDto {
+        id: "cd-reader".into(),
+        display_name: Some("CD Reader".into()),
+        description: "Elective CD".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let ab_responder = RoleSpecDto {
+        id: "ab-responder".into(),
+        display_name: Some("AB Responder".into()),
+        description: "Timed AB".into(),
+        activation: RoleActivationDto::timed(5, 5),
+        step_up: StepUpRequirement::Passkey,
+    };
+
+    // 1. Start active with baseline + elective `cd-reader` while viewing AbDeploy::DeploymentsSlots.
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("carol".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("viewer".into()),
+        bound_roles: vec!["viewer".into(), "cd-reader".into(), "ab-responder".into()],
+        active_roles: vec![baseline.clone(), cd_reader.clone()],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+        ],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        10,
+    );
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 15);
+    eng.handle(
+        UiCommand::SelectSubView(SubView::AbDeploy(AbDeploySubView::DeploymentsSlots)),
+        20,
+    );
+
+    // 2. Elevate Timed `ab-responder` -> must immediately refresh active AbDeploy subview + selection!
+    let s2 = AuthSessionDto {
+        active_roles: vec![baseline.clone(), cd_reader, ab_responder.clone()],
+        leases: vec![RoleLeaseView {
+            role_id: "ab-responder".into(),
+            display_name: Some("AB Responder".into()),
+            activated_at_ms: 30,
+            last_activity_at_ms: 30,
+            hard_ttl_secs: 5,
+            idle_ttl_secs: 5,
+            seconds_remaining: 5,
+            hard_expires_at_ms: 5_030,
+            idle_timer: 5,
+            idle_expires_at_ms: 5_030,
+        }],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "cd:runs.read".into(),
+            "ab:slots.read".into(),
+            "ab:gate.logs.read".into(),
+            "ab:rollback".into(),
+        ],
+        ..s1.clone()
+    };
+    let elev_fx = eng.on_fetch(
+        &FetchKind::AuthElevateFinish {
+            role_id: "ab-responder".into(),
+            assertion_json: "{}".into(),
+        },
+        Ok(serde_json::to_string(&s2).unwrap()),
+        30,
+    );
+    assert!(elev_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Deployments(_),
+            ..
+        }
+    )));
+    // Wait until a Canary read policy is granted before RegCanaries fires.
+    assert!(!elev_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::RegCanaries,
+            ..
+        }
+    )));
+
+    // 3. Disable Elective `cd-reader` while Timed `ab-responder` remains active (folios unavailable).
+    let s3 = AuthSessionDto {
+        active_roles: vec![baseline, ab_responder],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:repos.public.read".into(),
+            "ab:slots.read".into(),
+            "ab:gate.logs.read".into(),
+            "ab:rollback".into(),
+        ],
+        ..s2
+    };
+    eng.on_fetch(
+        &FetchKind::AuthDisableRole("cd-reader".into()),
+        Ok(serde_json::to_string(&s3).unwrap()),
+        40,
+    );
+
+    // 4. When `ab-responder` later reaches 00:00 (no folios table), `cd:runs.read` was pruned from
+    // non_timed_policies (`!is_empty` fix) while baseline policies remain active.
+    eng.tick(5_030);
+    let v_final = eng.store().view();
+    assert!(!v_final.auth.has_policy("cd:runs.read"));
+    assert!(!v_final.auth.has_policy("ab:rollback"));
+    assert!(!v_final.auth.has_policy("ab:slots.read"));
+    assert!(v_final.auth.has_policy("system:status.read"));
+    assert!(v_final.auth.has_policy("ci:queue.read"));
+    assert!(v_final.auth.has_policy("ci:repos.public.read"));
 }

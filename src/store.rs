@@ -6,26 +6,32 @@
 //! store into the canonical [`ViewModel`] for the current selection. Live
 //! data and fixture scenarios share this exact path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mu_console_protocol::dto::{
-    parse_job_id_str, AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto,
-    CasStatusDto, CiQueueDto, CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto,
-    IngressOverviewDto, IngressRouteDto, IngressUpstreamDto, ItProgressDto, JobStageChangedDto,
-    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
-    PrStateChangedDto, ProblemDto, PromotedDto, RepoDto, RepoSummaryDto, RolledBackDto,
-    SmartscapeDto, StoreStatusDto, TaintedDto, TopologyDto, TraceDto,
+    parse_job_id_str, AbRollbackResponseDto, AuthSessionDto, BranchCreatedDto, BranchDeletedDto,
+    CanaryBundleDto, CasStatusDto, CdRunDto, CdRunState, CiQueueDto, CiQueueJobRecordDto,
+    ClusterNodeDto, CreatedInviteResponseDto, DeploymentDto, GateDto, IngressOverviewDto,
+    IngressRouteDto, IngressUpstreamDto, InviteRecordDto, ItProgressDto, JobStageChangedDto,
+    LeaseExpiredDto, MetricSeriesDto, ModelRunnerConnectionDto, ModelRunnerStatusDto,
+    NodeMembershipChangedDto, OtelLogDto, PackageDto, PasskeySummaryDto, PlatformSnapshotDto,
+    PlatformUserDto, PolicyFolioDto, PrStateChangedDto, ProblemDto, PromotedDto, RepoDto,
+    RepoSummaryDto, RoleFolioIndexDto, RoleSpecDto, RolledBackDto, SmartscapeDto, StoreStatusDto,
+    SubsystemHealthSummary, SubsystemId, SubsystemStatus, SubsystemStatusEntryDto, TaintedDto,
+    TopologyDto, TraceDto, UserProfileDto, Visibility,
 };
 use mu_console_protocol::{
-    format_job_id, sanitize_ansi_log_lines, sanitize_public_log, AreaBadges, AuthState, Branch,
-    CanaryBundle, CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage, CiJobSummary,
-    DataSource, DataStoreHealth, DeploymentGate, DeploymentSummary, FabricNode, FadeReason,
-    GateOutcome, GateTest, HardwareMetricSeries, LogSeverity, ObserveView, OtelLogEntry,
-    PackageEcosystem, ParentRef, PrState, ProblemCategory, PurePathTrace, RegistryPackage,
-    RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology, RollbackReason,
+    format_job_id, sanitize_ansi_log_lines, sanitize_public_log, Area, AreaBadges, AuthState,
+    AuthStatus, Branch, CanaryBundle, CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage,
+    CiJobSummary, ConsoleSkin, CrtFont, DataSource, DataStoreHealth, DeploymentGate,
+    DeploymentSummary, DialogModel, FabricNode, FadeReason, GateOutcome, GateTest,
+    HardwareMetricSeries, InviteCreatedOnceDialogModel, LogSeverity, ModelRunnerView, ObserveView,
+    OtelLogEntry, PackageEcosystem, ParentRef, PasskeyEnrollmentGateModel, PrState,
+    ProblemCategory, PurePathTrace, RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus,
+    RepoTopology, RoleActivationDto, RoleBadgeView, RoleLeaseView, RollbackReason,
     SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot, SmartscapeEdge,
     SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState, TraceSpan,
-    Train, ViewModel,
+    Train, ViewModel, DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
 };
 
 /// A merged or deleted siding is removed this long after it starts fading.
@@ -44,8 +50,10 @@ pub enum Input {
         repo: RepoId,
         list: Vec<DeploymentDto>,
     },
+    CdRuns(Vec<CdRunDto>),
     Gate(GateDto),
     Leases(Vec<CdLease>),
+    AbRollbackResult(AbRollbackResponseDto),
     Sandboxes(Vec<SandboxProfileSummary>),
     RegPackages(Vec<PackageDto>),
     RegCanaries(Vec<CanaryBundleDto>),
@@ -59,11 +67,15 @@ pub enum Input {
     ObsLogsQueryResult(Vec<OtelLogDto>),
     ObsMetrics(Vec<MetricSeriesDto>),
     ObsStoreStatus(StoreStatusDto),
+    ObsSubsystemStatus(Vec<SubsystemStatusEntryDto>),
+    SubsystemStatusChanged(SubsystemStatusEntryDto),
     ObsIngressOverview(IngressOverviewDto),
     ObsIngressRoutes(Vec<IngressRouteDto>),
     ObsIngressUpstreams(Vec<IngressUpstreamDto>),
     ObsProblemEvent(ProblemDto),
     ObsIngressChanged,
+    MrStatus(ModelRunnerStatusDto),
+    MrConnection(ModelRunnerConnectionDto),
     BranchCreated(BranchCreatedDto),
     BranchDeleted(BranchDeletedDto),
     PrStateChanged(PrStateChangedDto),
@@ -75,8 +87,50 @@ pub enum Input {
     Tainted(TaintedDto),
     LeaseExpired(LeaseExpiredDto),
     Select(Selection),
-    /// Operator authentication session state (`/api/auth/session` or `/api/auth/redeem`).
+    /// Operator authentication session state (`/api/auth/session` or `/api/auth/redeem` / role actions).
     AuthSession(AuthSessionDto),
+    /// Signed-in user's `@user` profile & Passkeys (`GET/PUT /api/auth/profile`).
+    UserProfile(UserProfileDto),
+    /// Signed-in user's Passkey summary list (`GET /api/auth/passkeys`).
+    Passkeys(Vec<PasskeySummaryDto>),
+    /// Passkey registration completed cleanly.
+    PasskeyEnrolled(Option<PasskeySummaryDto>),
+    /// Passkey credential deleted cleanly.
+    PasskeyDeleted(String),
+    /// Explicit user activity acknowledged; refreshes active `Timed` idle timers locally.
+    UserActivityRecorded,
+    /// Platform `RoleCatalog` snapshot (`GET /api/auth/roles`).
+    PlatformRoles(Vec<RoleSpecDto>),
+    RoleSpecUpserted(RoleSpecDto),
+    RoleSpecDeleted(String),
+    /// Platform `PolicyFolio` catalog snapshot (`GET /api/auth/folios`).
+    PlatformFolios(Vec<PolicyFolioDto>),
+    PolicyFolioUpserted(PolicyFolioDto),
+    PolicyFolioDeleted(String),
+    /// Platform `RoleFolioIndex` mapping (`GET/PUT /api/auth/role-folio-index`).
+    PlatformRoleFolioIndex(RoleFolioIndexDto),
+    RoleFolioIndexUpdated(RoleFolioIndexDto),
+    /// Bound platform user directory (`GET /api/auth/users`).
+    PlatformUsers(Vec<PlatformUserDto>),
+    PlatformUsersUpsert(PlatformUserDto),
+    UserRolesUpdated {
+        github_login: String,
+        bound_roles: Vec<String>,
+    },
+    UserPasskeysReset(String),
+    UserRevoked(String),
+    /// Platform onboarding invites (`GET /api/auth/invites`).
+    PlatformInvites(Vec<InviteRecordDto>),
+    InviteCreated(CreatedInviteResponseDto),
+    InviteRevoked(String),
+    /// Skin-agnostic dialog open / close transitions.
+    OpenDialog(DialogModel),
+    CloseDialog,
+    /// Local or synced skin/font preference update reflected on loaded profile.
+    LocalUserPrefs {
+        skin: Option<ConsoleSkin>,
+        font: Option<CrtFont>,
+    },
     /// Operator restarted a CI job (`POST /api/jobs/{job_id}/restart`).
     JobRestarted(u64),
     /// Operator resumed a CI job (`POST /api/jobs/{job_id}/resume`).
@@ -125,6 +179,18 @@ pub struct Store {
     job_logs: BTreeMap<u64, Vec<String>>,
     selection: Option<Selection>,
     auth: AuthState,
+    max_active_roles_header_chars: u32,
+    user_profile: Option<UserProfileDto>,
+    active_dialog: Option<DialogModel>,
+    subsystem_health: SubsystemHealthSummary,
+    cd_runs: Vec<CdRunDto>,
+    model_runner: ModelRunnerView,
+    platform: PlatformSnapshotDto,
+    non_timed_policies: BTreeSet<String>,
+    non_timed_policies_known: bool,
+    timed_added_policies: BTreeMap<String, BTreeSet<String>>,
+    force_snapshot_pending: bool,
+    session_refresh_pending: bool,
     active_log_query: bool,
     /// Offline snapshot shown until live data arrives.
     offline: Option<(u64, ViewModel)>,
@@ -163,6 +229,17 @@ fn upsert_sorted<T, K: Ord>(v: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {
         Ok(i) => v[i] = item,
         Err(i) => v.insert(i, item),
     }
+}
+
+fn is_elevated_step_up_policy(policy: &str) -> bool {
+    policy.ends_with(".write")
+        || policy.ends_with(".restart")
+        || policy.ends_with(".resume")
+        || policy == "ab:rollback"
+        || policy.starts_with("platform:users.")
+        || policy.starts_with("platform:invites.")
+        || policy.starts_with("platform:roles.")
+        || policy.starts_with("platform:folios.")
 }
 
 fn canonical_service_group(compact: &str) -> Option<&'static str> {
@@ -840,22 +917,709 @@ fn default_observe() -> ObserveView {
     }
 }
 
+fn scenario_operator_auth() -> AuthState {
+    let mut policies: Vec<String> = [
+        "system:status.read",
+        "system:dashboard.read",
+        "ci:queue.read",
+        "ci:repos.public.read",
+        "ci:repos.private.read",
+        "ci:jobs.read",
+        "ci:jobs.logs.read",
+        "ci:nodes.read",
+        "ci:sandboxes.read",
+        "ci:ha.read",
+        "ci:jobs.resume",
+        "ci:jobs.restart",
+        "ci:ha.write",
+        "cd:runs.read",
+        "cd:steps.read",
+        "ab:slots.read",
+        "ab:gate.logs.read",
+        "ab:rollback",
+        "reg:packages.read",
+        "reg:canaries.read",
+        "reg:taints.read",
+        "reg:cas.read",
+        "reg:bundles.write",
+        "reg:taints.write",
+        "obs:logs.read",
+        "obs:smartscape.read",
+        "obs:traces.read",
+        "obs:problems.read",
+        "obs:metrics.read",
+        "obs:store.read",
+        "obs:ingress.read",
+        "obs:ingress.write",
+        "mr:models.read",
+        "mr:queue.read",
+        "mr:openai_api.read",
+        "mr:wireguard_vpn.read",
+        "platform:maintenance.read",
+        "platform:users.read",
+        "platform:invites.read",
+        "platform:roles.read",
+        "platform:folios.read",
+        "platform:activity.read",
+        "platform:maintenance.write",
+        "platform:users.write",
+        "platform:invites.write",
+        "platform:roles.write",
+        "platform:folios.write",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    policies.sort();
+    AuthState {
+        status: AuthStatus::Active,
+        github_login: Some("operator".into()),
+        passkey_count: 1,
+        passkey_enrollment_required: false,
+        reason_code: None,
+        anonymous_lockdown: false,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into()],
+        active_roles: vec![RoleBadgeView {
+            role_id: "operator".into(),
+            display_name: Some("Operator".into()),
+            activation: RoleActivationDto::pinned_baseline(),
+            lease: None,
+        }],
+        leases: Vec::new(),
+        active_folios: vec!["folio:operator:default".into()],
+        active_policies: policies,
+    }
+}
+
+fn scenario_subsystem_health() -> SubsystemHealthSummary {
+    let mut s = SubsystemHealthSummary::default();
+    for id in SubsystemId::OPERATIONAL {
+        if let Some(e) = s.get_mut(id) {
+            e.status = SubsystemStatus::Live;
+            e.probe_status = SubsystemStatus::Live;
+            e.summary = "Operational".into();
+        }
+    }
+    s
+}
+
+fn normalize_lease_deadlines(lease: &mut RoleLeaseView, now_ms: u64) {
+    if lease.hard_expires_at_ms == 0 && lease.seconds_remaining > 0 {
+        lease.hard_expires_at_ms =
+            now_ms.saturating_add(lease.seconds_remaining.saturating_mul(1_000));
+    }
+    if lease.idle_expires_at_ms == 0 && lease.idle_timer > 0 {
+        lease.idle_expires_at_ms = now_ms.saturating_add(lease.idle_timer.saturating_mul(1_000));
+    }
+    if lease.hard_ttl_secs == 0 && lease.seconds_remaining > 0 {
+        lease.hard_ttl_secs = lease.seconds_remaining;
+    }
+    if lease.idle_ttl_secs == 0 && lease.idle_timer > 0 {
+        lease.idle_ttl_secs = lease.idle_timer;
+    }
+}
+
 impl Store {
     #[must_use]
     pub fn new(source: DataSource) -> Self {
-        let auth = match &source {
-            DataSource::Scenario(_) => AuthState::Operator {
-                github_login: "operator".into(),
-                role: Some("operator".into()),
-            },
-            DataSource::Live | DataSource::OfflineCache => AuthState::Anonymous,
+        let is_scenario = matches!(source, DataSource::Scenario(_));
+        let auth = if is_scenario {
+            scenario_operator_auth()
+        } else {
+            AuthState::unresolved()
+        };
+        let subsystem_health = if is_scenario {
+            scenario_subsystem_health()
+        } else {
+            SubsystemHealthSummary::default()
         };
         Self {
             source,
             auth,
+            max_active_roles_header_chars: DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
+            subsystem_health,
             dirty: true,
             ..Self::default()
         }
+    }
+
+    fn effective_header_chars(&self) -> u32 {
+        if self.max_active_roles_header_chars == 0 {
+            DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS
+        } else {
+            self.max_active_roles_header_chars
+        }
+    }
+
+    /// Return `true` when session authorization permits displaying operational slices.
+    #[must_use]
+    pub fn can_emit_operational_data(&self) -> bool {
+        self.auth.is_resolved()
+            && !self.auth.passkey_enrollment_required
+            && self.auth.status != AuthStatus::AuthorizationDenied
+            && !(self.auth.status == AuthStatus::Anonymous && self.auth.anonymous_lockdown)
+    }
+
+    /// Return `true` when reading/persisting an offline snapshot is authorized (`Active` with Passkey).
+    #[must_use]
+    pub fn can_cache_offline(&self) -> bool {
+        self.auth.status == AuthStatus::Active
+            && self.auth.passkey_count > 0
+            && !self.auth.passkey_enrollment_required
+            && !self.auth.anonymous_lockdown
+    }
+
+    /// Return `true` when a restricted slice scrub requires forcing a full `Snapshot`.
+    pub fn take_force_snapshot(&mut self) -> bool {
+        std::mem::take(&mut self.force_snapshot_pending)
+    }
+
+    /// Return `true` when an expired timed role requires confirming `/api/auth/session`.
+    pub fn take_session_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.session_refresh_pending)
+    }
+
+    /// Return `true` if any policy in `policies` is active in the current session.
+    #[must_use]
+    pub fn has_any_policy(&self, policies: &[&str]) -> bool {
+        policies.iter().any(|p| self.auth.has_policy(p))
+    }
+
+    /// Refresh `idle_expires_at_ms` across all active `Timed` leases on explicit user activity.
+    pub fn refresh_idle_timers(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        for lease in &mut self.auth.leases {
+            normalize_lease_deadlines(lease, now_ms);
+            let prev_idle = lease.idle_timer;
+            lease.last_activity_at_ms = now_ms;
+            if lease.idle_ttl_secs > 0 {
+                let target = now_ms
+                    .saturating_add(lease.idle_ttl_secs.saturating_mul(1_000))
+                    .min(lease.hard_expires_at_ms);
+                if target > lease.idle_expires_at_ms {
+                    lease.idle_expires_at_ms = target;
+                }
+            }
+            let _ = lease.tick_at(now_ms);
+            if lease.idle_timer != prev_idle {
+                changed = true;
+            }
+        }
+        self.sync_active_role_leases();
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    fn sync_active_role_leases(&mut self) {
+        for badge in &mut self.auth.active_roles {
+            badge.lease = self
+                .auth
+                .leases
+                .iter()
+                .find(|l| l.role_id == badge.role_id)
+                .cloned();
+        }
+    }
+
+    fn record_auth_policy_diffs(&mut self, prev: &AuthState, next: &AuthState) {
+        if !next.is_operator() || (prev.is_resolved() && prev.github_login != next.github_login) {
+            self.non_timed_policies.clear();
+            self.non_timed_policies_known = false;
+            self.timed_added_policies.clear();
+            return;
+        }
+        let prev_timed: BTreeSet<String> = prev.leases.iter().map(|l| l.role_id.clone()).collect();
+        let next_timed: BTreeSet<String> = next.leases.iter().map(|l| l.role_id.clone()).collect();
+        let next_policies: BTreeSet<String> = next.active_policies.iter().cloned().collect();
+        let prev_policies: BTreeSet<String> = prev.active_policies.iter().cloned().collect();
+
+        if next_timed.is_empty() {
+            self.non_timed_policies = next_policies;
+            self.non_timed_policies_known = true;
+            self.timed_added_policies.clear();
+            return;
+        }
+        let added_roles: Vec<String> = next_timed.difference(&prev_timed).cloned().collect();
+        if prev.is_operator() && prev.github_login == next.github_login {
+            if prev_timed.is_empty() {
+                self.non_timed_policies = prev_policies
+                    .intersection(&next_policies)
+                    .cloned()
+                    .collect();
+                self.non_timed_policies_known = true;
+            } else if self.non_timed_policies_known {
+                // Preserve non-timed subset once known; intersect with surviving policies and
+                // fold in newly toggled Elective permissions when no Timed role changed.
+                self.non_timed_policies
+                    .retain(|p| next_policies.contains(p));
+                if added_roles.is_empty() && next_timed == prev_timed {
+                    self.non_timed_policies
+                        .extend(next_policies.difference(&prev_policies).cloned());
+                }
+            }
+            if added_roles.len() == 1 {
+                let exclusive: BTreeSet<String> =
+                    next_policies.difference(&prev_policies).cloned().collect();
+                self.timed_added_policies
+                    .insert(added_roles[0].clone(), exclusive);
+            }
+        }
+        self.timed_added_policies
+            .retain(|k, _| next_timed.contains(k));
+    }
+
+    fn resolve_folio_policies(&self, role_ids: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+        if self.platform.folios.is_empty() || self.platform.role_folio_index.role_folios.is_empty()
+        {
+            return None;
+        }
+        let all_known = role_ids
+            .iter()
+            .all(|r| self.platform.role_folio_index.role_folios.contains_key(r));
+        if !all_known {
+            return None;
+        }
+        let folio_map: BTreeMap<&str, &PolicyFolioDto> = self
+            .platform
+            .folios
+            .iter()
+            .map(|f| (f.id.as_str(), f))
+            .collect();
+        let mut seen_folios = BTreeSet::new();
+        let mut stack: Vec<String> = Vec::new();
+        for role in role_ids {
+            if let Some(roots) = self.platform.role_folio_index.role_folios.get(role) {
+                for f in roots {
+                    if seen_folios.insert(f.clone()) {
+                        stack.push(f.clone());
+                    }
+                }
+            }
+        }
+        let mut policies = BTreeSet::new();
+        while let Some(fid) = stack.pop() {
+            if let Some(folio) = folio_map.get(fid.as_str()) {
+                for p in &folio.policies {
+                    policies.insert(p.clone());
+                }
+                for inc in &folio.includes {
+                    if seen_folios.insert(inc.clone()) {
+                        stack.push(inc.clone());
+                    }
+                }
+            }
+        }
+        Some((
+            seen_folios.into_iter().collect(),
+            policies.into_iter().collect(),
+        ))
+    }
+
+    fn apply_auth_session(&mut self, dto: AuthSessionDto, now_ms: u64) -> bool {
+        let prev = self.auth.clone();
+        let mut next = AuthState::from_session(&dto);
+        for lease in &mut next.leases {
+            normalize_lease_deadlines(lease, now_ms);
+            let _ = lease.tick_at(now_ms);
+        }
+        for badge in &mut next.active_roles {
+            if let Some(lease) = &mut badge.lease {
+                normalize_lease_deadlines(lease, now_ms);
+                let _ = lease.tick_at(now_ms);
+            }
+        }
+        self.record_auth_policy_diffs(&prev, &next);
+
+        if next.passkey_enrollment_required {
+            self.active_dialog = Some(DialogModel::PasskeyEnrollmentGate(
+                PasskeyEnrollmentGateModel {
+                    github_login: next
+                        .github_login
+                        .clone()
+                        .unwrap_or_else(|| "operator".into()),
+                    passkey_count: next.passkey_count,
+                    reason_code: next.reason_code,
+                },
+            ));
+        } else if matches!(
+            self.active_dialog,
+            Some(DialogModel::PasskeyEnrollmentGate(_))
+        ) {
+            self.active_dialog = None;
+        }
+
+        if next.is_authenticated() {
+            let login = next
+                .github_login
+                .clone()
+                .unwrap_or_else(|| "operator".into());
+            let entry = self.user_profile.get_or_insert_with(|| UserProfileDto {
+                github_login: login.clone(),
+                bound_roles: next.bound_roles.clone(),
+                passkey_count: next.passkey_count,
+                ..UserProfileDto::default()
+            });
+            entry.github_login = login;
+            entry.bound_roles.clone_from(&next.bound_roles);
+            entry.passkey_count = next.passkey_count;
+            if let Some(name) = dto.display_name {
+                entry.display_name = Some(name);
+            }
+            if let Some(prefs) = dto.preferences {
+                entry.preferences = prefs;
+            }
+        } else {
+            self.user_profile = None;
+            if matches!(
+                self.active_dialog,
+                Some(
+                    DialogModel::PasskeyEnrollmentGate(_)
+                        | DialogModel::UserProfile(_)
+                        | DialogModel::SessionRoles(_)
+                        | DialogModel::InviteCreatedOnce(_)
+                )
+            ) {
+                self.active_dialog = None;
+            }
+        }
+
+        let prev_set: BTreeSet<&str> = prev.active_policies.iter().map(String::as_str).collect();
+        let next_set: BTreeSet<&str> = next.active_policies.iter().map(String::as_str).collect();
+        let lost_privileges = !prev_set.is_subset(&next_set)
+            || (prev.is_resolved() && next.passkey_enrollment_required)
+            || next.anonymous_lockdown
+            || next.status == AuthStatus::AuthorizationDenied;
+
+        let changed = self.auth != next;
+        self.auth = next;
+        let scrubbed = self.scrub_for_current_auth();
+        if lost_privileges || scrubbed {
+            self.force_snapshot_pending = true;
+        }
+        changed || scrubbed
+    }
+
+    fn deactivate_expired_roles(&mut self, expired_roles: &[String]) -> bool {
+        let prev_policies: BTreeSet<String> = self.auth.active_policies.iter().cloned().collect();
+        let expired_set: BTreeSet<&str> = expired_roles.iter().map(String::as_str).collect();
+        self.auth
+            .leases
+            .retain(|l| !expired_set.contains(l.role_id.as_str()));
+        self.auth
+            .active_roles
+            .retain(|r| !expired_set.contains(r.role_id.as_str()));
+
+        let surviving_roles: Vec<String> = self
+            .auth
+            .active_roles
+            .iter()
+            .map(|r| r.role_id.clone())
+            .collect();
+        let surviving_timed: Vec<String> =
+            self.auth.leases.iter().map(|l| l.role_id.clone()).collect();
+        if let Some((folios, policies)) = self.resolve_folio_policies(&surviving_roles) {
+            self.auth.active_folios = folios;
+            self.auth.active_policies = policies;
+        } else if self.non_timed_policies_known
+            && surviving_timed
+                .iter()
+                .all(|r| self.timed_added_policies.contains_key(r))
+        {
+            let mut surviving: BTreeSet<String> = self.non_timed_policies.clone();
+            for r in &surviving_timed {
+                if let Some(extra) = self.timed_added_policies.get(r) {
+                    surviving.extend(extra.iter().cloned());
+                }
+            }
+            self.auth.active_policies = surviving.into_iter().collect();
+        } else {
+            // Cold-boot elevated or simultaneous multi-timed sessions lack folio tables when
+            // `platform:folios.read` is absent: remove tracked expired additions and strip
+            // elevated step-up/write/admin capabilities while preserving baseline & elective reads
+            // until `/api/auth/session` (`session_refresh_pending`) returns exact policies.
+            let mut retained_known = if self.non_timed_policies_known {
+                self.non_timed_policies.clone()
+            } else {
+                BTreeSet::new()
+            };
+            for r in &surviving_timed {
+                if let Some(extra) = self.timed_added_policies.get(r) {
+                    retained_known.extend(extra.iter().cloned());
+                }
+            }
+            let mut surviving = prev_policies;
+            let mut has_untracked_expired = false;
+            for role in expired_roles {
+                if let Some(expired_only) = self.timed_added_policies.get(role) {
+                    surviving.retain(|p| retained_known.contains(p) || !expired_only.contains(p));
+                } else {
+                    has_untracked_expired = true;
+                }
+            }
+            if has_untracked_expired {
+                surviving.retain(|p| retained_known.contains(p) || !is_elevated_step_up_policy(p));
+            }
+            self.auth.active_policies = surviving.into_iter().collect();
+        }
+        for role in expired_roles {
+            self.timed_added_policies.remove(role);
+        }
+        self.scrub_for_current_auth();
+        self.force_snapshot_pending = true;
+        self.session_refresh_pending = true;
+        true
+    }
+
+    fn tick_role_leases(&mut self, now_ms: u64) -> bool {
+        if self.auth.leases.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut expired_roles = Vec::new();
+        for lease in &mut self.auth.leases {
+            normalize_lease_deadlines(lease, now_ms);
+            let prev = (lease.seconds_remaining, lease.idle_timer);
+            let alive = lease.tick_at(now_ms);
+            if (lease.seconds_remaining, lease.idle_timer) != prev {
+                changed = true;
+            }
+            if !alive {
+                expired_roles.push(lease.role_id.clone());
+            }
+        }
+        self.sync_active_role_leases();
+        if !expired_roles.is_empty() {
+            self.deactivate_expired_roles(&expired_roles);
+            changed = true;
+        }
+        changed
+    }
+
+    fn scrub_for_current_auth(&mut self) -> bool {
+        if !self.can_emit_operational_data() {
+            let had_data = !self.repos.is_empty()
+                || !self.topologies.is_empty()
+                || !self.gates.is_empty()
+                || !self.history.is_empty()
+                || !self.nodes.is_empty()
+                || !self.leases.is_empty()
+                || !self.sandboxes.is_empty()
+                || self.registry != RegistryView::default()
+                || self.observe != ObserveView::default()
+                || !self.ci_jobs.is_empty()
+                || self.subsystem_health != SubsystemHealthSummary::default()
+                || !self.cd_runs.is_empty()
+                || self.model_runner != ModelRunnerView::default()
+                || self.platform != PlatformSnapshotDto::default()
+                || self.offline.is_some();
+            self.repos.clear();
+            self.topologies.clear();
+            self.gates.clear();
+            self.history.clear();
+            self.latest.clear();
+            self.nodes.clear();
+            self.leases.clear();
+            self.sandboxes.clear();
+            self.registry = RegistryView::default();
+            self.observe = ObserveView::default();
+            self.live_obs_logs.clear();
+            self.live_obs_metrics.clear();
+            self.live_obs_problems.clear();
+            self.live_smartscape_nodes.clear();
+            self.live_smartscape_edges.clear();
+            self.ci_jobs.clear();
+            self.job_id_strings.clear();
+            self.job_logs.clear();
+            self.subsystem_health = SubsystemHealthSummary::default();
+            self.cd_runs.clear();
+            self.model_runner = ModelRunnerView::default();
+            self.platform = PlatformSnapshotDto::default();
+            self.offline = None;
+            return had_data;
+        }
+
+        let mut scrubbed = false;
+        let can_ci = self.auth.can_access_area(Area::Ci);
+        let can_public_repos = self.auth.has_policy("ci:repos.public.read");
+        let can_private_repos = self.auth.has_policy("ci:repos.private.read");
+        let can_nodes = self.auth.has_policy("ci:nodes.read");
+        let can_sandboxes = self.auth.has_policy("ci:sandboxes.read");
+        let can_job_logs =
+            self.auth.has_policy("ci:jobs.logs.read") || self.auth.has_policy("obs:logs.read");
+        let can_jobs =
+            self.auth.has_policy("ci:jobs.read") || self.auth.has_policy("ci:queue.read");
+        let can_cd_runs = self.auth.has_policy("cd:runs.read");
+        let can_ab = self.auth.can_access_area(Area::AbDeploy);
+        let can_ab_gate_logs = self.auth.has_policy("ab:gate.logs.read");
+        let can_repo_area = self.auth.can_access_area(Area::Repository);
+        let can_reg_pkg = self.auth.has_policy("reg:packages.read");
+        let can_reg_canaries = self.auth.has_policy("reg:canaries.read");
+        let can_reg_cas = self.auth.has_policy("reg:cas.read");
+        let can_obs_area = self.auth.can_access_area(Area::Observability);
+        let can_obs_logs = self.auth.has_policy("obs:logs.read");
+        let can_obs_traces = self.auth.has_policy("obs:traces.read");
+        let can_obs_metrics = self.auth.has_policy("obs:metrics.read");
+        let can_obs_problems = self.auth.has_policy("obs:problems.read");
+        let can_obs_smartscape = self.auth.has_policy("obs:smartscape.read");
+        let can_obs_store = self.auth.has_policy("obs:store.read");
+        let can_obs_ingress = self.auth.has_policy("obs:ingress.read");
+        let can_mr_area = self.auth.can_access_area(Area::ModelRunner);
+        let can_mr_status =
+            self.auth.has_policy("mr:models.read") || self.auth.has_policy("mr:queue.read");
+        let can_mr_conn = self.auth.has_policy("mr:openai_api.read")
+            || self.auth.has_policy("mr:wireguard_vpn.read");
+        let can_subsystems = self.has_any_policy(&[
+            "system:status.read",
+            "system:dashboard.read",
+            "platform:maintenance.read",
+        ]);
+        let can_plat_users = self.auth.has_policy("platform:users.read");
+        let can_plat_invites = self.auth.has_policy("platform:invites.read");
+        let can_plat_roles = self.auth.has_policy("platform:roles.read");
+        let can_plat_folios = self.auth.has_policy("platform:folios.read");
+        let can_plat_activity = self.auth.has_policy("platform:activity.read");
+        let can_plat_subsystems =
+            self.has_any_policy(&["platform:maintenance.read", "system:status.read"]);
+
+        if !can_ci {
+            scrubbed |= clear_map_if(&mut self.repos);
+            scrubbed |= clear_map_if(&mut self.topologies);
+            scrubbed |= clear_vec_if(&mut self.ci_jobs);
+            scrubbed |= clear_map_if(&mut self.job_id_strings);
+            scrubbed |= clear_map_if(&mut self.nodes);
+            scrubbed |= clear_vec_if(&mut self.sandboxes);
+            scrubbed |= clear_map_if(&mut self.job_logs);
+        } else {
+            let before_repos = self.repos.len();
+            self.repos.retain(|_, r| match r.visibility {
+                Visibility::Public => can_public_repos,
+                Visibility::Private => can_private_repos,
+            });
+            scrubbed |= self.repos.len() != before_repos;
+            if !can_nodes {
+                scrubbed |= clear_map_if(&mut self.nodes);
+            }
+            if !can_sandboxes {
+                scrubbed |= clear_vec_if(&mut self.sandboxes);
+            }
+            if !can_jobs {
+                scrubbed |= clear_vec_if(&mut self.ci_jobs);
+                scrubbed |= clear_map_if(&mut self.job_id_strings);
+                scrubbed |= clear_map_if(&mut self.job_logs);
+            } else if !can_job_logs {
+                scrubbed |= clear_map_if(&mut self.job_logs);
+                for j in &mut self.ci_jobs {
+                    scrubbed |= clear_vec_if(&mut j.raw_log_lines);
+                }
+            }
+        }
+        if !can_cd_runs {
+            scrubbed |= clear_vec_if(&mut self.cd_runs);
+        }
+        if !can_ab {
+            scrubbed |= clear_map_if(&mut self.gates);
+            scrubbed |= clear_map_if(&mut self.history);
+            scrubbed |= clear_map_if(&mut self.latest);
+            scrubbed |= clear_vec_if(&mut self.leases);
+            for r in self.repos.values_mut() {
+                scrubbed |= clear_opt_if(&mut r.cd);
+            }
+        } else if !can_ab_gate_logs {
+            for g in self.gates.values_mut() {
+                scrubbed |= clear_vec_if(&mut g.tests);
+            }
+        }
+        if !can_repo_area {
+            scrubbed |= reset_default_if(&mut self.registry);
+        } else {
+            if !can_reg_pkg {
+                scrubbed |= clear_vec_if(&mut self.registry.packages);
+            }
+            if !can_reg_canaries {
+                scrubbed |= clear_vec_if(&mut self.registry.canaries);
+            }
+            if !can_reg_cas {
+                scrubbed |= reset_default_if(&mut self.registry.cas);
+            }
+        }
+        if !can_obs_area {
+            scrubbed |= reset_default_if(&mut self.observe);
+            scrubbed |= clear_vec_if(&mut self.live_obs_logs);
+            scrubbed |= clear_vec_if(&mut self.live_obs_metrics);
+            scrubbed |= clear_vec_if(&mut self.live_obs_problems);
+            scrubbed |= clear_vec_if(&mut self.live_smartscape_nodes);
+            scrubbed |= clear_vec_if(&mut self.live_smartscape_edges);
+        } else {
+            if !can_obs_logs {
+                scrubbed |= clear_vec_if(&mut self.observe.logs);
+                scrubbed |= clear_vec_if(&mut self.live_obs_logs);
+            }
+            if !can_obs_traces {
+                scrubbed |= clear_vec_if(&mut self.observe.traces);
+            }
+            if !can_obs_metrics {
+                scrubbed |= clear_vec_if(&mut self.observe.metrics);
+                scrubbed |= clear_vec_if(&mut self.live_obs_metrics);
+            }
+            if !can_obs_problems {
+                scrubbed |= clear_vec_if(&mut self.observe.problems);
+                scrubbed |= clear_vec_if(&mut self.live_obs_problems);
+            }
+            if !can_obs_smartscape {
+                scrubbed |= clear_vec_if(&mut self.observe.smartscape_nodes);
+                scrubbed |= clear_vec_if(&mut self.observe.smartscape_edges);
+                scrubbed |= clear_vec_if(&mut self.live_smartscape_nodes);
+                scrubbed |= clear_vec_if(&mut self.live_smartscape_edges);
+            }
+            if !can_obs_store {
+                scrubbed |= reset_default_if(&mut self.observe.store);
+            }
+            if !can_obs_ingress {
+                scrubbed |= clear_opt_if(&mut self.observe.tls_health);
+                scrubbed |= clear_vec_if(&mut self.observe.ingress_routes);
+                scrubbed |= clear_vec_if(&mut self.observe.ingress_upstreams);
+            }
+        }
+        if !can_mr_area {
+            scrubbed |= reset_default_if(&mut self.model_runner);
+        } else {
+            if !can_mr_status {
+                scrubbed |= clear_opt_if(&mut self.model_runner.status);
+            }
+            if !can_mr_conn {
+                scrubbed |= clear_opt_if(&mut self.model_runner.connection);
+            }
+        }
+        if !can_subsystems {
+            scrubbed |= reset_default_if(&mut self.subsystem_health);
+        }
+        if !can_plat_users {
+            scrubbed |= clear_vec_if(&mut self.platform.users);
+        }
+        if !can_plat_invites {
+            scrubbed |= clear_vec_if(&mut self.platform.invites);
+        }
+        if !can_plat_roles {
+            scrubbed |= clear_vec_if(&mut self.platform.roles);
+        }
+        if !can_plat_folios {
+            scrubbed |= clear_vec_if(&mut self.platform.folios);
+            scrubbed |= clear_vec_if(&mut self.platform.policies);
+            scrubbed |= reset_default_if(&mut self.platform.role_folio_index);
+        }
+        if !can_plat_activity {
+            scrubbed |= clear_vec_if(&mut self.platform.recent_activity);
+        }
+        if !can_plat_subsystems {
+            scrubbed |= clear_vec_if(&mut self.platform.subsystems);
+        }
+        if let Some((_, offline_view)) = self.offline.as_mut() {
+            scrubbed |= sanitize_view_for_auth(offline_view, &self.auth);
+        }
+        scrubbed
     }
 
     /// Whether the projected view may have changed since [`Self::take_dirty`].
@@ -1842,11 +2606,286 @@ impl Store {
                 self.selection = Some(sel);
                 changed
             }
-            Input::AuthSession(dto) => {
-                let next = AuthState::from_session(&dto);
-                let changed = self.auth != next;
-                self.auth = next;
+            Input::AuthSession(dto) => self.apply_auth_session(dto, now_ms),
+            Input::ObsSubsystemStatus(entries) => {
+                self.subsystem_health = SubsystemHealthSummary::from_entries(&entries);
+                self.platform.subsystems = entries;
+                true
+            }
+            Input::SubsystemStatusChanged(entry) => {
+                self.subsystem_health.apply_entry(&entry);
+                if let Some(slot) = self
+                    .platform
+                    .subsystems
+                    .iter_mut()
+                    .find(|s| s.subsystem == entry.subsystem)
+                {
+                    *slot = entry;
+                } else {
+                    self.platform.subsystems.push(entry);
+                }
+                true
+            }
+            Input::CdRuns(runs) => {
+                self.loaded = true;
+                self.cd_runs = runs;
+                true
+            }
+            Input::AbRollbackResult(res) => {
+                let mut any = false;
+                if let Some(g) = self.gates.get_mut(&res.deployment_id) {
+                    g.outcome = GateOutcome::RolledBack;
+                    g.rollback_reason = Some(RollbackReason::Manual);
+                    g.tainted = res.tainted_digest.is_some();
+                    any = true;
+                }
+                self.refresh_cd(&res.deployment_id);
+                if any {
+                    self.refresh_live_problems();
+                }
+                true
+            }
+            Input::MrStatus(status) => {
+                self.model_runner.status = Some(status);
+                true
+            }
+            Input::MrConnection(conn) => {
+                self.model_runner.connection = Some(conn);
+                true
+            }
+            Input::UserProfile(profile) => {
+                self.auth.passkey_count = profile.passkey_count;
+                self.user_profile = Some(profile);
+                if let Some(DialogModel::UserProfile(ref mut dlg)) = self.active_dialog {
+                    if let Some(ref p) = self.user_profile {
+                        dlg.profile = p.clone();
+                    }
+                }
+                true
+            }
+            Input::Passkeys(passkeys) => {
+                let count = u32::try_from(passkeys.len()).unwrap_or(u32::MAX);
+                self.auth.passkey_count = count;
+                if let Some(ref mut profile) = self.user_profile {
+                    profile.passkeys = passkeys;
+                    profile.passkey_count = count;
+                }
+                true
+            }
+            Input::PasskeyEnrolled(maybe_summary) => {
+                if let Some(summary) = maybe_summary {
+                    let entry = self.user_profile.get_or_insert_with(|| UserProfileDto {
+                        github_login: self
+                            .auth
+                            .github_login
+                            .clone()
+                            .unwrap_or_else(|| "operator".into()),
+                        bound_roles: self.auth.bound_roles.clone(),
+                        ..UserProfileDto::default()
+                    });
+                    if !entry
+                        .passkeys
+                        .iter()
+                        .any(|p| p.credential_id == summary.credential_id)
+                    {
+                        entry.passkeys.push(summary);
+                    }
+                    let count = u32::try_from(entry.passkeys.len())
+                        .unwrap_or(u32::MAX)
+                        .max(1);
+                    entry.passkey_count = count;
+                    self.auth.passkey_count = count;
+                } else {
+                    self.auth.passkey_count = self.auth.passkey_count.max(1);
+                }
+                true
+            }
+            Input::PasskeyDeleted(credential_id) => {
+                if let Some(ref mut profile) = self.user_profile {
+                    profile
+                        .passkeys
+                        .retain(|p| p.credential_id != credential_id);
+                    profile.passkey_count =
+                        u32::try_from(profile.passkeys.len()).unwrap_or(u32::MAX);
+                    self.auth.passkey_count = profile.passkey_count;
+                } else if self.auth.passkey_count > 0 {
+                    self.auth.passkey_count -= 1;
+                }
+                if self.auth.passkey_count == 0 && self.auth.is_authenticated() {
+                    self.auth.status = AuthStatus::PasskeyEnrollmentRequired;
+                    self.auth.passkey_enrollment_required = true;
+                    self.auth.active_roles.clear();
+                    self.auth.leases.clear();
+                    self.auth.active_folios.clear();
+                    self.auth.active_policies.clear();
+                    self.active_dialog = Some(DialogModel::PasskeyEnrollmentGate(
+                        PasskeyEnrollmentGateModel {
+                            github_login: self
+                                .auth
+                                .github_login
+                                .clone()
+                                .unwrap_or_else(|| "operator".into()),
+                            passkey_count: 0,
+                            reason_code: self.auth.reason_code,
+                        },
+                    ));
+                    self.scrub_for_current_auth();
+                    self.force_snapshot_pending = true;
+                }
+                true
+            }
+            Input::UserActivityRecorded => self.refresh_idle_timers(now_ms),
+            Input::PlatformRoles(roles) => {
+                self.platform.roles = roles;
+                true
+            }
+            Input::RoleSpecUpserted(spec) => {
+                upsert_sorted(&mut self.platform.roles, spec, |r| r.id.clone());
+                true
+            }
+            Input::RoleSpecDeleted(role_id) => {
+                let before = self.platform.roles.len();
+                self.platform.roles.retain(|r| r.id != role_id);
+                self.platform.roles.len() != before
+            }
+            Input::PlatformFolios(folios) => {
+                self.platform.folios = folios;
+                true
+            }
+            Input::PolicyFolioUpserted(folio) => {
+                upsert_sorted(&mut self.platform.folios, folio, |f| f.id.clone());
+                true
+            }
+            Input::PolicyFolioDeleted(folio_id) => {
+                let before = self.platform.folios.len();
+                self.platform.folios.retain(|f| f.id != folio_id);
+                self.platform.folios.len() != before
+            }
+            Input::PlatformRoleFolioIndex(idx) | Input::RoleFolioIndexUpdated(idx) => {
+                let changed = self.platform.role_folio_index != idx;
+                self.platform.role_folio_index = idx;
                 changed
+            }
+            Input::PlatformUsers(users) => {
+                self.platform.users = users;
+                true
+            }
+            Input::PlatformUsersUpsert(user) => {
+                upsert_sorted(&mut self.platform.users, user, |u| u.github_login.clone());
+                true
+            }
+            Input::UserRolesUpdated {
+                github_login,
+                bound_roles,
+            } => {
+                if let Some(u) = self
+                    .platform
+                    .users
+                    .iter_mut()
+                    .find(|u| u.github_login == github_login)
+                {
+                    u.bound_roles = bound_roles;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::UserPasskeysReset(github_login) => {
+                if let Some(u) = self
+                    .platform
+                    .users
+                    .iter_mut()
+                    .find(|u| u.github_login == github_login)
+                {
+                    u.passkey_count = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::UserRevoked(github_login) => {
+                let before = self.platform.users.len();
+                self.platform
+                    .users
+                    .retain(|u| u.github_login != github_login);
+                self.platform.users.len() != before
+            }
+            Input::PlatformInvites(invites) => {
+                self.platform.invites = invites;
+                true
+            }
+            Input::InviteCreated(created) => {
+                self.platform.invites.insert(
+                    0,
+                    InviteRecordDto {
+                        invite_id: created.invite_id.clone(),
+                        granted_role: created.granted_role.clone(),
+                        expires_at_ms: created.expires_at_ms,
+                        note: created.note.clone(),
+                        created_by: self.auth.github_login.clone(),
+                        created_at_ms: now_ms,
+                        redeemed_by: None,
+                        redeemed_at_ms: None,
+                        revoked: false,
+                    },
+                );
+                self.active_dialog = Some(DialogModel::InviteCreatedOnce(
+                    InviteCreatedOnceDialogModel {
+                        invite_id: created.invite_id,
+                        invite_url: created.url,
+                        granted_role: created.granted_role,
+                        expires_at_ms: created.expires_at_ms,
+                        note: created.note,
+                    },
+                ));
+                true
+            }
+            Input::InviteRevoked(invite_id) => {
+                if let Some(inv) = self
+                    .platform
+                    .invites
+                    .iter_mut()
+                    .find(|i| i.invite_id == invite_id)
+                {
+                    inv.revoked = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::OpenDialog(dlg) => {
+                if self.auth.passkey_enrollment_required
+                    && !matches!(dlg, DialogModel::PasskeyEnrollmentGate(_))
+                {
+                    return false;
+                }
+                let changed = self.active_dialog.as_ref() != Some(&dlg);
+                self.active_dialog = Some(dlg);
+                changed
+            }
+            Input::CloseDialog => {
+                if let Some(ref dlg) = self.active_dialog {
+                    if !dlg.is_dismissible() || self.auth.passkey_enrollment_required {
+                        return false;
+                    }
+                    self.active_dialog = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::LocalUserPrefs { skin, font } => {
+                if let Some(ref mut p) = self.user_profile {
+                    if let Some(s) = skin {
+                        p.preferences.skin = s;
+                    }
+                    if let Some(f) = font {
+                        p.preferences.font = f;
+                    }
+                    true
+                } else {
+                    false
+                }
             }
             Input::JobRestarted(job_id) | Input::JobResumed(job_id) => {
                 let mut any = false;
@@ -1943,11 +2982,12 @@ impl Store {
             }
             Input::Restore {
                 saved_epoch_ms,
-                view,
+                mut view,
             } => {
-                if self.loaded {
+                if self.loaded || !self.can_emit_operational_data() {
                     false
                 } else {
+                    sanitize_view_for_auth(&mut view, &self.auth);
                     if self.selection.is_none() {
                         self.selection.clone_from(&view.selection);
                     }
@@ -1960,7 +3000,7 @@ impl Store {
         changed
     }
 
-    /// Advance time: remove sidings whose fade-out finished.
+    /// Advance time: remove sidings whose fade-out finished and tick timed role leases.
     pub fn tick(&mut self, now_ms: u64) -> bool {
         let mut changed = false;
         for topo in self.topologies.values_mut() {
@@ -1980,6 +3020,9 @@ impl Store {
             t.branches.retain(|b| !expired.contains(&b.ref_name));
             t.trains.retain(|tr| !expired.contains(&tr.ref_name));
             t.fabric_rev += 1;
+            changed = true;
+        }
+        if self.tick_role_leases(now_ms) {
             changed = true;
         }
         self.dirty |= changed;
@@ -2083,6 +3126,7 @@ impl Store {
                     state,
                     duration_secs: st.status.details.duration_secs,
                     exit_code: st.status.details.exit_code,
+                    skip_reason: st.effective_skip_reason().cloned(),
                 }
             })
             .collect();
@@ -2710,6 +3754,7 @@ impl Store {
                                 0
                             },
                             exit_code: i32::from(state == StageState::Failed),
+                            skip_reason: None,
                         }
                     })
                     .collect();
@@ -2953,6 +3998,7 @@ impl Store {
                     state: e.state,
                     duration_secs: 0,
                     exit_code: i32::from(e.state == StageState::Failed),
+                    skip_reason: None,
                 });
             }
             if j.stages.iter().any(|s| s.state == StageState::Failed) {
@@ -3188,9 +4234,25 @@ impl Store {
     /// Alert counts per area.
     #[must_use]
     pub fn badges(&self) -> AreaBadges {
+        if !self.can_emit_operational_data() {
+            return AreaBadges::default();
+        }
         if let Some((_, v)) = self.offline.as_ref() {
             return badges_of_view(v);
         }
+        let dashboard = u32::try_from(
+            self.subsystem_health
+                .entries()
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e.status,
+                        SubsystemStatus::Offline | SubsystemStatus::Degraded
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         let ci = u32::try_from(
             self.repos
                 .values()
@@ -3198,10 +4260,23 @@ impl Store {
                     r.status == RepoStatus::Failing
                         || self.topologies.get(&r.id).is_some_and(|t| t.t.stop())
                 })
-                .count(),
+                .count()
+                + self.nodes.values().filter(|n| !n.online).count(),
         )
         .unwrap_or(u32::MAX);
         let cd = u32::try_from(
+            self.cd_runs
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.state,
+                        CdRunState::Failed | CdRunState::Blocked | CdRunState::RolledBack
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let ab_deploy = u32::try_from(
             self.repos
                 .values()
                 .filter_map(|r| r.cd.as_ref())
@@ -3209,7 +4284,7 @@ impl Store {
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        let registry = u32::try_from(
+        let repository = u32::try_from(
             self.registry
                 .canaries
                 .iter()
@@ -3218,27 +4293,78 @@ impl Store {
                 + usize::from(self.registry.cas.corrupt_blobs > 0),
         )
         .unwrap_or(u32::MAX);
-        let observe = u32::try_from(self.observe.problems.iter().filter(|p| p.active).count())
-            .unwrap_or(u32::MAX);
-        let fleet =
-            u32::try_from(self.nodes.values().filter(|n| !n.online).count()).unwrap_or(u32::MAX);
+        let observability =
+            u32::try_from(self.observe.problems.iter().filter(|p| p.active).count())
+                .unwrap_or(u32::MAX);
+        let model_runner = u32::from(self.model_runner.connection.as_ref().is_some_and(|c| {
+            !c.interface_state.is_empty()
+                && !c.interface_state.eq_ignore_ascii_case("up")
+                && !c.interface_state.eq_ignore_ascii_case("live")
+        }));
+        let platform = u32::try_from(
+            self.subsystem_health
+                .entries()
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e.status,
+                        SubsystemStatus::InMaintenance | SubsystemStatus::PartialMaintenance
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         AreaBadges {
+            dashboard,
             ci,
             cd,
-            registry,
-            observe,
-            fleet,
+            ab_deploy,
+            repository,
+            observability,
+            model_runner,
+            platform,
         }
     }
 
     /// Project the store into the view model for the current selection.
     #[must_use]
     pub fn view(&self) -> ViewModel {
+        if !self.can_emit_operational_data() {
+            let user_profile = if self.auth.status == AuthStatus::PasskeyEnrollmentRequired {
+                self.user_profile.clone()
+            } else {
+                None
+            };
+            let active_dialog = if self.auth.status == AuthStatus::PasskeyEnrollmentRequired {
+                Some(DialogModel::PasskeyEnrollmentGate(
+                    PasskeyEnrollmentGateModel {
+                        github_login: self.auth.github_login.clone().unwrap_or_default(),
+                        passkey_count: self.auth.passkey_count,
+                        reason_code: self.auth.reason_code,
+                    },
+                ))
+            } else {
+                self.active_dialog.clone()
+            };
+            return ViewModel {
+                source: self.source.clone(),
+                auth: self.auth.clone(),
+                max_active_roles_header_chars: self.effective_header_chars(),
+                user_profile,
+                active_dialog,
+                ..ViewModel::default()
+            };
+        }
         if let Some((saved, v)) = self.offline.as_ref() {
             let mut v = v.clone();
             v.source = DataSource::OfflineCache;
             v.stale_since_epoch_ms = Some(*saved);
             v.selection.clone_from(&self.selection);
+            v.auth = self.auth.clone();
+            v.max_active_roles_header_chars = self.effective_header_chars();
+            v.user_profile.clone_from(&self.user_profile);
+            v.active_dialog.clone_from(&self.active_dialog);
+            sanitize_view_for_auth(&mut v, &self.auth);
             return v;
         }
         let selection = self.selection.clone();
@@ -3297,8 +4423,15 @@ impl Store {
             sandboxes: self.sandboxes.clone(),
             registry: self.registry.clone(),
             observe: self.observe.clone(),
-            ci_jobs: self.ci_jobs.clone(),
             auth: self.auth.clone(),
+            max_active_roles_header_chars: self.effective_header_chars(),
+            user_profile: self.user_profile.clone(),
+            active_dialog: self.active_dialog.clone(),
+            ci_jobs: self.ci_jobs.clone(),
+            subsystem_health: self.subsystem_health.clone(),
+            cd_runs: self.cd_runs.clone(),
+            model_runner: self.model_runner.clone(),
+            platform: self.platform.clone(),
         }
     }
 }
@@ -3404,34 +4537,237 @@ fn train_status(t: &Train) -> RepoStatus {
     }
 }
 
+fn clear_vec_if<T>(v: &mut Vec<T>) -> bool {
+    if v.is_empty() {
+        false
+    } else {
+        v.clear();
+        true
+    }
+}
+
+fn clear_map_if<K, V>(m: &mut BTreeMap<K, V>) -> bool {
+    if m.is_empty() {
+        false
+    } else {
+        m.clear();
+        true
+    }
+}
+
+fn clear_opt_if<T>(o: &mut Option<T>) -> bool {
+    if o.is_some() {
+        *o = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn reset_default_if<T: Default + PartialEq>(v: &mut T) -> bool {
+    if *v == T::default() {
+        false
+    } else {
+        *v = T::default();
+        true
+    }
+}
+
+fn sanitize_view_for_auth(v: &mut ViewModel, auth: &AuthState) -> bool {
+    let mut scrubbed = false;
+    let can_ci = auth.can_access_area(Area::Ci);
+    let can_public_repos = auth.has_policy("ci:repos.public.read");
+    let can_private_repos = auth.has_policy("ci:repos.private.read");
+    if !can_ci {
+        scrubbed |= clear_vec_if(&mut v.repos);
+        scrubbed |= clear_opt_if(&mut v.topology);
+        scrubbed |= clear_vec_if(&mut v.ci_jobs);
+        scrubbed |= clear_vec_if(&mut v.nodes);
+        scrubbed |= clear_vec_if(&mut v.sandboxes);
+    } else {
+        let before = v.repos.len();
+        v.repos.retain(|r| match r.visibility {
+            Visibility::Public => can_public_repos,
+            Visibility::Private => can_private_repos,
+        });
+        scrubbed |= v.repos.len() != before;
+        if !auth.has_policy("ci:nodes.read") {
+            scrubbed |= clear_vec_if(&mut v.nodes);
+        }
+        if !auth.has_policy("ci:sandboxes.read") {
+            scrubbed |= clear_vec_if(&mut v.sandboxes);
+        }
+        if !auth.has_policy("ci:jobs.read") && !auth.has_policy("ci:queue.read") {
+            scrubbed |= clear_vec_if(&mut v.ci_jobs);
+        } else if !auth.has_policy("ci:jobs.logs.read") && !auth.has_policy("obs:logs.read") {
+            for j in &mut v.ci_jobs {
+                scrubbed |= clear_vec_if(&mut j.raw_log_lines);
+            }
+        }
+    }
+    if !auth.has_policy("cd:runs.read") {
+        scrubbed |= clear_vec_if(&mut v.cd_runs);
+    }
+    if !auth.can_access_area(Area::AbDeploy) {
+        scrubbed |= clear_opt_if(&mut v.gate);
+        scrubbed |= clear_vec_if(&mut v.history);
+        scrubbed |= clear_vec_if(&mut v.leases);
+        for r in &mut v.repos {
+            scrubbed |= clear_opt_if(&mut r.cd);
+        }
+    } else if !auth.has_policy("ab:gate.logs.read") {
+        if let Some(g) = v.gate.as_mut() {
+            scrubbed |= clear_vec_if(&mut g.tests);
+        }
+    }
+    if !auth.can_access_area(Area::Repository) {
+        scrubbed |= reset_default_if(&mut v.registry);
+    } else {
+        if !auth.has_policy("reg:packages.read") {
+            scrubbed |= clear_vec_if(&mut v.registry.packages);
+        }
+        if !auth.has_policy("reg:canaries.read") {
+            scrubbed |= clear_vec_if(&mut v.registry.canaries);
+        }
+        if !auth.has_policy("reg:cas.read") {
+            scrubbed |= reset_default_if(&mut v.registry.cas);
+        }
+    }
+    if !auth.can_access_area(Area::Observability) {
+        scrubbed |= reset_default_if(&mut v.observe);
+    } else {
+        if !auth.has_policy("obs:logs.read") {
+            scrubbed |= clear_vec_if(&mut v.observe.logs);
+        }
+        if !auth.has_policy("obs:traces.read") {
+            scrubbed |= clear_vec_if(&mut v.observe.traces);
+        }
+        if !auth.has_policy("obs:metrics.read") {
+            scrubbed |= clear_vec_if(&mut v.observe.metrics);
+        }
+        if !auth.has_policy("obs:problems.read") {
+            scrubbed |= clear_vec_if(&mut v.observe.problems);
+        }
+        if !auth.has_policy("obs:smartscape.read") {
+            scrubbed |= clear_vec_if(&mut v.observe.smartscape_nodes);
+            scrubbed |= clear_vec_if(&mut v.observe.smartscape_edges);
+        }
+        if !auth.has_policy("obs:store.read") {
+            scrubbed |= reset_default_if(&mut v.observe.store);
+        }
+        if !auth.has_policy("obs:ingress.read") {
+            scrubbed |= clear_opt_if(&mut v.observe.tls_health);
+            scrubbed |= clear_vec_if(&mut v.observe.ingress_routes);
+            scrubbed |= clear_vec_if(&mut v.observe.ingress_upstreams);
+        }
+    }
+    if !auth.can_access_area(Area::ModelRunner) {
+        scrubbed |= reset_default_if(&mut v.model_runner);
+    } else {
+        if !auth.has_policy("mr:models.read") && !auth.has_policy("mr:queue.read") {
+            scrubbed |= clear_opt_if(&mut v.model_runner.status);
+        }
+        if !auth.has_policy("mr:openai_api.read") && !auth.has_policy("mr:wireguard_vpn.read") {
+            scrubbed |= clear_opt_if(&mut v.model_runner.connection);
+        }
+    }
+    if !auth.has_policy("system:status.read")
+        && !auth.has_policy("system:dashboard.read")
+        && !auth.has_policy("platform:maintenance.read")
+    {
+        scrubbed |= reset_default_if(&mut v.subsystem_health);
+    }
+    if !auth.has_policy("platform:users.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.users);
+    }
+    if !auth.has_policy("platform:invites.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.invites);
+    }
+    if !auth.has_policy("platform:roles.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.roles);
+    }
+    if !auth.has_policy("platform:folios.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.folios);
+        scrubbed |= clear_vec_if(&mut v.platform.policies);
+        scrubbed |= reset_default_if(&mut v.platform.role_folio_index);
+    }
+    if !auth.has_policy("platform:activity.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.recent_activity);
+    }
+    if !auth.has_policy("platform:maintenance.read") && !auth.has_policy("system:status.read") {
+        scrubbed |= clear_vec_if(&mut v.platform.subsystems);
+    }
+    scrubbed
+}
+
 fn badges_of_view(v: &ViewModel) -> AreaBadges {
+    let dashboard = v
+        .subsystem_health
+        .entries()
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e.status,
+                SubsystemStatus::Offline | SubsystemStatus::Degraded
+            )
+        })
+        .count();
     let ci = v
         .repos
         .iter()
         .filter(|r| r.status == RepoStatus::Failing)
-        .count();
+        .count()
+        + v.nodes.iter().filter(|n| !n.online).count();
     let cd = v
+        .cd_runs
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                CdRunState::Failed | CdRunState::Blocked | CdRunState::RolledBack
+            )
+        })
+        .count();
+    let ab_deploy = v
         .repos
         .iter()
         .filter_map(|r| r.cd.as_ref())
         .filter(|c| matches!(c.outcome, GateOutcome::RolledBack | GateOutcome::Tainted))
         .count();
-    let registry = v
+    let repository = v
         .registry
         .canaries
         .iter()
         .filter(|c| c.state == CanaryBundleState::Tainted)
         .count()
         + usize::from(v.registry.cas.corrupt_blobs > 0);
-    let observe = v.observe.problems.iter().filter(|p| p.active).count();
-    let fleet = v.nodes.iter().filter(|n| !n.online).count();
+    let observability = v.observe.problems.iter().filter(|p| p.active).count();
+    let model_runner = usize::from(v.model_runner.connection.as_ref().is_some_and(|c| {
+        !c.interface_state.is_empty()
+            && !c.interface_state.eq_ignore_ascii_case("up")
+            && !c.interface_state.eq_ignore_ascii_case("live")
+    }));
+    let platform = v
+        .subsystem_health
+        .entries()
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e.status,
+                SubsystemStatus::InMaintenance | SubsystemStatus::PartialMaintenance
+            )
+        })
+        .count();
     let c = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     AreaBadges {
+        dashboard: c(dashboard),
         ci: c(ci),
         cd: c(cd),
-        registry: c(registry),
-        observe: c(observe),
-        fleet: c(fleet),
+        ab_deploy: c(ab_deploy),
+        repository: c(repository),
+        observability: c(observability),
+        model_runner: c(model_runner),
+        platform: c(platform),
     }
 }
 
@@ -3497,9 +4833,30 @@ mod tests {
         assert!(!service_matches_repo("muconsole", "mu-registry"));
     }
 
+    fn live_operator_store() -> Store {
+        let auth = scenario_operator_auth();
+        let mut s = Store::new(DataSource::Live);
+        s.apply(
+            Input::AuthSession(AuthSessionDto {
+                authenticated: true,
+                github_login: auth.github_login,
+                invite_bound: true,
+                passkey_count: auth.passkey_count,
+                baseline_role: auth.baseline_role,
+                bound_roles: auth.bound_roles,
+                active_folios: auth.active_folios,
+                active_policies: auth.active_policies,
+                ..AuthSessionDto::default()
+            }),
+            0,
+        );
+        s.take_dirty();
+        s
+    }
+
     #[test]
     fn live_metrics_merge_and_problems_synthesize_from_canaries_jobs_and_logs() {
-        let mut s = Store::new(DataSource::Live);
+        let mut s = live_operator_store();
         s.apply(
             Input::Repos(vec![RepoDto {
                 owner: "LMA1980".into(),
@@ -3659,7 +5016,7 @@ mod tests {
 
     #[test]
     fn obs_logs_normalization_and_multi_service_synthesis() {
-        let mut s = Store::new(DataSource::Live);
+        let mut s = live_operator_store();
         s.apply(
             Input::ClusterNodes(vec![ClusterNodeDto {
                 node_id: "worker-riscv64".into(),
@@ -3788,7 +5145,7 @@ mod tests {
 
     #[test]
     fn test_log_query_disentanglement_and_500_capacity() {
-        let mut s = Store::new(DataSource::Live);
+        let mut s = live_operator_store();
 
         // 1. Send 550 live logs via polling
         let poll_logs: Vec<OtelLogDto> = (0..550)
@@ -3881,7 +5238,7 @@ mod tests {
 
     #[test]
     fn test_zero_synthetic_live_fabrications() {
-        let mut s = Store::new(DataSource::Live);
+        let mut s = live_operator_store();
 
         // 1. In Live mode, canary bundles do NOT fabricate synthetic "node-b" DeploymentGate
         s.apply(
@@ -3951,7 +5308,7 @@ mod tests {
 
     #[test]
     fn test_issue_35_live_job_detail_topology_and_trace_detail_isolation() {
-        let mut s = Store::new(DataSource::Live);
+        let mut s = live_operator_store();
         let repo = RepoId::new("LMA1980", "superproject");
 
         // (a) Input::Topology in DataSource::Live yields threads == 0 and duration_secs == 0 on stages

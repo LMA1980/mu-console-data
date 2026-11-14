@@ -1,38 +1,42 @@
-______________________________________________________________________
-
-## name: mu-console-data description: "Implement, test, and consume the mu-console-data crate for dedicated Web Worker state management, event coalescing, and offline data storage in MuConsole."
+---
+name: mu-console-data
+description: "Implement, test, and consume the mu-console-data crate for dedicated Web Worker state management, fail-closed folio RBAC gating, event coalescing, and offline data storage in MuConsole."
+---
 
 # `mu-console-data` Architecture & Guidelines
 
-Use these guidelines when developing or integrating `mu-console-data`, the dedicated Web Worker data processing engine for MuConsole:
+Use these guidelines when developing or integrating `mu-console-data`, the dedicated Web Worker data processing engine (`#![forbid(unsafe_code)]`, Protocol v6) for MuConsole:
 
-## 1. Engine & Event Loop
+## 1. Fail-Closed Session & Folio State Machine (`engine`, `wasm`)
 
-- **Clock-Driven State Machine (`engine`)**:
-  - The worker runs an event-driven loop via `Engine::step` and `Engine::handle_command`.
-  - Side effects (`Effect`) are returned by pure engine methods and dispatched by the WASM glue (`wasm.rs`).
-  - Supports dynamic scenario playback (`?scenario=<name>`), live SSE streams, and fallback offline polling.
+- **Cold-Boot Fail-Closed Gate**:
+  - At `t = 0` (`Configure`), `AuthState` starts `Unresolved`. The worker emits `Ready` + `Connecting` and dispatches **only** `GET /api/auth/session`, withholding `LoadOffline`, SSE streams, all operational REST calls, and operational `ViewModel` state until session resolution completes.
+- **`anonymous_lockdown`, `AuthorizationDenied`, and `0`-Passkey Gating**:
+  - When `anonymous_lockdown == true` or `AuthStatus::AuthorizationDenied`, all non-auth REST calls, `LoadOffline`, and SSE streams stay suppressed and restricted store slices remain scrubbed.
+  - When authenticated with `passkey_count == 0` (`AuthStatus::PasskeyEnrollmentRequired`), only `/api/auth/session`, `/api/auth/profile`, `/api/auth/passkeys`, `/api/auth/passkeys/register/finish`, and `/api/auth/activity` are allowed; `Store` forces a non-dismissible `DialogModel::PasskeyEnrollmentGate` (`CloseDialog` cannot close it).
+  - Non-lockdown `Anonymous` sessions fetch and project **only** `active_policies`-authorized endpoints (withholding raw build logs, cluster nodes, observability logs, and registry slices unless explicitly permitted).
+- **8-Area / 27-Subview REST & SSE Coverage (`api`, `wasm`)**:
+  - Handles all Protocol v6 endpoints across System/Home (`/api/obs/v1/status/subsystems`, `subsystem_status_changed` SSE on `StreamId::Obs`, maintenance toggling), CI, CD (`/api/cd/runs`), A/B Deploy (`/api/cd/deployments/{id}/rollback`), Registry, Observability (Smartscape, PurePath, Problems, Logs, Metrics, DataStore, Ingress), Model Runner (`/api/mr/v1/status`, `/api/mr/v1/connection`), and Platform/Identity (`/api/auth/{profile,passkeys/*,roles/*,elevate/finish,activity,folios,role-folio-index,users,invites}`).
 
-## 2. In-Memory Store & Coalescing
+## 2. Role Lease Timers, Selective Scrubbing & Coalescing (`store`, `coalesce`)
 
-- **Normalized Entity Store (`store`)**:
-  - Maintains state for repositories, pipeline runs, stages, canary deployments, and host metrics.
-  - Generates compact `ViewModel` diffs against previous state representations.
-- **Throttling & Coalescing (`coalesce`)**:
-  - Throttles UI message dispatch to `<= 10 Hz` (`MAX_PATCH_HZ = 10`) during high-frequency telemetry streams.
-  - Detects tab visibility state; switches to low-frequency heartbeat emission when the browser tab is hidden to conserve power and CPU.
+- **Independent Per-Role Lease Countdowns**:
+  - `Store::tick` advances `[seconds_remaining][idle_timer]` independently for every active `RoleLeaseView`.
+  - `UiCommand::RecordUserActivity` resets only `idle_timer` without extending `hard_expires_at_ms`; non-activity REST/SSE traffic never resets idle leases.
+  - When a `Timed` role reaches `00:00`, it deactivates locally, recomputes active policies from baseline + `Elective` + remaining unexpired `Timed` roles, scrubs only exclusive restricted slices while preserving still-authorized data, sets `force_snapshot_pending` (`DataEvent::Snapshot`), closes disallowed SSE streams, and triggers `/api/auth/session` confirmation.
+- **Area Badges & Throttling (`coalesce`)**:
+  - Computes 8-area `AreaBadges` health/status indicators across every tick/mutation.
+  - Throttles UI diffs to `<= 10 Hz` (`MIN_INTERVAL_MS = 100`) and switches to heartbeats when the browser tab is hidden.
 
-## 3. Resilience & Offline Support
+## 3. Resilience & Offline Support (`sse`, `offline`)
 
 - **SSE Stream Parsing (`sse`)**:
-  - WHATWG event stream specification compliant parser with support for multi-line data frames, BOM stripping, and custom retry intervals.
-  - Automatic exponential backoff with deterministic jitter on connection dropouts.
+  - WHATWG event stream parser with BOM stripping, mixed line endings, custom `retry:` support, and exponential backoff with deterministic jitter on reconnects.
 - **CacheStorage Persistence (`offline`)**:
-  - Persists serialized snapshots into the browser `CacheStorage` API under schema-watermarked keys.
-  - Automatically recovers and replays cached snapshots during network interruptions.
+  - Persists sanitized `ViewModel` snapshots into `CacheStorage` under schema-watermarked keys only when `AuthStatus::Active` with enrolled Passkeys (`passkey_count > 0`) and replays them on `LoadOffline` only once operational data emission is authorized.
 
 ## 4. Privacy & Lab Boundary Invariants
 
 - **Public Repository Cleanliness**:
-  - Public documentation, logs, and skills must never expose internal hostnames or private network ranges.
-  - Use generic placeholders (`node-a`, `worker-riscv64`, `192.0.2.x`) across all tests and documentation.
+  - Public documentation, logs, tests, and skills must never expose internal hostnames, private network ranges, or internal domains.
+  - Use generic placeholders (`node-a`, `worker-riscv64`, `192.0.2.x`, `console.example.org`) across all tests and documentation.
