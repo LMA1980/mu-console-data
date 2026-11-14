@@ -1537,30 +1537,48 @@ impl Store {
                 } else {
                     self.observe.traces.push(trace);
                 }
-                for l in correlated {
-                    let clean_msg = clean_otel_message(&l.message);
-                    if clean_msg.is_empty() {
-                        continue;
-                    }
-                    let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
-                        String::from("actionrunner-controller")
-                    } else {
-                        l.service
-                    };
-                    let exists = self.observe.logs.iter().any(|existing| {
-                        existing.trace_id == l.trace_id
-                            && existing.timestamp_ms == l.timestamp_ms
-                            && existing.message == clean_msg
-                    });
-                    if !exists {
-                        self.observe.logs.push(OtelLogEntry {
-                            timestamp_ms: l.timestamp_ms,
-                            severity: l.severity,
-                            service,
-                            span_id: l.span_id,
-                            trace_id: l.trace_id,
-                            message: clean_msg,
+                if self.source == DataSource::Live {
+                    let normalized = self.normalize_log_dtos(correlated);
+                    for entry in normalized {
+                        let exists = self.live_obs_logs.iter().any(|existing| {
+                            existing.trace_id == entry.trace_id
+                                && existing.timestamp_ms == entry.timestamp_ms
+                                && existing.message == entry.message
                         });
+                        if !exists {
+                            self.live_obs_logs.push(entry);
+                        }
+                    }
+                    self.live_obs_logs
+                        .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
+                    self.live_obs_logs.truncate(500);
+                } else {
+                    for l in correlated {
+                        let clean_msg = clean_otel_message(&l.message);
+                        if clean_msg.is_empty() {
+                            continue;
+                        }
+                        let service = if l.service.eq_ignore_ascii_case("action-runner-controller")
+                        {
+                            String::from("actionrunner-controller")
+                        } else {
+                            l.service
+                        };
+                        let exists = self.observe.logs.iter().any(|existing| {
+                            existing.trace_id == l.trace_id
+                                && existing.timestamp_ms == l.timestamp_ms
+                                && existing.message == clean_msg
+                        });
+                        if !exists {
+                            self.observe.logs.push(OtelLogEntry {
+                                timestamp_ms: l.timestamp_ms,
+                                severity: l.severity,
+                                service,
+                                span_id: l.span_id,
+                                trace_id: l.trace_id,
+                                message: clean_msg,
+                            });
+                        }
                     }
                 }
                 self.refresh_live_problems();
@@ -1869,16 +1887,18 @@ impl Store {
             Input::JobDetail(rec) => {
                 self.loaded = true;
                 let rec = rec.into_unwrapped();
-                let trace = self.build_ci_trace_and_log(&rec, "Completed", 0);
-                if let Some(slot) = self
-                    .observe
-                    .traces
-                    .iter_mut()
-                    .find(|t| t.trace_id == trace.trace_id)
-                {
-                    *slot = trace;
-                } else {
-                    self.observe.traces.insert(0, trace);
+                if matches!(self.source, DataSource::Scenario(_)) {
+                    let trace = self.build_ci_trace_and_log(&rec, "Completed", 0);
+                    if let Some(slot) = self
+                        .observe
+                        .traces
+                        .iter_mut()
+                        .find(|t| t.trace_id == trace.trace_id)
+                    {
+                        *slot = trace;
+                    } else {
+                        self.observe.traces.insert(0, trace);
+                    }
                 }
                 let Some(summary) = self.ci_job_from_record(rec, None) else {
                     return false;
@@ -2668,6 +2688,7 @@ impl Store {
                     format!("job-{}", format_job_id(tr.job_id))
                 };
                 let repo_score = self.repos.get(&repo);
+                let is_scenario = matches!(self.source, DataSource::Scenario(_));
                 let stages: Vec<CiJobStage> = stations
                     .iter()
                     .enumerate()
@@ -2681,9 +2702,13 @@ impl Store {
                             id: st.id.clone(),
                             name: st.label.clone(),
                             assigned_node: tr.node_id.clone(),
-                            threads: 6,
+                            threads: if is_scenario { 6 } else { 0 },
                             state,
-                            duration_secs: if state == StageState::Passed { 12 } else { 0 },
+                            duration_secs: if is_scenario && state == StageState::Passed {
+                                12
+                            } else {
+                                0
+                            },
                             exit_code: i32::from(state == StageState::Failed),
                         }
                     })
@@ -3922,5 +3947,145 @@ mod tests {
             102,
         );
         assert!(s.view().observe.traces.is_empty());
+    }
+
+    #[test]
+    fn test_issue_35_live_job_detail_topology_and_trace_detail_isolation() {
+        let mut s = Store::new(DataSource::Live);
+        let repo = RepoId::new("LMA1980", "superproject");
+
+        // (a) Input::Topology in DataSource::Live yields threads == 0 and duration_secs == 0 on stages
+        let repos_in =
+            crate::api::parse_fetch(&crate::api::FetchKind::Repos, crate::api::tests::REPOS)
+                .expect("parse repos");
+        s.apply(repos_in, 10);
+        s.apply(
+            Input::Select(Selection {
+                repo: repo.clone(),
+                submodule: None,
+            }),
+            11,
+        );
+        let topo_in = crate::api::parse_fetch(
+            &crate::api::FetchKind::Topology(repo),
+            crate::api::tests::TOPOLOGY,
+        )
+        .expect("parse topology");
+        s.apply(topo_in, 12);
+
+        let v_topo = s.view();
+        assert!(
+            !v_topo.ci_jobs.is_empty(),
+            "Topology train must hydrate a CI job entry"
+        );
+        let topo_job = &v_topo.ci_jobs[0];
+        assert!(
+            !topo_job.stages.is_empty(),
+            "Topology job must expose stage placeholders"
+        );
+        assert!(
+            topo_job
+                .stages
+                .iter()
+                .all(|st| st.threads == 0 && st.duration_secs == 0),
+            "Live Topology stages must keep threads=0 and duration_secs=0, got: {:?}",
+            topo_job.stages
+        );
+
+        // (b) Input::JobDetail in DataSource::Live does NOT synthesize tr-ci-* traces into observe.traces
+        let job_detail_json = r#"{
+            "job": {
+                "id": "job-1794054497-af7344e0",
+                "repo_name": "LMA1980/superproject",
+                "ref_name": "refs/heads/main",
+                "commit_sha": "af7344e01234",
+                "event_type": "push"
+            },
+            "status": { "state": "Completed", "details": { "duration_secs": 11, "exit_code": 0 } },
+            "stages": [
+                {
+                    "id": "fmt",
+                    "name": "fmt-check",
+                    "assigned_node": "worker-riscv64",
+                    "threads": 6,
+                    "status": { "state": "Completed", "details": { "duration_secs": 8, "exit_code": 0 } }
+                }
+            ]
+        }"#;
+        let job_detail_in =
+            crate::api::parse_fetch(&crate::api::FetchKind::JobDetail(1234), job_detail_json)
+                .expect("parse job detail");
+        s.apply(job_detail_in, 20);
+        let v_job = s.view();
+        assert!(
+            v_job.observe.traces.is_empty(),
+            "Live JobDetail must not synthesize tr-ci-* traces: {:?}",
+            v_job.observe.traces
+        );
+
+        // (c) Input::ObsTraceDetail while is_active_log_query() == true isolates active search view
+        // while persisting normalized correlated logs into live_obs_logs for display on clear.
+        s.apply(
+            Input::ObsLogsQueryResult(vec![OtelLogDto {
+                timestamp_ms: 1_762_742_550_000,
+                severity: LogSeverity::Info,
+                service: "query-svc".into(),
+                span_id: Some("sp-q-1".into()),
+                trace_id: "tr-query-1".into(),
+                message: "search query hit".into(),
+            }]),
+            30,
+        );
+        assert!(s.is_active_log_query());
+        assert_eq!(s.view().observe.logs.len(), 1);
+        assert_eq!(s.view().observe.logs[0].message, "search query hit");
+
+        let trace_detail_json = r#"{
+            "trace_id": "tr-detail-1",
+            "root_service": "mu-db",
+            "root_operation": "SELECT",
+            "domain": "OBS",
+            "duration_ms": 42,
+            "error": true,
+            "slow_p99": false,
+            "started_epoch_ms": 1762742600000,
+            "spans": [],
+            "correlated_logs": [
+                {
+                    "timestamp_ms": 1762742600000,
+                    "trace_id": "tr-detail-1",
+                    "span_id": "sp-detail-1",
+                    "severity_text": "ERROR",
+                    "service": "mu-db",
+                    "body": "correlated deadlock detail"
+                }
+            ]
+        }"#;
+        let trace_detail_in = crate::api::parse_fetch(
+            &crate::api::FetchKind::ObsTraceDetail("tr-detail-1".into()),
+            trace_detail_json,
+        )
+        .expect("parse trace detail");
+        s.apply(trace_detail_in, 40);
+
+        // Active log query must stay isolated from background correlated_logs
+        let v_during = s.view();
+        assert!(s.is_active_log_query());
+        assert_eq!(v_during.observe.logs.len(), 1);
+        assert_eq!(v_during.observe.logs[0].message, "search query hit");
+
+        // Clearing the active query reveals the normalized correlated_logs from live_obs_logs
+        s.clear_active_log_query();
+        assert!(!s.is_active_log_query());
+        let v_after = s.view();
+        assert!(
+            v_after
+                .observe
+                .logs
+                .iter()
+                .any(|l| l.message == "correlated deadlock detail" && l.service == "mu-db"),
+            "Correlated logs must persist in live_obs_logs after query clear: {:?}",
+            v_after.observe.logs
+        );
     }
 }
