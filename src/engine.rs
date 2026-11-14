@@ -11,9 +11,10 @@ use std::collections::BTreeSet;
 
 use mu_console_protocol::dto::paths;
 use mu_console_protocol::{
-    decode, encode, AreaBadges, CdSubView, CiSubView, CodecError, ConnState, DataEvent, DataSource,
-    ObserveSubView, RegistrySubView, RepoId, Selection, SubView, UiCommand, UiError, WorkerConfig,
-    PROTOCOL_VERSION,
+    decode, encode, AbDeploySubView, Area, AreaBadges, AuthStatus, CdSubView, CiSubView,
+    CodecError, ConnState, DataEvent, DataSource, DialogModel, ModelRunnerSubView,
+    ObservabilitySubView, PlatformSubView, RepoId, RepositorySubView, Selection, SubView,
+    UiCommand, UiError, WorkerConfig, PROTOCOL_VERSION,
 };
 
 use crate::api::{parse_event, parse_fetch, FetchKind, StreamId};
@@ -32,6 +33,8 @@ pub const OFFLINE_AFTER_ATTEMPTS: u32 = 3;
 pub const SELECT_SETTLE_MS: u64 = 350;
 /// Active CI job detail & log tailing poll interval (ms) while a job is running or queued.
 pub const LIVE_ACTIVE_JOB_POLL_MS: u64 = 2_000;
+/// Minimum interval (ms) between `/api/auth/activity` heartbeats for timed role idle timers.
+pub const ACTIVITY_HEARTBEAT_MS: u64 = 5_000;
 
 /// Side effect for the browser glue to execute.
 #[allow(clippy::large_enum_variant)]
@@ -110,6 +113,8 @@ pub struct Engine {
     selected_job_id: Option<u64>,
     active_subview: Option<SubView>,
     last_live_poll_ms: u64,
+    last_activity_post_ms: Option<u64>,
+    offline_requested: bool,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
 }
@@ -138,6 +143,8 @@ impl Engine {
             selected_job_id: None,
             active_subview: None,
             last_live_poll_ms: 0,
+            last_activity_post_ms: None,
+            offline_requested: false,
             selection_gen: 0,
             pending_select: None,
         }
@@ -232,18 +239,7 @@ impl Engine {
                     if let Some(tid) = route.trace_id {
                         self.fetch(FetchKind::ObsTraceDetail(tid), &mut fx);
                     }
-                    if matches!(
-                        route.subview,
-                        SubView::Observe(ObserveSubView::Logs) | SubView::Ci(CiSubView::QueueLogs)
-                    ) {
-                        self.fetch(FetchKind::CiQueue, &mut fx);
-                        if let Some(ref q) = route.filter.filter(|s| !s.trim().is_empty()) {
-                            self.fetch(FetchKind::ObsLogsQuery(q.clone()), &mut fx);
-                        } else {
-                            self.store.clear_active_log_query();
-                            self.fetch(FetchKind::ObsLogs, &mut fx);
-                        }
-                    }
+                    self.fetch_subview(route.subview, route.filter.as_deref(), &mut fx);
                 }
             }
             UiCommand::SelectRepo { repo, submodule } => {
@@ -253,66 +249,7 @@ impl Engine {
                 self.active_subview = Some(subview);
                 self.store.clear_active_log_query();
                 if self.mode == Mode::Live {
-                    match subview {
-                        SubView::Ci(CiSubView::QueueLogs) => {
-                            self.fetch(FetchKind::CiQueue, &mut fx);
-                            self.fetch(FetchKind::ObsLogs, &mut fx);
-                            if let Some(job_id) = self
-                                .selected_job_id
-                                .or_else(|| self.store.view().ci_jobs.first().map(|j| j.job_id))
-                            {
-                                self.fetch(FetchKind::JobDetail(job_id), &mut fx);
-                                self.fetch_active_job_log(job_id, &mut fx);
-                            }
-                        }
-                        SubView::Cd(CdSubView::IntegrationGate | CdSubView::DeploymentsSlots) => {
-                            self.fetch_selection(&mut fx);
-                            self.fetch(FetchKind::RegCanaries, &mut fx);
-                        }
-                        SubView::Cd(CdSubView::ActiveLeases) => {
-                            self.fetch(FetchKind::Leases, &mut fx);
-                            self.fetch(FetchKind::RegCanaries, &mut fx);
-                        }
-                        SubView::Registry(RegistrySubView::Packages) => {
-                            self.fetch(FetchKind::RegPackages, &mut fx);
-                        }
-                        SubView::Registry(RegistrySubView::CanaryTaints) => {
-                            self.fetch(FetchKind::RegCanaries, &mut fx);
-                        }
-                        SubView::Registry(RegistrySubView::CasHealth) => {
-                            self.fetch(FetchKind::RegCasStatus, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::Smartscape) => {
-                            self.fetch(FetchKind::ObsSmartscape, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::PurePath) => {
-                            self.fetch(FetchKind::CiQueue, &mut fx);
-                            self.fetch(FetchKind::ObsTraces, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::ProblemsSlos) => {
-                            self.fetch(FetchKind::ObsProblems, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::Logs) => {
-                            self.fetch(FetchKind::ObsLogs, &mut fx);
-                            self.fetch(FetchKind::CiQueue, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::Metrics) => {
-                            self.fetch(FetchKind::ObsMetrics, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::DataStore) => {
-                            self.fetch(FetchKind::ObsStoreStatus, &mut fx);
-                        }
-                        SubView::Observe(ObserveSubView::Ingress) => {
-                            self.fetch(FetchKind::ObsIngressOverview, &mut fx);
-                        }
-                        SubView::Fleet(_) => {
-                            self.fetch(FetchKind::ClusterNodes, &mut fx);
-                        }
-                        SubView::Ci(CiSubView::Trainway | CiSubView::Scorecards) => {
-                            self.fetch_selection(&mut fx);
-                            self.fetch(FetchKind::CiQueue, &mut fx);
-                        }
-                    }
+                    self.fetch_subview(subview, None, &mut fx);
                 }
             }
             UiCommand::Retry | UiCommand::ResetStream => self.retry(now_ms, &mut fx),
@@ -328,45 +265,183 @@ impl Engine {
                     self.badges = None;
                 }
             }
-            // UI-local in Phase 3; nothing to fetch.
-            UiCommand::Page { .. }
-            | UiCommand::SetCrtFont(_)
-            | UiCommand::SetSkin(_)
-            | UiCommand::Navigate { .. } => {}
+            UiCommand::Page { .. } | UiCommand::Navigate { .. } => {}
+            UiCommand::SetCrtFont(font) => {
+                self.store.apply(
+                    Input::LocalUserPrefs {
+                        skin: None,
+                        font: Some(font),
+                    },
+                    now_ms,
+                );
+            }
+            UiCommand::SetSkin(skin) => {
+                self.store.apply(
+                    Input::LocalUserPrefs {
+                        skin: Some(skin),
+                        font: None,
+                    },
+                    now_ms,
+                );
+            }
+            UiCommand::RefreshSession => {
+                if self.mode == Mode::Live {
+                    self.fetch(FetchKind::AuthSession, &mut fx);
+                }
+            }
             UiCommand::SetAuthSession(dto) => {
+                let prev_allowed = self.store.can_emit_operational_data();
+                let prev_policies = self.store.auth().active_policies.clone();
                 self.store.apply(Input::AuthSession(dto), now_ms);
+                self.on_auth_transition(prev_allowed, &prev_policies, now_ms, &mut fx);
             }
             UiCommand::RedeemInvite { token } => {
                 if self.mode == Mode::Live && !token.is_empty() {
                     self.fetch(FetchKind::AuthRedeem(token), &mut fx);
                 }
             }
+            UiCommand::EnableRole { role_id } => {
+                if self.require_active_auth(&mut fx, "Active session required to enable roles")
+                    && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthEnableRole(role_id), &mut fx);
+                }
+            }
+            UiCommand::DisableRole { role_id } => {
+                if self.require_active_auth(&mut fx, "Active session required to disable roles")
+                    && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthDisableRole(role_id), &mut fx);
+                }
+            }
+            UiCommand::ElevateWithPasskey {
+                role_id,
+                assertion_json,
+            } => {
+                if self.require_active_auth(&mut fx, "Active session required for role elevation")
+                    && self.mode == Mode::Live
+                {
+                    self.fetch(
+                        FetchKind::AuthElevateFinish {
+                            role_id,
+                            assertion_json,
+                        },
+                        &mut fx,
+                    );
+                }
+            }
+            UiCommand::LockTimedRoles => {
+                if self.require_active_auth(&mut fx, "Active session required to lock timed roles")
+                    && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthLockRoles, &mut fx);
+                }
+            }
+            UiCommand::RecordUserActivity => {
+                self.store.apply(Input::UserActivityRecorded, now_ms);
+                if self.mode == Mode::Live
+                    && !self.store.auth().leases.is_empty()
+                    && self
+                        .last_activity_post_ms
+                        .is_none_or(|prev| now_ms >= prev.saturating_add(ACTIVITY_HEARTBEAT_MS))
+                {
+                    self.last_activity_post_ms = Some(now_ms);
+                    self.fetch(FetchKind::AuthActivity, &mut fx);
+                }
+            }
+            UiCommand::UpdateUserProfile {
+                display_name,
+                preferred_skin,
+                preferred_font,
+            } => {
+                let kind = FetchKind::AuthProfilePut {
+                    display_name,
+                    preferred_skin,
+                    preferred_font,
+                };
+                if self.can_fetch(&kind) {
+                    if self.mode == Mode::Live {
+                        self.fetch(kind, &mut fx);
+                    }
+                } else {
+                    deny_403(&mut fx, "Authenticated session required to update profile");
+                }
+            }
+            UiCommand::EnrollPasskey {
+                label,
+                attestation_json,
+            } => {
+                let kind = FetchKind::AuthPasskeyRegisterFinish {
+                    label,
+                    attestation_json,
+                };
+                if self.can_fetch(&kind) {
+                    if self.mode == Mode::Live {
+                        self.fetch(kind, &mut fx);
+                    }
+                } else {
+                    deny_403(&mut fx, "Authenticated session required to enroll passkeys");
+                }
+            }
+            UiCommand::RemovePasskey {
+                credential_id,
+                step_up_assertion_json,
+            } => {
+                let kind = FetchKind::AuthPasskeyDelete {
+                    credential_id,
+                    step_up_assertion_json,
+                };
+                if self.can_fetch(&kind) {
+                    if self.mode == Mode::Live {
+                        self.fetch(kind, &mut fx);
+                    }
+                } else {
+                    deny_403(&mut fx, "Authenticated session required to remove passkeys");
+                }
+            }
+            UiCommand::OpenDialog(dlg) => {
+                if self.mode == Mode::Live {
+                    match &dlg {
+                        DialogModel::UserProfile(_) => {
+                            self.fetch(FetchKind::AuthProfile, &mut fx);
+                            self.fetch(FetchKind::AuthPasskeys, &mut fx);
+                        }
+                        DialogModel::SessionRoles(_) => {
+                            self.fetch(FetchKind::AuthSession, &mut fx);
+                            self.fetch(FetchKind::AuthRoles, &mut fx);
+                        }
+                        _ => {}
+                    }
+                }
+                self.store.apply(Input::OpenDialog(dlg), now_ms);
+            }
+            UiCommand::CloseDialog => {
+                self.store.apply(Input::CloseDialog, now_ms);
+            }
             UiCommand::RestartJob { job_id } => {
-                if self.store.auth().is_operator() {
+                if self.require_policy(
+                    "ci:jobs.restart",
+                    &mut fx,
+                    "Policy ci:jobs.restart required to restart jobs",
+                ) {
                     self.store.apply(Input::JobRestarted(job_id), now_ms);
                     if self.mode == Mode::Live {
                         self.fetch(FetchKind::RestartJob(job_id), &mut fx);
                         self.fetch(FetchKind::CiQueue, &mut fx);
                     }
-                } else {
-                    fx.push(Effect::Post(DataEvent::Error(UiError::Http {
-                        status: 403,
-                        message: "Operator session required to restart jobs".into(),
-                    })));
                 }
             }
             UiCommand::ResumeJob { job_id } => {
-                if self.store.auth().is_operator() {
+                if self.require_policy(
+                    "ci:jobs.resume",
+                    &mut fx,
+                    "Policy ci:jobs.resume required to resume jobs",
+                ) {
                     self.store.apply(Input::JobResumed(job_id), now_ms);
                     if self.mode == Mode::Live {
                         self.fetch(FetchKind::ResumeJob(job_id), &mut fx);
                         self.fetch(FetchKind::CiQueue, &mut fx);
                     }
-                } else {
-                    fx.push(Effect::Post(DataEvent::Error(UiError::Http {
-                        status: 403,
-                        message: "Operator session required to resume jobs".into(),
-                    })));
                 }
             }
             UiCommand::SelectJob { job_id } => {
@@ -375,13 +450,164 @@ impl Engine {
                     if self.mode == Mode::Live {
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                         if self.fallback_job_logs.contains(&job_id)
-                            && !self.store.auth().is_operator()
+                            && !self.store.auth().has_policy("ci:jobs.logs.read")
                         {
                             self.fetch_obs_job_log(job_id, &mut fx);
                         } else {
-                            self.fetch(FetchKind::JobLog(job_id), &mut fx);
+                            self.fetch_active_job_log(job_id, &mut fx);
                         }
                     }
+                }
+            }
+            UiCommand::TriggerAbRollback {
+                deployment_id,
+                note,
+            } => {
+                if self.require_policy(
+                    "ab:rollback",
+                    &mut fx,
+                    "Policy ab:rollback required for emergency rollback",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(
+                        FetchKind::AbRollback {
+                            deployment_id,
+                            note,
+                        },
+                        &mut fx,
+                    );
+                }
+            }
+            UiCommand::SetSubsystemMaintenance {
+                subsystem,
+                mode,
+                reason,
+                auto_clear_secs,
+            } => {
+                if self.require_policy(
+                    "platform:maintenance.write",
+                    &mut fx,
+                    "Policy platform:maintenance.write required to update maintenance mode",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(
+                        FetchKind::SetSubsystemMaintenance {
+                            subsystem,
+                            mode,
+                            reason,
+                            auto_clear_secs,
+                        },
+                        &mut fx,
+                    );
+                }
+            }
+            UiCommand::CreateInvite { note, ttl_secs } => {
+                if self.require_policy(
+                    "platform:invites.write",
+                    &mut fx,
+                    "Policy platform:invites.write required to create invites",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthCreateInvite { note, ttl_secs }, &mut fx);
+                }
+            }
+            UiCommand::RevokeInvite { invite_id } => {
+                if self.require_policy(
+                    "platform:invites.write",
+                    &mut fx,
+                    "Policy platform:invites.write required to revoke invites",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthRevokeInvite(invite_id), &mut fx);
+                }
+            }
+            UiCommand::UpdateUserRoles {
+                github_login,
+                bound_roles,
+            } => {
+                if self.require_policy(
+                    "platform:users.write",
+                    &mut fx,
+                    "Policy platform:users.write required to update user roles",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(
+                        FetchKind::AuthUpdateUserRoles {
+                            github_login,
+                            bound_roles,
+                        },
+                        &mut fx,
+                    );
+                }
+            }
+            UiCommand::ResetUserPasskeys { github_login } => {
+                if self.require_policy(
+                    "platform:users.write",
+                    &mut fx,
+                    "Policy platform:users.write required to reset user passkeys",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthResetUserPasskeys(github_login), &mut fx);
+                }
+            }
+            UiCommand::RevokeUser { github_login } => {
+                if self.require_policy(
+                    "platform:users.write",
+                    &mut fx,
+                    "Policy platform:users.write required to revoke user bindings",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthRevokeUser(github_login), &mut fx);
+                }
+            }
+            UiCommand::UpsertRoleSpec(spec) => {
+                if self.require_policy(
+                    "platform:roles.write",
+                    &mut fx,
+                    "Policy platform:roles.write required to modify role specifications",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthUpsertRole(spec), &mut fx);
+                }
+            }
+            UiCommand::DeleteRoleSpec { role_id } => {
+                if self.require_policy(
+                    "platform:roles.write",
+                    &mut fx,
+                    "Policy platform:roles.write required to delete role specifications",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthDeleteRole(role_id), &mut fx);
+                }
+            }
+            UiCommand::UpsertPolicyFolio(folio) => {
+                if self.require_policy(
+                    "platform:folios.write",
+                    &mut fx,
+                    "Policy platform:folios.write required to modify policy folios",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthUpsertFolio(folio), &mut fx);
+                }
+            }
+            UiCommand::DeletePolicyFolio { folio_id } => {
+                if self.require_policy(
+                    "platform:folios.write",
+                    &mut fx,
+                    "Policy platform:folios.write required to delete policy folios",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthDeleteFolio(folio_id), &mut fx);
+                }
+            }
+            UiCommand::UpdateRoleFolioIndex(index) => {
+                if self.require_policy(
+                    "platform:folios.write",
+                    &mut fx,
+                    "Policy platform:folios.write required to update role-folio bindings",
+                ) && self.mode == Mode::Live
+                {
+                    self.fetch(FetchKind::AuthUpdateRoleFolioIndex(index), &mut fx);
                 }
             }
         }
@@ -434,20 +660,10 @@ impl Engine {
                 protocol: PROTOCOL_VERSION,
                 source: DataSource::Live,
             }));
+            // Fail-closed cold boot (t = 0): hold all non-auth REST fetches,
+            // LoadOffline, and SSE streams until /api/auth/session resolves.
             self.set_conn(ConnState::Connecting, fx);
-            fx.push(Effect::LoadOffline);
             self.fetch(FetchKind::AuthSession, fx);
-            self.fetch(FetchKind::Repos, fx);
-            self.fetch(FetchKind::ClusterNodes, fx);
-            self.fetch(FetchKind::CiQueue, fx);
-            self.fetch(FetchKind::ObsLogs, fx);
-            self.fetch(FetchKind::ObsStoreStatus, fx);
-            self.fetch(FetchKind::RegPackages, fx);
-            self.fetch(FetchKind::RegCanaries, fx);
-            self.fetch(FetchKind::RegCasStatus, fx);
-            for s in StreamId::ALL {
-                self.open_stream(s, fx);
-            }
         }
     }
 
@@ -464,35 +680,344 @@ impl Engine {
                 }
             }
             Mode::Live => {
+                self.fetch(FetchKind::AuthSession, fx);
+                if !self.store.can_emit_operational_data() {
+                    return;
+                }
                 for s in StreamId::ALL {
+                    let can_open = self.can_open_stream(s);
                     let st = &mut self.streams[s.index()];
                     st.backoff.reset();
-                    if !st.open {
+                    if can_open && !st.open {
                         st.reconnect_at = None;
                         self.open_stream(s, fx);
                     }
                 }
-                self.fetch(FetchKind::AuthSession, fx);
-                self.fetch(FetchKind::Repos, fx);
-                self.fetch(FetchKind::ClusterNodes, fx);
-                self.fetch(FetchKind::CiQueue, fx);
-                self.fetch(FetchKind::ObsLogs, fx);
-                self.fetch(FetchKind::ObsStoreStatus, fx);
-                self.fetch(FetchKind::RegPackages, fx);
-                self.fetch(FetchKind::RegCanaries, fx);
-                self.fetch(FetchKind::RegCasStatus, fx);
+                self.fetch_permitted_bootstrap(fx);
                 self.fetch_selection(fx);
+                if let Some(sv) = self.active_subview {
+                    if !matches!(
+                        sv,
+                        SubView::Ci(
+                            CiSubView::Trainway | CiSubView::Scorecards | CiSubView::WorkerNodes
+                        ) | SubView::Observability(
+                            ObservabilitySubView::Logs | ObservabilitySubView::DataStore
+                        ) | SubView::Repository(_)
+                    ) {
+                        self.fetch_subview(sv, None, fx);
+                    }
+                }
             }
         }
     }
 
+    fn fetch_permitted_bootstrap(&mut self, fx: &mut Vec<Effect>) {
+        for kind in [
+            FetchKind::ObsSubsystemStatus,
+            FetchKind::Repos,
+            FetchKind::ClusterNodes,
+            FetchKind::CiQueue,
+            FetchKind::ObsLogs,
+            FetchKind::ObsStoreStatus,
+            FetchKind::RegPackages,
+            FetchKind::RegCanaries,
+            FetchKind::RegCasStatus,
+        ] {
+            self.fetch(kind, fx);
+        }
+    }
+
+    fn fetch_subview(&mut self, subview: SubView, filter: Option<&str>, fx: &mut Vec<Effect>) {
+        match subview {
+            SubView::Dashboard(_) => {
+                self.fetch(FetchKind::ObsSubsystemStatus, fx);
+                self.fetch(FetchKind::Repos, fx);
+            }
+            SubView::Ci(CiSubView::Scorecards | CiSubView::Trainway) => {
+                self.fetch_selection(fx);
+                self.fetch(FetchKind::CiQueue, fx);
+            }
+            SubView::Ci(CiSubView::QueueLogs) => {
+                self.fetch(FetchKind::CiQueue, fx);
+                if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
+                    self.fetch(FetchKind::ObsLogsQuery(q.to_owned()), fx);
+                } else {
+                    self.store.clear_active_log_query();
+                    if self.store.auth().has_policy("obs:logs.read") {
+                        self.fetch(FetchKind::ObsLogs, fx);
+                    }
+                }
+                if let Some(job_id) = self
+                    .selected_job_id
+                    .or_else(|| self.store.view().ci_jobs.first().map(|j| j.job_id))
+                {
+                    self.fetch(FetchKind::JobDetail(job_id), fx);
+                    self.fetch_active_job_log(job_id, fx);
+                }
+            }
+            SubView::Ci(CiSubView::WorkerNodes) => {
+                self.fetch(FetchKind::ClusterNodes, fx);
+                self.fetch(FetchKind::CiQueue, fx);
+            }
+            SubView::Ci(CiSubView::SandboxProfiles) => {
+                self.fetch(FetchKind::Repos, fx);
+            }
+            SubView::Cd(cd_sv) => {
+                if let Some(repo) = self
+                    .store
+                    .selection()
+                    .map(|s| s.repo.clone())
+                    .or_else(|| self.store.repo_ids().next().cloned())
+                {
+                    self.fetch(
+                        FetchKind::CdRuns {
+                            repo,
+                            ecosystem: None,
+                            limit: 25,
+                        },
+                        fx,
+                    );
+                }
+                if cd_sv == CdSubView::Pipelines {
+                    self.fetch_selection(fx);
+                }
+            }
+            SubView::AbDeploy(
+                AbDeploySubView::IntegrationGate
+                | AbDeploySubView::DeploymentsSlots
+                | AbDeploySubView::GateTestLogs,
+            ) => {
+                self.fetch_selection(fx);
+                self.fetch(FetchKind::RegCanaries, fx);
+            }
+            SubView::AbDeploy(AbDeploySubView::ActiveLeases) => {
+                self.fetch(FetchKind::Leases, fx);
+                self.fetch(FetchKind::RegCanaries, fx);
+            }
+            SubView::Repository(RepositorySubView::Packages) => {
+                self.fetch(FetchKind::RegPackages, fx);
+            }
+            SubView::Repository(RepositorySubView::CanaryTaints) => {
+                self.fetch(FetchKind::RegCanaries, fx);
+            }
+            SubView::Repository(RepositorySubView::CasHealth) => {
+                self.fetch(FetchKind::RegCasStatus, fx);
+            }
+            SubView::Observability(ObservabilitySubView::Smartscape) => {
+                self.fetch(FetchKind::ObsSmartscape, fx);
+            }
+            SubView::Observability(ObservabilitySubView::PurePath) => {
+                self.fetch(FetchKind::CiQueue, fx);
+                self.fetch(FetchKind::ObsTraces, fx);
+            }
+            SubView::Observability(ObservabilitySubView::ProblemsSlos) => {
+                self.fetch(FetchKind::ObsProblems, fx);
+            }
+            SubView::Observability(ObservabilitySubView::Logs) => {
+                self.fetch(FetchKind::CiQueue, fx);
+                if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
+                    self.fetch(FetchKind::ObsLogsQuery(q.to_owned()), fx);
+                } else {
+                    self.store.clear_active_log_query();
+                    self.fetch(FetchKind::ObsLogs, fx);
+                }
+            }
+            SubView::Observability(ObservabilitySubView::Metrics) => {
+                self.fetch(FetchKind::ObsMetrics, fx);
+            }
+            SubView::Observability(ObservabilitySubView::DataStore) => {
+                self.fetch(FetchKind::ObsStoreStatus, fx);
+            }
+            SubView::Observability(ObservabilitySubView::Ingress) => {
+                self.fetch(FetchKind::ObsIngressOverview, fx);
+                self.fetch(FetchKind::ObsIngressRoutes, fx);
+                self.fetch(FetchKind::ObsIngressUpstreams, fx);
+            }
+            SubView::ModelRunner(ModelRunnerSubView::RuntimeQueue) => {
+                self.fetch(FetchKind::MrStatus, fx);
+            }
+            SubView::ModelRunner(ModelRunnerSubView::ConnectionVpn) => {
+                self.fetch(FetchKind::MrConnection, fx);
+            }
+            SubView::Platform(PlatformSubView::Maintenance) => {
+                self.fetch(FetchKind::ObsSubsystemStatus, fx);
+                self.fetch(FetchKind::AuthActivity, fx);
+            }
+            SubView::Platform(PlatformSubView::UsersAndInvites) => {
+                self.fetch(FetchKind::AuthUsers, fx);
+                self.fetch(FetchKind::AuthInvites, fx);
+                self.fetch(FetchKind::AuthRoles, fx);
+            }
+            SubView::Platform(PlatformSubView::RolesAndFolios) => {
+                self.fetch(FetchKind::AuthRoles, fx);
+                self.fetch(FetchKind::AuthFolios, fx);
+                self.fetch(FetchKind::AuthRoleFolioIndex, fx);
+            }
+        }
+    }
+
+    fn require_active_auth(&self, fx: &mut Vec<Effect>, msg: &str) -> bool {
+        if self.store.auth().status == AuthStatus::Active {
+            true
+        } else {
+            deny_403(fx, msg);
+            false
+        }
+    }
+
+    fn require_policy(&self, policy: &str, fx: &mut Vec<Effect>, msg: &str) -> bool {
+        if self.store.can_emit_operational_data() && self.store.auth().has_policy(policy) {
+            true
+        } else {
+            deny_403(fx, msg);
+            false
+        }
+    }
+
+    fn can_fetch(&self, kind: &FetchKind) -> bool {
+        can_fetch_for_auth(
+            self.store.can_emit_operational_data(),
+            self.store.auth().status,
+            self.store.auth(),
+            kind,
+        )
+    }
+
+    fn can_open_stream(&self, s: StreamId) -> bool {
+        if !self.store.can_emit_operational_data() {
+            return false;
+        }
+        let auth = self.store.auth();
+        match s {
+            StreamId::Ci => auth.can_access_area(Area::Ci),
+            StreamId::Cd => auth.can_access_area(Area::Cd) || auth.can_access_area(Area::AbDeploy),
+            StreamId::Obs => {
+                auth.can_access_area(Area::Observability)
+                    || auth.has_policy("system:status.read")
+                    || auth.has_policy("system:dashboard.read")
+                    || auth.has_policy("platform:maintenance.read")
+            }
+        }
+    }
+
+    fn close_disallowed_streams(&mut self, fx: &mut Vec<Effect>) {
+        for s in StreamId::ALL {
+            if !self.can_open_stream(s) {
+                let st = &mut self.streams[s.index()];
+                st.reconnect_at = None;
+                if st.open {
+                    st.open = false;
+                    fx.push(Effect::CloseStream(s));
+                }
+            }
+        }
+    }
+
+    fn on_auth_transition(
+        &mut self,
+        prev_allowed: bool,
+        prev_policies: &[String],
+        now_ms: u64,
+        fx: &mut Vec<Effect>,
+    ) {
+        if self.store.take_force_snapshot() {
+            self.out.force_snapshot();
+        }
+        if !self.store.can_emit_operational_data() {
+            self.close_disallowed_streams(fx);
+            if self.mode == Mode::Live {
+                self.update_conn(now_ms, fx);
+            }
+            return;
+        }
+        self.close_disallowed_streams(fx);
+        if self.mode != Mode::Live {
+            return;
+        }
+        if !prev_allowed
+            && self.store.can_cache_offline()
+            && !self.offline_requested
+            && !self.store.has_live_data()
+        {
+            self.offline_requested = true;
+            fx.push(Effect::LoadOffline);
+        }
+        for s in StreamId::ALL {
+            if self.can_open_stream(s) && !self.streams[s.index()].open {
+                self.streams[s.index()].backoff.reset();
+                self.open_stream(s, fx);
+            }
+        }
+        let gained_policy = |p: &str| !prev_allowed || !prev_policies.iter().any(|x| x == p);
+        let bootstrap: [(&[&str], FetchKind); 9] = [
+            (
+                &[
+                    "system:status.read",
+                    "system:dashboard.read",
+                    "platform:maintenance.read",
+                ],
+                FetchKind::ObsSubsystemStatus,
+            ),
+            (
+                &["ci:repos.public.read", "ci:repos.private.read"],
+                FetchKind::Repos,
+            ),
+            (&["ci:nodes.read"], FetchKind::ClusterNodes),
+            (&["ci:queue.read", "ci:jobs.read"], FetchKind::CiQueue),
+            (&["obs:logs.read"], FetchKind::ObsLogs),
+            (&["obs:store.read"], FetchKind::ObsStoreStatus),
+            (&["reg:packages.read"], FetchKind::RegPackages),
+            (
+                &["reg:canaries.read", "reg:taints.read"],
+                FetchKind::RegCanaries,
+            ),
+            (&["reg:cas.read"], FetchKind::RegCasStatus),
+        ];
+        for (policies, kind) in bootstrap {
+            if self.can_fetch(&kind)
+                && policies
+                    .iter()
+                    .any(|p| self.store.auth().has_policy(p) && gained_policy(p))
+            {
+                self.fetch(kind, fx);
+            }
+        }
+        if !prev_allowed {
+            self.fetch_selection(fx);
+        }
+        if let Some(sv) = self.active_subview {
+            if !matches!(
+                sv,
+                SubView::Ci(CiSubView::Trainway | CiSubView::Scorecards | CiSubView::WorkerNodes)
+                    | SubView::Observability(
+                        ObservabilitySubView::Logs | ObservabilitySubView::DataStore
+                    )
+                    | SubView::Repository(_)
+            ) && !prev_allowed
+            {
+                self.fetch_subview(sv, None, fx);
+            }
+        }
+        self.update_conn(now_ms, fx);
+    }
+
     fn select(&mut self, sel: Selection, now_ms: u64, fx: &mut Vec<Effect>) {
         self.pending_select = None;
-        if self.store.apply(Input::Select(sel), now_ms) {
+        if self.store.apply(Input::Select(sel.clone()), now_ms) {
             self.selection_gen = self.selection_gen.wrapping_add(1);
         }
         if self.mode == Mode::Live {
             self.fetch_selection(fx);
+            if matches!(self.active_subview, Some(SubView::Cd(_))) {
+                self.fetch(
+                    FetchKind::CdRuns {
+                        repo: sel.repo,
+                        ecosystem: None,
+                        limit: 25,
+                    },
+                    fx,
+                );
+            }
         }
     }
 
@@ -508,6 +1033,9 @@ impl Engine {
     }
 
     fn fetch(&self, kind: FetchKind, fx: &mut Vec<Effect>) {
+        if !self.can_fetch(&kind) {
+            return;
+        }
         let path = match &kind {
             FetchKind::Repos => paths::REPOS.to_owned(),
             FetchKind::ClusterNodes => paths::CLUSTER_NODES.to_owned(),
@@ -515,8 +1043,20 @@ impl Engine {
             FetchKind::Summary(r) => paths::summary(&r.owner, &r.repo),
             FetchKind::Topology(r) => paths::topology(&r.owner, &r.repo),
             FetchKind::Deployments(r) => paths::deployments(&r.owner, &r.repo, HISTORY_LIMIT),
+            FetchKind::CdRuns {
+                repo,
+                ecosystem,
+                limit,
+            } => {
+                if repo.owner.is_empty() || repo.repo.is_empty() {
+                    paths::CD_RUNS.to_owned()
+                } else {
+                    paths::cd_runs(&repo.owner, &repo.repo, ecosystem.as_deref(), *limit)
+                }
+            }
             FetchKind::Gate(id) => paths::gate(id),
             FetchKind::Leases => paths::LEASES.to_owned(),
+            FetchKind::AbRollback { deployment_id, .. } => paths::ab_rollback(deployment_id),
             FetchKind::RegPackages => paths::REG_PACKAGES.to_owned(),
             FetchKind::RegCanaries => paths::REG_CANARIES.to_owned(),
             FetchKind::RegCasStatus => paths::REG_CAS_STATUS.to_owned(),
@@ -527,12 +1067,50 @@ impl Engine {
             FetchKind::ObsLogs => paths::OBS_LOGS.to_owned(),
             FetchKind::ObsMetrics => paths::OBS_METRICS.to_owned(),
             FetchKind::ObsStoreStatus => paths::OBS_STORE_STATUS.to_owned(),
+            FetchKind::ObsSubsystemStatus => paths::OBS_SUBSYSTEM_STATUS.to_owned(),
+            FetchKind::SetSubsystemMaintenance { subsystem, .. } => {
+                paths::subsystem_maintenance(*subsystem)
+            }
             FetchKind::ObsIngressOverview => paths::OBS_INGRESS_OVERVIEW.to_owned(),
             FetchKind::ObsIngressRoutes => paths::OBS_INGRESS_ROUTES.to_owned(),
             FetchKind::ObsIngressUpstreams => paths::OBS_INGRESS_UPSTREAMS.to_owned(),
             FetchKind::ObsLogsQuery(q) => paths::obs_logs_query(q, 100),
+            FetchKind::MrStatus => paths::MR_STATUS.to_owned(),
+            FetchKind::MrConnection => paths::MR_CONNECTION.to_owned(),
             FetchKind::AuthSession => paths::AUTH_SESSION.to_owned(),
             FetchKind::AuthRedeem(_) => paths::AUTH_REDEEM.to_owned(),
+            FetchKind::AuthProfile | FetchKind::AuthProfilePut { .. } => {
+                paths::AUTH_PROFILE.to_owned()
+            }
+            FetchKind::AuthPasskeys => paths::AUTH_PASSKEYS.to_owned(),
+            FetchKind::AuthPasskeyRegisterFinish { .. } => {
+                paths::AUTH_PASSKEYS_REGISTER_FINISH.to_owned()
+            }
+            FetchKind::AuthPasskeyDelete { credential_id, .. } => {
+                paths::auth_passkey(credential_id)
+            }
+            FetchKind::AuthEnableRole(role_id) => paths::role_enable(role_id),
+            FetchKind::AuthDisableRole(role_id) => paths::role_disable(role_id),
+            FetchKind::AuthElevateFinish { .. } => paths::AUTH_ELEVATE_FINISH.to_owned(),
+            FetchKind::AuthLockRoles => paths::AUTH_ROLE_LOCK.to_owned(),
+            FetchKind::AuthActivity => paths::AUTH_ACTIVITY.to_owned(),
+            FetchKind::AuthRoles | FetchKind::AuthUpsertRole(_) => paths::AUTH_ROLES.to_owned(),
+            FetchKind::AuthDeleteRole(role_id) => format!("{}/{role_id}", paths::AUTH_ROLES),
+            FetchKind::AuthFolios | FetchKind::AuthUpsertFolio(_) => paths::AUTH_FOLIOS.to_owned(),
+            FetchKind::AuthDeleteFolio(folio_id) => format!("{}/{folio_id}", paths::AUTH_FOLIOS),
+            FetchKind::AuthRoleFolioIndex | FetchKind::AuthUpdateRoleFolioIndex(_) => {
+                paths::AUTH_ROLE_FOLIO_INDEX.to_owned()
+            }
+            FetchKind::AuthUsers => paths::AUTH_USERS.to_owned(),
+            FetchKind::AuthUpdateUserRoles { github_login, .. } => {
+                paths::auth_user_roles(github_login)
+            }
+            FetchKind::AuthResetUserPasskeys(login) => paths::auth_user_passkeys_reset(login),
+            FetchKind::AuthRevokeUser(login) => paths::auth_user(login),
+            FetchKind::AuthInvites | FetchKind::AuthCreateInvite { .. } => {
+                paths::AUTH_INVITES.to_owned()
+            }
+            FetchKind::AuthRevokeInvite(invite_id) => paths::auth_invite(invite_id),
             FetchKind::RestartJob(job_id) => {
                 paths::job_restart_id(&self.store.resolve_job_id_str(*job_id))
             }
@@ -551,6 +1129,10 @@ impl Engine {
     }
 
     fn fetch_obs_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
+        if !self.store.can_emit_operational_data() || !self.store.auth().has_policy("obs:logs.read")
+        {
+            return;
+        }
         let jid = self.store.resolve_job_id_str(job_id);
         let path = paths::job_obs_log_id(&jid);
         fx.push(Effect::Fetch {
@@ -560,14 +1142,17 @@ impl Engine {
     }
 
     fn fetch_active_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
-        if self.store.auth().is_operator() {
+        if self.store.auth().has_policy("ci:jobs.logs.read") {
             self.fetch(FetchKind::JobLog(job_id), fx);
-        } else {
+        } else if self.store.auth().has_policy("obs:logs.read") {
             self.fetch_obs_job_log(job_id, fx);
         }
     }
 
     fn open_stream(&mut self, s: StreamId, fx: &mut Vec<Effect>) {
+        if !self.can_open_stream(s) {
+            return;
+        }
         let path = match s {
             StreamId::Ci => paths::CI_EVENTS,
             StreamId::Cd => paths::CD_EVENTS,
@@ -606,18 +1191,35 @@ impl Engine {
                 }
             }
             Mode::Live => {
+                if !self.store.auth().is_resolved() {
+                    return ConnState::Connecting;
+                }
+                let permitted: Vec<StreamId> = StreamId::ALL
+                    .into_iter()
+                    .filter(|&s| self.can_open_stream(s))
+                    .collect();
+                if permitted.is_empty() {
+                    return ConnState::Live;
+                }
+                let ci_perm = permitted.contains(&StreamId::Ci);
+                let cd_perm = permitted.contains(&StreamId::Cd);
+                let obs_open =
+                    permitted.contains(&StreamId::Obs) && self.streams[StreamId::Obs.index()].open;
                 let ci = &self.streams[StreamId::Ci.index()];
                 let cd = &self.streams[StreamId::Cd.index()];
-                let obs = &self.streams[StreamId::Obs.index()];
-                if (ci.open && (cd.open || cd.backoff.attempt() > 0))
-                    || (cd.open && (ci.open || ci.backoff.attempt() > 0))
-                    || obs.open
+                if obs_open
+                    || (ci_perm
+                        && cd_perm
+                        && ((ci.open && (cd.open || cd.backoff.attempt() > 0))
+                            || (cd.open && (ci.open || ci.backoff.attempt() > 0))))
+                    || (!(ci_perm && cd_perm)
+                        && permitted.iter().any(|&s| self.streams[s.index()].open))
                 {
                     return ConnState::Live;
                 }
-                let worst = self
-                    .streams
+                let worst = permitted
                     .iter()
+                    .map(|&s| &self.streams[s.index()])
                     .filter(|s| !s.open)
                     .map(|s| s.backoff.attempt())
                     .max();
@@ -629,10 +1231,9 @@ impl Engine {
                     }
                     Some(a) => ConnState::Reconnecting {
                         attempt: a,
-                        retry_in_ms: self
-                            .streams
+                        retry_in_ms: permitted
                             .iter()
-                            .filter_map(|s| s.reconnect_at)
+                            .filter_map(|&s| self.streams[s.index()].reconnect_at)
                             .min()
                             .map_or(0, |t| {
                                 u32::try_from(t.saturating_sub(now_ms)).unwrap_or(u32::MAX)
@@ -665,6 +1266,7 @@ impl Engine {
             FetchKind::Summary(_)
                 | FetchKind::Topology(_)
                 | FetchKind::Deployments(_)
+                | FetchKind::CdRuns { .. }
                 | FetchKind::Gate(_)
         );
         if is_selection_scoped && gen != self.selection_gen {
@@ -691,11 +1293,20 @@ impl Engine {
                 let is_optional_probe = matches!(
                     kind,
                     FetchKind::Deployments(_)
+                        | FetchKind::CdRuns { .. }
                         | FetchKind::Gate(_)
                         | FetchKind::Leases
                         | FetchKind::ClusterNodes
                         | FetchKind::CiQueue
                         | FetchKind::AuthSession
+                        | FetchKind::AuthProfile
+                        | FetchKind::AuthPasskeys
+                        | FetchKind::AuthActivity
+                        | FetchKind::AuthRoles
+                        | FetchKind::AuthFolios
+                        | FetchKind::AuthRoleFolioIndex
+                        | FetchKind::AuthUsers
+                        | FetchKind::AuthInvites
                         | FetchKind::RegPackages
                         | FetchKind::RegCanaries
                         | FetchKind::RegCasStatus
@@ -706,13 +1317,22 @@ impl Engine {
                         | FetchKind::ObsLogs
                         | FetchKind::ObsMetrics
                         | FetchKind::ObsStoreStatus
+                        | FetchKind::ObsSubsystemStatus
+                        | FetchKind::ObsIngressOverview
+                        | FetchKind::ObsIngressRoutes
+                        | FetchKind::ObsIngressUpstreams
+                        | FetchKind::MrStatus
+                        | FetchKind::MrConnection
                         | FetchKind::RestartJob(_)
                         | FetchKind::ResumeJob(_)
                         | FetchKind::JobDetail(_)
                         | FetchKind::JobLog(_)
                 );
                 if let FetchKind::JobLog(job_id) = kind {
-                    if matches!(e.status, 401 | 403) && self.fallback_job_logs.insert(*job_id) {
+                    if matches!(e.status, 401 | 403)
+                        && self.store.auth().has_policy("obs:logs.read")
+                        && self.fallback_job_logs.insert(*job_id)
+                    {
                         self.fetch_obs_job_log(*job_id, &mut fx);
                         return fx;
                     }
@@ -737,7 +1357,26 @@ impl Engine {
                 return fx;
             }
         };
+        let is_auth_kind = matches!(
+            kind,
+            FetchKind::AuthSession
+                | FetchKind::AuthRedeem(_)
+                | FetchKind::AuthPasskeyDelete { .. }
+                | FetchKind::AuthEnableRole(_)
+                | FetchKind::AuthDisableRole(_)
+                | FetchKind::AuthElevateFinish { .. }
+                | FetchKind::AuthLockRoles
+        );
+        let prev_allowed = self.store.can_emit_operational_data();
+        let prev_policies = if is_auth_kind {
+            self.store.auth().active_policies.clone()
+        } else {
+            Vec::new()
+        };
         self.store.apply(input, now_ms);
+        if is_auth_kind {
+            self.on_auth_transition(prev_allowed, &prev_policies, now_ms, &mut fx);
+        }
         match kind {
             FetchKind::Repos => {
                 let first = self.store.repo_ids().next().cloned();
@@ -766,26 +1405,43 @@ impl Engine {
                 if let Some(job_id) = first_job {
                     self.asked_job_details.insert(job_id);
                     self.fetch(FetchKind::JobDetail(job_id), &mut fx);
-                    if self.store.auth().is_operator() {
-                        self.fetch(FetchKind::JobLog(job_id), &mut fx);
-                    } else {
-                        self.fetch_obs_job_log(job_id, &mut fx);
-                    }
+                    self.fetch_active_job_log(job_id, &mut fx);
                 }
             }
             FetchKind::Summary(repo) | FetchKind::Topology(repo) => {
                 if let Some(job_id) = self.store.repo_latest_job(repo) {
                     if job_id > 0 && self.asked_job_details.insert(job_id) {
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
-                        if self.store.auth().is_operator() {
-                            self.fetch(FetchKind::JobLog(job_id), &mut fx);
-                        } else {
-                            self.fetch_obs_job_log(job_id, &mut fx);
-                        }
+                        self.fetch_active_job_log(job_id, &mut fx);
                     }
                 }
             }
             FetchKind::Deployments(repo) => self.fetch_latest_gate(repo, &mut fx),
+            FetchKind::AbRollback { .. } => {
+                if let Some(sel) = self.store.selection().cloned() {
+                    self.fetch(FetchKind::Deployments(sel.repo), &mut fx);
+                }
+                self.fetch(FetchKind::Leases, &mut fx);
+                self.fetch(FetchKind::RegCanaries, &mut fx);
+            }
+            FetchKind::SetSubsystemMaintenance { .. } => {
+                self.fetch(FetchKind::ObsSubsystemStatus, &mut fx);
+            }
+            FetchKind::AuthPasskeyRegisterFinish { .. } | FetchKind::AuthPasskeyDelete { .. } => {
+                self.fetch(FetchKind::AuthSession, &mut fx);
+                self.fetch(FetchKind::AuthPasskeys, &mut fx);
+            }
+            FetchKind::AuthCreateInvite { .. } | FetchKind::AuthRevokeInvite(_) => {
+                self.fetch(FetchKind::AuthInvites, &mut fx);
+            }
+            FetchKind::AuthUpdateUserRoles { .. }
+            | FetchKind::AuthResetUserPasskeys(_)
+            | FetchKind::AuthRevokeUser(_) => {
+                self.fetch(FetchKind::AuthUsers, &mut fx);
+            }
+            FetchKind::AuthUpdateRoleFolioIndex(_) => {
+                self.fetch(FetchKind::AuthSession, &mut fx);
+            }
             FetchKind::ObsTraces => {
                 let first_empty_tid = self
                     .store
@@ -798,10 +1454,6 @@ impl Engine {
                 if let Some(tid) = first_empty_tid {
                     self.fetch(FetchKind::ObsTraceDetail(tid), &mut fx);
                 }
-            }
-            FetchKind::AuthRedeem(_) if self.store.auth().is_operator() => {
-                self.fetch(FetchKind::Repos, &mut fx);
-                self.fetch_selection(&mut fx);
             }
             _ => {}
         }
@@ -897,8 +1549,13 @@ impl Engine {
             .iter()
             .filter(|&&other| other != s)
             .any(|&other| self.streams[other.index()].open);
+        let can_open = self.can_open_stream(s);
         let st = &mut self.streams[s.index()];
         st.open = false;
+        if !can_open {
+            st.reconnect_at = None;
+            return fx;
+        }
         let delay = st.backoff.next_delay_ms();
         let attempt = st.backoff.attempt();
         st.reconnect_at = Some(now_ms + u64::from(delay));
@@ -927,6 +1584,9 @@ impl Engine {
 
     /// Result of [`Effect::LoadOffline`].
     pub fn on_offline_loaded(&mut self, bytes: Option<&[u8]>, now_ms: u64) -> Vec<Effect> {
+        if !self.store.can_emit_operational_data() {
+            return Vec::new();
+        }
         if let Some(snap) = bytes.and_then(|b| OfflineSnapshot::from_bytes(b).ok()) {
             self.store.apply(
                 Input::Restore {
@@ -963,14 +1623,16 @@ impl Engine {
             Mode::Scenario => self.play(now_ms),
             Mode::Live => {
                 for s in StreamId::ALL {
-                    if self.streams[s.index()]
-                        .reconnect_at
-                        .is_some_and(|t| now_ms >= t)
+                    if self.can_open_stream(s)
+                        && self.streams[s.index()]
+                            .reconnect_at
+                            .is_some_and(|t| now_ms >= t)
                     {
                         self.open_stream(s, &mut fx);
                     }
                 }
                 if !self.out.is_hidden()
+                    && self.store.can_emit_operational_data()
                     && now_ms
                         >= self
                             .last_live_poll_ms
@@ -995,13 +1657,17 @@ impl Engine {
                         });
                     if matches!(
                         self.active_subview,
-                        Some(
-                            SubView::Observe(ObserveSubView::Logs)
-                                | SubView::Ci(CiSubView::QueueLogs)
-                        )
+                        Some(SubView::Observability(ObservabilitySubView::Logs))
                     ) {
                         polled = true;
                         self.fetch(FetchKind::ObsLogs, &mut fx);
+                        self.fetch(FetchKind::CiQueue, &mut fx);
+                    } else if matches!(self.active_subview, Some(SubView::Ci(CiSubView::QueueLogs)))
+                    {
+                        polled = true;
+                        if self.store.auth().has_policy("obs:logs.read") {
+                            self.fetch(FetchKind::ObsLogs, &mut fx);
+                        }
                         self.fetch(FetchKind::CiQueue, &mut fx);
                     }
                     if let Some(job_id) = active_job_id {
@@ -1039,6 +1705,13 @@ impl Engine {
             }
         }
         self.store.tick(now_ms);
+        if self.store.take_force_snapshot() {
+            self.out.force_snapshot();
+        }
+        if self.mode == Mode::Live && self.store.take_session_refresh() {
+            self.close_disallowed_streams(&mut fx);
+            self.fetch(FetchKind::AuthSession, &mut fx);
+        }
         let dirty = self.store.is_dirty();
         let store = &mut self.store;
         if let Some(ev) = self.out.poll(now_ms, dirty, || {
@@ -1054,7 +1727,7 @@ impl Engine {
                 fx.push(Effect::Post(DataEvent::AreaBadges(badges)));
             }
         }
-        if self.mode == Mode::Live && self.store.has_live_data() {
+        if self.mode == Mode::Live && self.store.has_live_data() && self.store.can_cache_offline() {
             if let Some(view) = self.out.sent() {
                 if let Some(bytes) = self.offline.maybe_save(now_ms, view) {
                     fx.push(Effect::SaveOffline(bytes));
@@ -1062,6 +1735,98 @@ impl Engine {
             }
         }
         fx
+    }
+}
+
+fn deny_403(fx: &mut Vec<Effect>, message: &str) {
+    fx.push(Effect::Post(DataEvent::Error(UiError::Http {
+        status: 403,
+        message: message.to_owned(),
+    })));
+}
+
+fn can_fetch_for_auth(
+    can_op_data: bool,
+    status: AuthStatus,
+    auth: &mu_console_protocol::AuthState,
+    kind: &FetchKind,
+) -> bool {
+    match kind {
+        FetchKind::AuthSession | FetchKind::AuthRedeem(_) => true,
+        FetchKind::AuthProfile
+        | FetchKind::AuthProfilePut { .. }
+        | FetchKind::AuthPasskeys
+        | FetchKind::AuthPasskeyRegisterFinish { .. }
+        | FetchKind::AuthPasskeyDelete { .. }
+        | FetchKind::AuthActivity => matches!(
+            status,
+            AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
+        ),
+        FetchKind::AuthEnableRole(_)
+        | FetchKind::AuthDisableRole(_)
+        | FetchKind::AuthElevateFinish { .. }
+        | FetchKind::AuthLockRoles => status == AuthStatus::Active,
+        _ if !can_op_data => false,
+        FetchKind::Repos | FetchKind::Summary(_) | FetchKind::Topology(_) => {
+            auth.has_policy("ci:repos.public.read") || auth.has_policy("ci:repos.private.read")
+        }
+        FetchKind::CiQueue => auth.has_policy("ci:queue.read") || auth.has_policy("ci:jobs.read"),
+        FetchKind::ClusterNodes => auth.has_policy("ci:nodes.read"),
+        FetchKind::JobDetail(_) => auth.has_policy("ci:jobs.read"),
+        FetchKind::JobLog(_) => {
+            auth.has_policy("ci:jobs.logs.read") || auth.has_policy("obs:logs.read")
+        }
+        FetchKind::RestartJob(_) => auth.has_policy("ci:jobs.restart"),
+        FetchKind::ResumeJob(_) => auth.has_policy("ci:jobs.resume"),
+        FetchKind::CdRuns { .. } => auth.has_policy("cd:runs.read"),
+        FetchKind::Deployments(_) | FetchKind::Gate(_) | FetchKind::Leases => {
+            auth.can_access_area(Area::AbDeploy)
+        }
+        FetchKind::AbRollback { .. } => auth.has_policy("ab:rollback"),
+        FetchKind::RegPackages => auth.has_policy("reg:packages.read"),
+        FetchKind::RegCanaries => {
+            auth.has_policy("reg:canaries.read") || auth.has_policy("reg:taints.read")
+        }
+        FetchKind::RegCasStatus => auth.has_policy("reg:cas.read"),
+        FetchKind::ObsSmartscape => auth.has_policy("obs:smartscape.read"),
+        FetchKind::ObsProblems => auth.has_policy("obs:problems.read"),
+        FetchKind::ObsTraces | FetchKind::ObsTraceDetail(_) => auth.has_policy("obs:traces.read"),
+        FetchKind::ObsLogs | FetchKind::ObsLogsQuery(_) => auth.has_policy("obs:logs.read"),
+        FetchKind::ObsMetrics => auth.has_policy("obs:metrics.read"),
+        FetchKind::ObsStoreStatus => auth.has_policy("obs:store.read"),
+        FetchKind::ObsIngressOverview
+        | FetchKind::ObsIngressRoutes
+        | FetchKind::ObsIngressUpstreams => auth.has_policy("obs:ingress.read"),
+        FetchKind::ObsSubsystemStatus => {
+            auth.has_policy("system:status.read")
+                || auth.has_policy("system:dashboard.read")
+                || auth.has_policy("platform:maintenance.read")
+        }
+        FetchKind::SetSubsystemMaintenance { .. } => auth.has_policy("platform:maintenance.write"),
+        FetchKind::MrStatus => {
+            auth.has_policy("mr:models.read") || auth.has_policy("mr:queue.read")
+        }
+        FetchKind::MrConnection => {
+            auth.has_policy("mr:openai_api.read") || auth.has_policy("mr:wireguard_vpn.read")
+        }
+        FetchKind::AuthRoles => auth.has_policy("platform:roles.read"),
+        FetchKind::AuthUpsertRole(_) | FetchKind::AuthDeleteRole(_) => {
+            auth.has_policy("platform:roles.write")
+        }
+        FetchKind::AuthFolios | FetchKind::AuthRoleFolioIndex => {
+            auth.has_policy("platform:folios.read")
+        }
+        FetchKind::AuthUpsertFolio(_)
+        | FetchKind::AuthDeleteFolio(_)
+        | FetchKind::AuthUpdateRoleFolioIndex(_) => auth.has_policy("platform:folios.write"),
+        FetchKind::AuthUsers => auth.has_policy("platform:users.read"),
+        FetchKind::AuthUpdateUserRoles { .. }
+        | FetchKind::AuthResetUserPasskeys(_)
+        | FetchKind::AuthRevokeUser(_) => auth.has_policy("platform:users.write"),
+        FetchKind::AuthInvites => auth.has_policy("platform:invites.read"),
+        FetchKind::AuthCreateInvite { .. } | FetchKind::AuthRevokeInvite(_) => {
+            auth.has_policy("platform:invites.write")
+        }
     }
 }
 

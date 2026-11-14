@@ -8,7 +8,8 @@
 use std::cell::{Cell, RefCell};
 
 use js_sys::{Array, ArrayBuffer, Date, Reflect, Uint8Array};
-use mu_console_protocol::DataEvent;
+use mu_console_protocol::dto::AbRollbackRequestDto;
+use mu_console_protocol::{DataEvent, MaintenanceMode};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -128,16 +129,197 @@ fn request(url: &str, accept: &str, signal: Option<&AbortController>) -> Result<
     Ok(req)
 }
 
-fn post_json_request(url: &str, body_json: &str) -> Result<Request, JsValue> {
+fn json_request(method: &str, url: &str, body_json: Option<&str>) -> Result<Request, JsValue> {
     let init = RequestInit::new();
-    init.set_method("POST");
+    init.set_method(method);
     init.set_credentials(RequestCredentials::SameOrigin);
     init.set_cache(RequestCache::NoStore);
-    init.set_body(&JsValue::from_str(body_json));
+    if let Some(body) = body_json {
+        init.set_body(&JsValue::from_str(body));
+    }
     let req = Request::new_with_str_and_init(url, &init)?;
     req.headers().set("Accept", "application/json")?;
-    req.headers().set("Content-Type", "application/json")?;
+    if body_json.is_some() {
+        req.headers().set("Content-Type", "application/json")?;
+    }
     Ok(req)
+}
+
+fn merge_json_field(
+    raw: &str,
+    key: &str,
+    val: Option<serde_json::Value>,
+    fallback_key: &str,
+) -> String {
+    if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(v) = val {
+            obj.entry(key).or_insert(v);
+        }
+        return serde_json::Value::Object(obj).to_string();
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = val {
+        obj.insert(key.to_owned(), v);
+    }
+    obj.insert(
+        fallback_key.to_owned(),
+        serde_json::Value::String(raw.to_owned()),
+    );
+    serde_json::Value::Object(obj).to_string()
+}
+
+fn serialize_json_or_err<T: serde::Serialize>(val: &T) -> Result<String, JsValue> {
+    serde_json::to_string(val).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn build_fetch_request(kind: &FetchKind, url: &str) -> Result<Request, JsValue> {
+    match kind {
+        FetchKind::AuthRedeem(token) => {
+            let payload = serde_json::json!({ "token": token, "invite_token": token }).to_string();
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::RestartJob(job_id) | FetchKind::ResumeJob(job_id) => {
+            let payload = serde_json::json!({ "job_id": job_id }).to_string();
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::AbRollback { note, .. } => {
+            let payload = serialize_json_or_err(&AbRollbackRequestDto { note: note.clone() })?;
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::SetSubsystemMaintenance {
+            mode,
+            reason,
+            auto_clear_secs,
+            ..
+        } => {
+            let mut obj = serde_json::Map::new();
+            let (mode_str, state_str, clear) = match mode {
+                MaintenanceMode::Auto => ("auto", "live", true),
+                MaintenanceMode::Manual(status) => ("manual", status.as_str(), false),
+            };
+            obj.insert("mode".into(), serde_json::Value::String(mode_str.into()));
+            obj.insert("state".into(), serde_json::Value::String(state_str.into()));
+            obj.insert("clear".into(), serde_json::Value::Bool(clear));
+            if let Some(r) = reason {
+                obj.insert("summary".into(), serde_json::Value::String(r.clone()));
+                obj.insert("reason".into(), serde_json::Value::String(r.clone()));
+            }
+            if let Some(secs) = auto_clear_secs {
+                obj.insert(
+                    "duration_secs".into(),
+                    serde_json::Value::Number((*secs).into()),
+                );
+            }
+            let payload = serde_json::Value::Object(obj).to_string();
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::AuthEnableRole(_)
+        | FetchKind::AuthDisableRole(_)
+        | FetchKind::AuthLockRoles
+        | FetchKind::AuthActivity
+        | FetchKind::AuthResetUserPasskeys(_) => json_request("POST", url, Some("{}")),
+        FetchKind::AuthElevateFinish {
+            role_id,
+            assertion_json,
+        } => {
+            let payload = merge_json_field(
+                assertion_json,
+                "role_id",
+                Some(serde_json::Value::String(role_id.clone())),
+                "assertion_json",
+            );
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::AuthProfilePut {
+            display_name,
+            preferred_skin,
+            preferred_font,
+        } => {
+            let mut obj = serde_json::Map::new();
+            if let Some(name) = display_name {
+                obj.insert(
+                    "display_name".into(),
+                    serde_json::Value::String(name.clone()),
+                );
+            }
+            if let Some(skin) = preferred_skin {
+                if let Ok(v) = serde_json::to_value(skin) {
+                    obj.insert("skin".into(), v);
+                }
+            }
+            if let Some(font) = preferred_font {
+                if let Ok(v) = serde_json::to_value(font) {
+                    obj.insert("font".into(), v);
+                }
+            }
+            let payload = serde_json::Value::Object(obj).to_string();
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::AuthPasskeyRegisterFinish {
+            label,
+            attestation_json,
+        } => {
+            let payload = merge_json_field(
+                attestation_json,
+                "label",
+                label.as_ref().map(|s| serde_json::Value::String(s.clone())),
+                "attestation_json",
+            );
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::AuthPasskeyDelete {
+            step_up_assertion_json,
+            ..
+        } => {
+            let trimmed = step_up_assertion_json.trim();
+            if trimmed.is_empty() {
+                json_request("DELETE", url, None)
+            } else {
+                let payload = if trimmed.starts_with('{') {
+                    trimmed.to_owned()
+                } else {
+                    serde_json::json!({ "step_up_assertion_json": trimmed }).to_string()
+                };
+                json_request("DELETE", url, Some(&payload))
+            }
+        }
+        FetchKind::AuthCreateInvite { note, ttl_secs } => {
+            let mut obj = serde_json::Map::new();
+            if let Some(n) = note {
+                obj.insert("note".into(), serde_json::Value::String(n.clone()));
+            }
+            if let Some(ttl) = ttl_secs {
+                obj.insert(
+                    "ttl_seconds".into(),
+                    serde_json::Value::Number((*ttl).into()),
+                );
+            }
+            let payload = serde_json::Value::Object(obj).to_string();
+            json_request("POST", url, Some(&payload))
+        }
+        FetchKind::AuthRevokeInvite(_)
+        | FetchKind::AuthRevokeUser(_)
+        | FetchKind::AuthDeleteRole(_)
+        | FetchKind::AuthDeleteFolio(_) => json_request("DELETE", url, None),
+        FetchKind::AuthUpdateUserRoles { bound_roles, .. } => {
+            let payload = serde_json::json!({ "bound_roles": bound_roles }).to_string();
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::AuthUpsertRole(spec) => {
+            let payload = serialize_json_or_err(spec)?;
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::AuthUpsertFolio(folio) => {
+            let payload = serialize_json_or_err(folio)?;
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::AuthUpdateRoleFolioIndex(idx) => {
+            let payload = serialize_json_or_err(idx)?;
+            json_request("PUT", url, Some(&payload))
+        }
+        FetchKind::JobLog(_) => request(url, "text/plain, */*", None),
+        _ => request(url, "application/json", None),
+    }
 }
 
 async fn fetch_response(req: &Request) -> Result<Response, JsValue> {
@@ -148,26 +330,7 @@ async fn fetch_response(req: &Request) -> Result<Response, JsValue> {
 
 async fn fetch_json(kind: FetchKind, url: String) {
     let result = async {
-        let req = match &kind {
-            FetchKind::AuthRedeem(token) => {
-                let payload = serde_json::json!({
-                    "token": token,
-                    "invite_token": token,
-                })
-                .to_string();
-                post_json_request(&url, &payload)
-            }
-            FetchKind::RestartJob(job_id) | FetchKind::ResumeJob(job_id) => {
-                let payload = serde_json::json!({
-                    "job_id": job_id,
-                })
-                .to_string();
-                post_json_request(&url, &payload)
-            }
-            FetchKind::JobLog(_) => request(&url, "text/plain, */*", None),
-            _ => request(&url, "application/json", None),
-        }
-        .map_err(|e| HttpError {
+        let req = build_fetch_request(&kind, &url).map_err(|e| HttpError {
             status: 0,
             message: js_msg(&e),
         })?;

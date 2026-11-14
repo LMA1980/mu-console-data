@@ -2,23 +2,27 @@
 //! REST and SSE payload decoding into store [`Input`]s.
 
 use mu_console_protocol::dto::{
-    AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto, CasStatusDto, CiQueueDto,
-    CiQueueJobRecordDto, ClusterNodeDto, DeploymentDto, GateDto, IngressOverviewDto,
-    IngressRouteDto, IngressUpstreamDto, ItProgressDto, JobStageChangedDto, LeaseDto,
-    LeaseExpiredDto, MetricSeriesDto, NodeMembershipChangedDto, OtelLogDto, PackageDto,
-    PrStateChangedDto, ProblemDto, PromotedDto, RawMetricPointDto, RepoDto, RepoListResponseDto,
-    RepoSummaryDto, RolledBackDto, SmartscapeDto, StoreStatusDto, TaintedDigestDto, TaintedDto,
-    TopologyDto, TraceDto,
+    AbRollbackResponseDto, AuthSessionDto, BranchCreatedDto, BranchDeletedDto, CanaryBundleDto,
+    CasStatusDto, CdRunDto, CiQueueDto, CiQueueJobRecordDto, ClusterNodeDto,
+    CreatedInviteResponseDto, DeploymentDto, GateDto, IngressOverviewDto, IngressRouteDto,
+    IngressUpstreamDto, InviteRecordDto, ItProgressDto, JobStageChangedDto, LeaseDto,
+    LeaseExpiredDto, MaintenanceMode, MetricSeriesDto, ModelRunnerConnectionDto,
+    ModelRunnerStatusDto, NodeMembershipChangedDto, OtelLogDto, PackageDto, PasskeySummaryDto,
+    PlatformUserDto, PolicyFolioDto, PrStateChangedDto, ProblemDto, PromotedDto, RawMetricPointDto,
+    RepoDto, RepoListResponseDto, RepoSummaryDto, RoleFolioIndexDto, RoleSpecDto, RolledBackDto,
+    SmartscapeDto, StoreStatusDto, SubsystemId, SubsystemStatus, SubsystemStatusEntryDto,
+    TaintedDigestDto, TaintedDto, TopologyDto, TraceDto, UserProfileDto,
 };
 use mu_console_protocol::{
-    sanitize_ansi_log_lines, CanaryBundleState, CdLease, RepoId, DEFAULT_MAX_JOB_LOG_LINES,
+    sanitize_ansi_log_lines, CanaryBundleState, CdLease, ConsoleSkin, CrtFont, RepoId,
+    DEFAULT_MAX_JOB_LOG_LINES,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::store::Input;
 
-/// Which REST resource a fetch targets.
+/// Which REST resource or mutating endpoint a fetch targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchKind {
     Repos,
@@ -27,8 +31,17 @@ pub enum FetchKind {
     Summary(RepoId),
     Topology(RepoId),
     Deployments(RepoId),
+    CdRuns {
+        repo: RepoId,
+        ecosystem: Option<String>,
+        limit: u32,
+    },
     Gate(String),
     Leases,
+    AbRollback {
+        deployment_id: String,
+        note: Option<String>,
+    },
     RegPackages,
     RegCanaries,
     RegCasStatus,
@@ -39,12 +52,65 @@ pub enum FetchKind {
     ObsLogs,
     ObsMetrics,
     ObsStoreStatus,
+    ObsSubsystemStatus,
+    SetSubsystemMaintenance {
+        subsystem: SubsystemId,
+        mode: MaintenanceMode,
+        reason: Option<String>,
+        auto_clear_secs: Option<u64>,
+    },
     ObsIngressOverview,
     ObsIngressRoutes,
     ObsIngressUpstreams,
     ObsLogsQuery(String),
+    MrStatus,
+    MrConnection,
     AuthSession,
     AuthRedeem(String),
+    AuthProfile,
+    AuthProfilePut {
+        display_name: Option<String>,
+        preferred_skin: Option<ConsoleSkin>,
+        preferred_font: Option<CrtFont>,
+    },
+    AuthPasskeys,
+    AuthPasskeyRegisterFinish {
+        label: Option<String>,
+        attestation_json: String,
+    },
+    AuthPasskeyDelete {
+        credential_id: String,
+        step_up_assertion_json: String,
+    },
+    AuthEnableRole(String),
+    AuthDisableRole(String),
+    AuthElevateFinish {
+        role_id: String,
+        assertion_json: String,
+    },
+    AuthLockRoles,
+    AuthActivity,
+    AuthRoles,
+    AuthUpsertRole(RoleSpecDto),
+    AuthDeleteRole(String),
+    AuthFolios,
+    AuthUpsertFolio(PolicyFolioDto),
+    AuthDeleteFolio(String),
+    AuthRoleFolioIndex,
+    AuthUpdateRoleFolioIndex(RoleFolioIndexDto),
+    AuthUsers,
+    AuthUpdateUserRoles {
+        github_login: String,
+        bound_roles: Vec<String>,
+    },
+    AuthResetUserPasskeys(String),
+    AuthRevokeUser(String),
+    AuthInvites,
+    AuthCreateInvite {
+        note: Option<String>,
+        ttl_secs: Option<u64>,
+    },
+    AuthRevokeInvite(String),
     RestartJob(u64),
     ResumeJob(u64),
     JobDetail(u64),
@@ -116,6 +182,243 @@ enum JobsEnvelope {
         #[serde(default)]
         jobs: Vec<CiQueueJobRecordDto>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CdRunsEnvelope {
+    List(Vec<CdRunDto>),
+    Envelope {
+        #[serde(default)]
+        runs: Vec<CdRunDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PasskeysEnvelope {
+    List(Vec<PasskeySummaryDto>),
+    Envelope {
+        #[serde(default)]
+        passkeys: Vec<PasskeySummaryDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RolesEnvelope {
+    List(Vec<RoleSpecDto>),
+    Envelope {
+        #[serde(default)]
+        roles: Vec<RoleSpecDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FoliosEnvelope {
+    List(Vec<PolicyFolioDto>),
+    Envelope {
+        #[serde(default)]
+        folios: Vec<PolicyFolioDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UsersEnvelope {
+    List(Vec<PlatformUserDto>),
+    Envelope {
+        #[serde(default)]
+        users: Vec<PlatformUserDto>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InvitesEnvelope {
+    List(Vec<InviteRecordDto>),
+    Envelope {
+        #[serde(default)]
+        invites: Vec<InviteRecordDto>,
+    },
+}
+
+#[derive(Deserialize)]
+struct FlexSubsystemEntry {
+    #[serde(default, alias = "id")]
+    subsystem: SubsystemId,
+    #[serde(default, alias = "state")]
+    effective_status: Option<String>,
+    #[serde(default)]
+    probe_status: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    maintenance_active: Option<bool>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    updated_by: Option<String>,
+    #[serde(default)]
+    updated_at_ms: i64,
+    #[serde(default, alias = "expires_at_ms")]
+    auto_clear_at_ms: Option<i64>,
+    #[serde(default)]
+    active_incidents: u32,
+}
+
+fn parse_subsystem_status_str(raw: Option<&str>) -> SubsystemStatus {
+    match raw
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "in_maintenance" | "maintenance" => SubsystemStatus::InMaintenance,
+        "partial_maintenance" | "partial" => SubsystemStatus::PartialMaintenance,
+        "degraded" => SubsystemStatus::Degraded,
+        "offline" | "down" | "unhealthy" => SubsystemStatus::Offline,
+        _ => SubsystemStatus::Live,
+    }
+}
+
+fn parse_maintenance_mode_str(
+    raw: Option<&str>,
+    effective: SubsystemStatus,
+    maint_flag: Option<bool>,
+) -> MaintenanceMode {
+    match raw
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "scheduled_maintenance" => MaintenanceMode::Manual(SubsystemStatus::InMaintenance),
+        "partial_maintenance" => MaintenanceMode::Manual(SubsystemStatus::PartialMaintenance),
+        "offline_override" => MaintenanceMode::Manual(SubsystemStatus::Offline),
+        "manual" | "manual_override" => MaintenanceMode::Manual(effective),
+        _ if maint_flag == Some(true) => MaintenanceMode::Manual(effective),
+        _ => MaintenanceMode::Auto,
+    }
+}
+
+impl From<FlexSubsystemEntry> for SubsystemStatusEntryDto {
+    fn from(raw: FlexSubsystemEntry) -> Self {
+        let effective = parse_subsystem_status_str(raw.effective_status.as_deref());
+        let probe = raw
+            .probe_status
+            .as_deref()
+            .map_or(effective, |s| parse_subsystem_status_str(Some(s)));
+        let mode =
+            parse_maintenance_mode_str(raw.mode.as_deref(), effective, raw.maintenance_active);
+        Self {
+            subsystem: raw.subsystem,
+            effective_status: effective,
+            probe_status: probe,
+            mode,
+            summary: raw.summary.unwrap_or_default(),
+            updated_by: raw.updated_by,
+            updated_at_ms: u64::try_from(raw.updated_at_ms.max(0)).unwrap_or(0),
+            auto_clear_at_ms: raw
+                .auto_clear_at_ms
+                .and_then(|ms| u64::try_from(ms.max(0)).ok()),
+            active_incidents: raw.active_incidents,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FlexSubsystemsResponse {
+    Entries(Vec<SubsystemStatusEntryDto>),
+    ProtocolEnvelope {
+        #[serde(default)]
+        subsystems: Vec<SubsystemStatusEntryDto>,
+    },
+    FlexList(Vec<FlexSubsystemEntry>),
+    FlexEnvelope {
+        #[serde(default)]
+        subsystems: Vec<FlexSubsystemEntry>,
+    },
+}
+
+fn parse_subsystem_entries(body: &str) -> Result<Vec<SubsystemStatusEntryDto>, String> {
+    if let Ok(entries) = serde_json::from_str::<Vec<SubsystemStatusEntryDto>>(body) {
+        return Ok(entries);
+    }
+    match json::<FlexSubsystemsResponse>(body)? {
+        FlexSubsystemsResponse::Entries(v) => Ok(v),
+        FlexSubsystemsResponse::ProtocolEnvelope { subsystems } => Ok(subsystems),
+        FlexSubsystemsResponse::FlexList(v) => Ok(v.into_iter().map(Into::into).collect()),
+        FlexSubsystemsResponse::FlexEnvelope { subsystems } => {
+            Ok(subsystems.into_iter().map(Into::into).collect())
+        }
+    }
+}
+
+fn parse_subsystem_entry(body: &str) -> Result<SubsystemStatusEntryDto, String> {
+    if let Ok(wrapped) =
+        serde_json::from_str::<mu_console_protocol::SubsystemStatusChangedDto>(body)
+    {
+        return Ok(wrapped.entry);
+    }
+    if let Ok(entry) = serde_json::from_str::<SubsystemStatusEntryDto>(body) {
+        return Ok(entry);
+    }
+    Ok(json::<FlexSubsystemEntry>(body)?.into())
+}
+
+fn parse_passkey_finish_body(body: &str) -> Result<Input, String> {
+    let val = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        json::<serde_json::Value>(body)?
+    };
+    if let Some(session_val) = val.get("session") {
+        let dto: AuthSessionDto =
+            serde_json::from_value(session_val.clone()).map_err(|e| e.to_string())?;
+        return Ok(Input::AuthSession(dto));
+    }
+    if val.get("authenticated").is_some()
+        || val.get("active_roles").is_some()
+        || val.get("active_policies").is_some()
+    {
+        let dto: AuthSessionDto = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        return Ok(Input::AuthSession(dto));
+    }
+    if val.get("passkeys").is_some() && val.get("github_login").is_some() {
+        let profile: UserProfileDto = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        return Ok(Input::UserProfile(profile));
+    }
+    if val.get("credential_id").is_some() {
+        let summary: PasskeySummaryDto = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        return Ok(Input::PasskeyEnrolled(Some(summary)));
+    }
+    Ok(Input::PasskeyEnrolled(None))
+}
+
+fn parse_passkey_delete_body(credential_id: &str, body: &str) -> Result<Input, String> {
+    if body.trim().is_empty() {
+        return Ok(Input::PasskeyDeleted(credential_id.to_owned()));
+    }
+    let val: serde_json::Value = json(body)?;
+    if let Some(session_val) = val.get("session") {
+        let dto: AuthSessionDto =
+            serde_json::from_value(session_val.clone()).map_err(|e| e.to_string())?;
+        return Ok(Input::AuthSession(dto));
+    }
+    if val.get("authenticated").is_some() {
+        let dto: AuthSessionDto = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        return Ok(Input::AuthSession(dto));
+    }
+    if val.get("passkeys").is_some() && val.get("github_login").is_some() {
+        let profile: UserProfileDto = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        return Ok(Input::UserProfile(profile));
+    }
+    Ok(Input::PasskeyDeleted(credential_id.to_owned()))
 }
 
 #[derive(Deserialize)]
@@ -514,9 +817,12 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             };
             Input::ObsLogsQueryResult(list)
         }
-        FetchKind::AuthSession | FetchKind::AuthRedeem(_) => {
-            Input::AuthSession(parse_auth_session(body.as_bytes())?)
-        }
+        FetchKind::AuthSession
+        | FetchKind::AuthRedeem(_)
+        | FetchKind::AuthEnableRole(_)
+        | FetchKind::AuthDisableRole(_)
+        | FetchKind::AuthElevateFinish { .. }
+        | FetchKind::AuthLockRoles => Input::AuthSession(parse_auth_session(body.as_bytes())?),
         FetchKind::RestartJob(job_id) => Input::JobRestarted(*job_id),
         FetchKind::ResumeJob(job_id) => Input::JobResumed(*job_id),
         FetchKind::JobDetail(_) => {
@@ -526,6 +832,145 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             job_id: *job_id,
             lines: sanitize_ansi_log_lines(body, DEFAULT_MAX_JOB_LOG_LINES),
         },
+        other => return parse_m2_fetch(other, body),
+    })
+}
+
+fn parse_m2_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
+    Ok(match kind {
+        FetchKind::CdRuns { .. } => {
+            let runs = match json::<CdRunsEnvelope>(body)? {
+                CdRunsEnvelope::List(v) => v,
+                CdRunsEnvelope::Envelope { runs } => runs,
+            };
+            Input::CdRuns(runs)
+        }
+        FetchKind::AbRollback { .. } => {
+            Input::AbRollbackResult(json::<AbRollbackResponseDto>(body)?)
+        }
+        FetchKind::ObsSubsystemStatus => Input::ObsSubsystemStatus(parse_subsystem_entries(body)?),
+        FetchKind::SetSubsystemMaintenance { .. } => {
+            Input::SubsystemStatusChanged(parse_subsystem_entry(body)?)
+        }
+        FetchKind::MrStatus => Input::MrStatus(json::<ModelRunnerStatusDto>(body)?),
+        FetchKind::MrConnection => Input::MrConnection(json::<ModelRunnerConnectionDto>(body)?),
+        FetchKind::AuthProfile | FetchKind::AuthProfilePut { .. } => {
+            Input::UserProfile(json::<UserProfileDto>(body)?)
+        }
+        FetchKind::AuthPasskeys => {
+            let list = match json::<PasskeysEnvelope>(body)? {
+                PasskeysEnvelope::List(v) => v,
+                PasskeysEnvelope::Envelope { passkeys } => passkeys,
+            };
+            Input::Passkeys(list)
+        }
+        FetchKind::AuthPasskeyRegisterFinish { .. } => parse_passkey_finish_body(body)?,
+        FetchKind::AuthPasskeyDelete { credential_id, .. } => {
+            parse_passkey_delete_body(credential_id, body)?
+        }
+        FetchKind::AuthActivity => {
+            let trimmed = body.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = json::<serde_json::Value>(trimmed) {
+                    if val.get("authenticated").is_some() || val.get("leases").is_some() {
+                        return Ok(Input::AuthSession(
+                            serde_json::from_value(val).map_err(|e| e.to_string())?,
+                        ));
+                    }
+                }
+            }
+            Input::UserActivityRecorded
+        }
+        FetchKind::AuthRoles => {
+            let list = match json::<RolesEnvelope>(body)? {
+                RolesEnvelope::List(v) => v,
+                RolesEnvelope::Envelope { roles } => roles,
+            };
+            Input::PlatformRoles(list)
+        }
+        FetchKind::AuthUpsertRole(fallback) => {
+            if let Ok(spec) = serde_json::from_str::<RoleSpecDto>(body) {
+                Input::RoleSpecUpserted(spec)
+            } else if let Ok(val) = json::<serde_json::Value>(body) {
+                if let Some(role) = val.get("role") {
+                    Input::RoleSpecUpserted(
+                        serde_json::from_value(role.clone()).map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    Input::RoleSpecUpserted(fallback.clone())
+                }
+            } else {
+                Input::RoleSpecUpserted(fallback.clone())
+            }
+        }
+        FetchKind::AuthDeleteRole(id) => Input::RoleSpecDeleted(id.clone()),
+        FetchKind::AuthFolios => {
+            let list = match json::<FoliosEnvelope>(body)? {
+                FoliosEnvelope::List(v) => v,
+                FoliosEnvelope::Envelope { folios } => folios,
+            };
+            Input::PlatformFolios(list)
+        }
+        FetchKind::AuthUpsertFolio(fallback) => {
+            if let Ok(folio) = serde_json::from_str::<PolicyFolioDto>(body) {
+                Input::PolicyFolioUpserted(folio)
+            } else if let Ok(val) = json::<serde_json::Value>(body) {
+                if let Some(folio) = val.get("folio") {
+                    Input::PolicyFolioUpserted(
+                        serde_json::from_value(folio.clone()).map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    Input::PolicyFolioUpserted(fallback.clone())
+                }
+            } else {
+                Input::PolicyFolioUpserted(fallback.clone())
+            }
+        }
+        FetchKind::AuthDeleteFolio(id) => Input::PolicyFolioDeleted(id.clone()),
+        FetchKind::AuthRoleFolioIndex => {
+            Input::PlatformRoleFolioIndex(json::<RoleFolioIndexDto>(body)?)
+        }
+        FetchKind::AuthUpdateRoleFolioIndex(fallback) => {
+            if let Ok(idx) = serde_json::from_str::<RoleFolioIndexDto>(body) {
+                Input::RoleFolioIndexUpdated(idx)
+            } else {
+                Input::RoleFolioIndexUpdated(fallback.clone())
+            }
+        }
+        FetchKind::AuthUsers => {
+            let list = match json::<UsersEnvelope>(body)? {
+                UsersEnvelope::List(v) => v,
+                UsersEnvelope::Envelope { users } => users,
+            };
+            Input::PlatformUsers(list)
+        }
+        FetchKind::AuthUpdateUserRoles {
+            github_login,
+            bound_roles,
+        } => {
+            if let Ok(user) = serde_json::from_str::<PlatformUserDto>(body) {
+                Input::PlatformUsersUpsert(user)
+            } else {
+                Input::UserRolesUpdated {
+                    github_login: github_login.clone(),
+                    bound_roles: bound_roles.clone(),
+                }
+            }
+        }
+        FetchKind::AuthResetUserPasskeys(login) => Input::UserPasskeysReset(login.clone()),
+        FetchKind::AuthRevokeUser(login) => Input::UserRevoked(login.clone()),
+        FetchKind::AuthInvites => {
+            let list = match json::<InvitesEnvelope>(body)? {
+                InvitesEnvelope::List(v) => v,
+                InvitesEnvelope::Envelope { invites } => invites,
+            };
+            Input::PlatformInvites(list)
+        }
+        FetchKind::AuthCreateInvite { .. } => {
+            Input::InviteCreated(json::<CreatedInviteResponseDto>(body)?)
+        }
+        FetchKind::AuthRevokeInvite(id) => Input::InviteRevoked(id.clone()),
+        _ => unreachable!("handled in parse_fetch"),
     })
 }
 
@@ -602,6 +1047,9 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
             Input::ObsProblemEvent(problem)
         }
         (StreamId::Obs, "ingress_changed") => Input::ObsIngressChanged,
+        (StreamId::Obs, "subsystem_status_changed") => {
+            Input::SubsystemStatusChanged(parse_subsystem_entry(data)?)
+        }
         (StreamId::Obs, "heartbeat") => return Ok(None),
         _ => return Ok(None),
     };
@@ -1267,5 +1715,189 @@ pub(crate) mod tests {
         let ev =
             parse_event(StreamId::Obs, "log_entry", sse_entry_json).expect("parse stream event");
         assert!(matches!(ev, Some(Input::ObsLogEntry(entry)) if entry.service == "mu-sse"));
+    }
+
+    #[test]
+    fn m2_phase3_contract_samples_and_subsystem_sse_deserialize() {
+        use mu_console_protocol::{
+            CdEcosystem, CdRunState, ConsoleSkin, CrtFont, MaintenanceMode, Slot, SubsystemId,
+            SubsystemStatus,
+        };
+
+        // Both mu-observable-hub ("mode": "manual", "effective_status": "in-maintenance",
+        // "updated_at_ms": ...) and mu-console-protocol SubsystemStatusEntryDto deserialize uniformly.
+        let hub_subsystems_json = r#"{
+          "subsystems": [
+            {
+              "subsystem": "ci",
+              "effective_status": "live",
+              "probe_status": "live",
+              "mode": "auto",
+              "maintenance_active": false,
+              "summary": "All runners nominal",
+              "updated_at_ms": 1794000000000
+            },
+            {
+              "subsystem": "cd",
+              "effective_status": "in-maintenance",
+              "probe_status": "live",
+              "mode": "manual",
+              "maintenance_active": true,
+              "summary": "Planned release cutover",
+              "updated_by": "operator",
+              "updated_at_ms": 1794000001000,
+              "active_incidents": 0
+            }
+          ]
+        }"#;
+        let Input::ObsSubsystemStatus(subsystems) =
+            parse_fetch(&FetchKind::ObsSubsystemStatus, hub_subsystems_json)
+                .expect("obs subsystems")
+        else {
+            panic!("expected ObsSubsystemStatus");
+        };
+        assert_eq!(subsystems.len(), 2);
+        assert_eq!(subsystems[0].subsystem, SubsystemId::Ci);
+        assert_eq!(subsystems[0].effective_status, SubsystemStatus::Live);
+        assert_eq!(subsystems[0].mode, MaintenanceMode::Auto);
+        assert_eq!(subsystems[1].subsystem, SubsystemId::Cd);
+        assert_eq!(
+            subsystems[1].effective_status,
+            SubsystemStatus::InMaintenance
+        );
+        assert_eq!(
+            subsystems[1].mode,
+            MaintenanceMode::Manual(SubsystemStatus::InMaintenance)
+        );
+        assert_eq!(subsystems[1].updated_by.as_deref(), Some("operator"));
+
+        let sse_sub = r#"{
+          "subsystem": "repository",
+          "effective_status": "degraded",
+          "probe_status": "degraded",
+          "mode": "auto",
+          "summary": "CAS scrub latency elevated",
+          "updated_at_ms": 1794000005000
+        }"#;
+        let ev =
+            parse_event(StreamId::Obs, "subsystem_status_changed", sse_sub).expect("subsystem SSE");
+        assert!(matches!(
+            ev,
+            Some(Input::SubsystemStatusChanged(e))
+                if e.subsystem == SubsystemId::Repository
+                    && e.effective_status == SubsystemStatus::Degraded
+        ));
+
+        let cd_runs_json = r#"[{
+          "run_id": "run-cargo-42",
+          "ecosystem": "cargo",
+          "repo": { "owner": "LMA1980", "repo": "mu-console" },
+          "ref_name": "main",
+          "commit_sha": "abc12345",
+          "state": "failed",
+          "started_epoch_ms": 1794000000000,
+          "steps": [{
+            "step_id": "publish-mu-registry",
+            "label": "Publish to MuRegist",
+            "state": "failed",
+            "duration_ms": 840,
+            "failed_package": "mu-console-protocol",
+            "exit_code": 1
+          }],
+          "ab_deployment_id": "dep-42",
+          "artifact_digest": "sha256:9f82c01a334e"
+        }]"#;
+        let Input::CdRuns(runs) = parse_fetch(
+            &FetchKind::CdRuns {
+                repo: RepoId::new("LMA1980", "mu-console"),
+                ecosystem: None,
+                limit: 25,
+            },
+            cd_runs_json,
+        )
+        .expect("cd runs") else {
+            panic!("expected CdRuns");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].ecosystem, CdEcosystem::Cargo);
+        assert_eq!(runs[0].state, CdRunState::Failed);
+
+        let rollback_json = r#"{
+          "deployment_id": "dep-42",
+          "restored_slot": "a",
+          "tainted_digest": "sha256:bad999"
+        }"#;
+        let Input::AbRollbackResult(rb) = parse_fetch(
+            &FetchKind::AbRollback {
+                deployment_id: "dep-42".into(),
+                note: Some("canary regression".into()),
+            },
+            rollback_json,
+        )
+        .expect("rollback response") else {
+            panic!("expected AbRollbackResult");
+        };
+        assert_eq!(rb.restored_slot, Slot::A);
+        assert_eq!(rb.tainted_digest.as_deref(), Some("sha256:bad999"));
+
+        let mr_status_json = r#"{
+          "total_queue_depth": 2,
+          "is_executing": true,
+          "estimated_wait_ms": 420,
+          "mlock_used_bytes": 12000000000,
+          "memlock_ceiling_bytes": 30064771072,
+          "models": [{ "model_id": "qwen2.5-coder-7b", "resident_bytes": 8000000000, "state": "loaded" }]
+        }"#;
+        let Input::MrStatus(mr) =
+            parse_fetch(&FetchKind::MrStatus, mr_status_json).expect("mr status")
+        else {
+            panic!("expected MrStatus");
+        };
+        assert_eq!(mr.total_queue_depth, 2);
+        assert!(mr.is_executing);
+
+        let mr_conn_json = r#"{
+          "openai_base_url": "https://192.0.2.10/v1",
+          "openai_routes": ["/v1/chat/completions", "/v1/models"],
+          "auth_header_guide": "Authorization: Bearer <token>",
+          "wireguard_endpoint": "192.0.2.10:51820",
+          "tunnel_cidr": "198.51.100.0/24",
+          "interface_state": "up",
+          "peers": [{ "public_key_prefix": "ab12cd34", "allowed_ips": "198.51.100.2/32" }]
+        }"#;
+        let Input::MrConnection(conn) =
+            parse_fetch(&FetchKind::MrConnection, mr_conn_json).expect("mr conn")
+        else {
+            panic!("expected MrConnection");
+        };
+        assert_eq!(conn.interface_state, "up");
+        assert_eq!(conn.peers.len(), 1);
+
+        let profile_json = r#"{
+          "github_login": "LMA1980",
+          "display_name": "Lead Operator",
+          "preferences": { "skin": "wireframe", "font": "OpenDyslexic" },
+          "passkey_count": 2
+        }"#;
+        let Input::UserProfile(profile) =
+            parse_fetch(&FetchKind::AuthProfile, profile_json).expect("auth profile")
+        else {
+            panic!("expected UserProfile");
+        };
+        assert_eq!(profile.preferences.skin, ConsoleSkin::Wireframe);
+        assert_eq!(profile.preferences.font, CrtFont::OpenDyslexic);
+        assert_eq!(profile.passkey_count, 2);
+
+        let folios_json = r#"{
+          "folios": [{ "id": "folio:ci:read", "display_name": "CI Read", "policies": ["ci:queue.read", "ci:jobs.read"] }],
+          "policies": [{ "id": "ci:queue.read", "subsystem": "ci", "description": "Read CI queue" }]
+        }"#;
+        let Input::PlatformFolios(folios) =
+            parse_fetch(&FetchKind::AuthFolios, folios_json).expect("auth folios")
+        else {
+            panic!("expected PlatformFolios");
+        };
+        assert_eq!(folios.len(), 1);
+        assert_eq!(folios[0].policies.len(), 2);
     }
 }
