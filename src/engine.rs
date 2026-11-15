@@ -1296,6 +1296,8 @@ impl Engine {
             Ok(b) => b,
             Err(e) => {
                 // Non-fatal 404/502/503 on optional auxiliary daemon probes.
+                // `FetchKind::AuthSession` is excluded so cold-boot auth probe failures
+                // always surface `DataEvent::Error` instead of leaving the UI stuck.
                 let is_optional_probe = matches!(
                     kind,
                     FetchKind::Deployments(_)
@@ -1304,7 +1306,6 @@ impl Engine {
                         | FetchKind::Leases
                         | FetchKind::ClusterNodes
                         | FetchKind::CiQueue
-                        | FetchKind::AuthSession
                         | FetchKind::AuthProfile
                         | FetchKind::AuthPasskeys
                         | FetchKind::AuthActivity
@@ -1348,9 +1349,21 @@ impl Engine {
                 if !((is_optional_probe && matches!(e.status, 404 | 502 | 503))
                     || is_auth_gated_log)
                 {
+                    let message = if matches!(kind, FetchKind::AuthSession) {
+                        let trimmed = e.message.trim();
+                        if trimmed.is_empty() {
+                            "GET /api/auth/session".to_owned()
+                        } else if trimmed.contains("/api/auth/session") {
+                            trimmed.to_owned()
+                        } else {
+                            format!("GET /api/auth/session: {trimmed}")
+                        }
+                    } else {
+                        e.message
+                    };
                     fx.push(Effect::Post(DataEvent::Error(UiError::Http {
                         status: e.status,
-                        message: e.message,
+                        message,
                     })));
                 }
                 return fx;

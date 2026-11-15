@@ -2359,3 +2359,66 @@ fn timed_elevation_refreshes_active_subview_and_elective_toggle_prunes_non_timed
     assert!(v_final.auth.has_policy("ci:queue.read"));
     assert!(v_final.auth.has_policy("ci:repos.public.read"));
 }
+
+#[test]
+fn auth_session_probe_http_failure_surfaces_error_and_stays_fail_closed() {
+    let mut eng = Engine::new(308);
+    let init_fx = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    assert!(init_fx.contains(&Effect::Fetch {
+        kind: FetchKind::AuthSession,
+        url: "/api/auth/session".into(),
+    }));
+
+    for (ts, status, raw_msg, expected_msg) in [
+        (50_u64, 404_u32, "", "GET /api/auth/session"),
+        (
+            100_u64,
+            503_u32,
+            "Service Unavailable",
+            "GET /api/auth/session: Service Unavailable",
+        ),
+        (
+            150_u64,
+            0_u32,
+            "network timeout",
+            "GET /api/auth/session: network timeout",
+        ),
+    ] {
+        let err_fx = eng.on_fetch(
+            &FetchKind::AuthSession,
+            Err(HttpError {
+                status,
+                message: raw_msg.into(),
+            }),
+            ts,
+        );
+        assert!(
+            err_fx.iter().any(|e| matches!(
+                e,
+                Effect::Post(DataEvent::Error(UiError::Http { status: s, message }))
+                    if *s == status && message == expected_msg
+            )),
+            "expected DataEvent::Error(UiError::Http {{ status: {status}, message: {expected_msg:?} }}), got {err_fx:?}"
+        );
+        assert_eq!(eng.store().auth().status, AuthStatus::Unresolved);
+        assert!(!eng.store().can_emit_operational_data());
+        assert!(!err_fx.contains(&Effect::LoadOffline));
+        assert!(!err_fx
+            .iter()
+            .any(|e| matches!(e, Effect::OpenStream { .. } | Effect::Fetch { .. })));
+    }
+
+    let retry_fx = eng.handle(UiCommand::Retry, 200);
+    assert!(retry_fx.contains(&Effect::Fetch {
+        kind: FetchKind::AuthSession,
+        url: "/api/auth/session".into(),
+    }));
+    assert!(!retry_fx.iter().any(
+        |e| matches!(e, Effect::OpenStream { .. } | Effect::LoadOffline)
+            || matches!(e, Effect::Fetch { kind, .. } if !matches!(kind, FetchKind::AuthSession))
+    ));
+
+    let ok_fx = resolve_operator_session(&mut eng, 250);
+    assert_eq!(eng.store().auth().status, AuthStatus::Active);
+    assert!(ok_fx.contains(&Effect::LoadOffline));
+}
