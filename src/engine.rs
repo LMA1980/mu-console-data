@@ -35,6 +35,8 @@ pub const SELECT_SETTLE_MS: u64 = 350;
 pub const LIVE_ACTIVE_JOB_POLL_MS: u64 = 2_000;
 /// Minimum interval (ms) between `/api/auth/activity` heartbeats for timed role idle timers.
 pub const ACTIVITY_HEARTBEAT_MS: u64 = 5_000;
+/// Minimum duration (ms) an SSE connection must stay open before its backoff resets.
+pub const MIN_STABLE_STREAM_MS: u64 = 5_000;
 
 /// Side effect for the browser glue to execute.
 #[allow(clippy::large_enum_variant)]
@@ -73,6 +75,7 @@ struct StreamState {
     parser: SseParser,
     backoff: Backoff,
     open: bool,
+    opened_at: Option<u64>,
     reconnect_at: Option<u64>,
 }
 
@@ -82,6 +85,7 @@ impl StreamState {
             parser: SseParser::new(),
             backoff: Backoff::new(seed),
             open: false,
+            opened_at: None,
             reconnect_at: None,
         }
     }
@@ -688,6 +692,7 @@ impl Engine {
                     let can_open = self.can_open_stream(s);
                     let st = &mut self.streams[s.index()];
                     st.backoff.reset();
+                    st.opened_at = None;
                     if can_open && !st.open {
                         st.reconnect_at = None;
                         self.open_stream(s, fx);
@@ -904,6 +909,7 @@ impl Engine {
             if !self.can_open_stream(s) {
                 let st = &mut self.streams[s.index()];
                 st.reconnect_at = None;
+                st.opened_at = None;
                 if st.open {
                     st.open = false;
                     fx.push(Effect::CloseStream(s));
@@ -943,7 +949,9 @@ impl Engine {
         }
         for s in StreamId::ALL {
             if self.can_open_stream(s) && !self.streams[s.index()].open {
-                self.streams[s.index()].backoff.reset();
+                let st = &mut self.streams[s.index()];
+                st.backoff.reset();
+                st.opened_at = None;
                 self.open_stream(s, fx);
             }
         }
@@ -1167,6 +1175,7 @@ impl Engine {
         let st = &mut self.streams[s.index()];
         st.parser.reset_connection();
         st.reconnect_at = None;
+        st.opened_at = None;
         fx.push(Effect::OpenStream {
             stream: s,
             url: self.config.url(path),
@@ -1504,7 +1513,7 @@ impl Engine {
         let mut fx = Vec::new();
         let st = &mut self.streams[s.index()];
         st.open = true;
-        st.backoff.reset();
+        st.opened_at = Some(now_ms);
         st.reconnect_at = None;
         self.update_conn(now_ms, &mut fx);
         fx
@@ -1571,9 +1580,16 @@ impl Engine {
         let can_open = self.can_open_stream(s);
         let st = &mut self.streams[s.index()];
         st.open = false;
+        let was_stable = st
+            .opened_at
+            .take()
+            .is_some_and(|t| now_ms.saturating_sub(t) >= MIN_STABLE_STREAM_MS);
         if !can_open {
             st.reconnect_at = None;
             return fx;
+        }
+        if was_stable {
+            st.backoff.reset();
         }
         let delay = st.backoff.next_delay_ms();
         let attempt = st.backoff.attempt();
@@ -1642,6 +1658,13 @@ impl Engine {
             Mode::Scenario => self.play(now_ms),
             Mode::Live => {
                 for s in StreamId::ALL {
+                    if self.streams[s.index()].open
+                        && self.streams[s.index()]
+                            .opened_at
+                            .is_some_and(|t| now_ms.saturating_sub(t) >= MIN_STABLE_STREAM_MS)
+                    {
+                        self.streams[s.index()].backoff.reset();
+                    }
                     if self.can_open_stream(s)
                         && self.streams[s.index()]
                             .reconnect_at

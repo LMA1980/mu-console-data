@@ -14,7 +14,9 @@ use mu_console_protocol::{
 use crate::api::tests::{GATE, REPOS, TOPOLOGY};
 use crate::api::{FetchKind, StreamId};
 use crate::coalesce::{HEARTBEAT_MS, MIN_INTERVAL_MS};
-use crate::engine::{Effect, Engine, HttpError, OFFLINE_AFTER_ATTEMPTS, SELECT_SETTLE_MS};
+use crate::engine::{
+    Effect, Engine, HttpError, MIN_STABLE_STREAM_MS, OFFLINE_AFTER_ATTEMPTS, SELECT_SETTLE_MS,
+};
 use crate::offline::{OfflineSnapshot, SAVE_INTERVAL_MS};
 use crate::scenario::{offline_snapshot, Scenario, OWNER, SUPERPROJECT};
 use crate::store::FADE_MS;
@@ -2421,4 +2423,90 @@ fn auth_session_probe_http_failure_surfaces_error_and_stays_fail_closed() {
     let ok_fx = resolve_operator_session(&mut eng, 250);
     assert_eq!(eng.store().auth().status, AuthStatus::Active);
     assert!(ok_fx.contains(&Effect::LoadOffline));
+}
+
+#[test]
+fn live_fetch_and_sse_short_lived_eof_backs_off_until_stable() {
+    let mut eng = Engine::new(77);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    resolve_operator_session(&mut eng, 5);
+    // Keep has_live_data() true so repeated closes report ConnState::Reconnecting.
+    eng.on_fetch(&FetchKind::Repos, Ok(REPOS.into()), 6);
+
+    let mut now_ms = 10;
+    let mut prev_delay_ms = 0;
+
+    for expected_attempt in 1..=4 {
+        let open_fx = eng.on_stream_open(StreamId::Obs, now_ms);
+        assert!(open_fx.contains(&Effect::Post(DataEvent::Connection(ConnState::Live))));
+
+        // Immediate EOF after 10ms must preserve exponential backoff across reconnects.
+        let close_ms = now_ms + 10;
+        let close_fx = eng.on_stream_closed(StreamId::Obs, None, close_ms);
+        let (attempt, retry_in_ms) = close_fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Post(DataEvent::Connection(ConnState::Reconnecting {
+                    attempt,
+                    retry_in_ms,
+                })) => Some((*attempt, *retry_in_ms)),
+                _ => None,
+            })
+            .expect("ConnState::Reconnecting emitted");
+
+        assert_eq!(attempt, expected_attempt);
+        assert!(
+            retry_in_ms > prev_delay_ms,
+            "attempt {attempt} delay {retry_in_ms}ms should exceed prior {prev_delay_ms}ms"
+        );
+        if expected_attempt == 4 {
+            assert!(
+                retry_in_ms >= 3_200,
+                "expected exponential growth by attempt 4, got {retry_in_ms}ms"
+            );
+        }
+        prev_delay_ms = retry_in_ms;
+
+        // Reconnect remains suppressed 1ms before due time and fires at `reconnect_at`.
+        let before_due = close_ms + u64::from(retry_in_ms) - 1;
+        let before_fx = eng.tick(before_due);
+        assert!(!before_fx.iter().any(|e| matches!(
+            e,
+            Effect::OpenStream {
+                stream: StreamId::Obs,
+                ..
+            }
+        )));
+
+        now_ms = close_ms + u64::from(retry_in_ms);
+        let due_fx = eng.tick(now_ms);
+        assert!(due_fx.iter().any(|e| matches!(
+            e,
+            Effect::OpenStream {
+                stream: StreamId::Obs,
+                ..
+            }
+        )));
+    }
+
+    // Holding open >= MIN_STABLE_STREAM_MS resets backoff on the subsequent close.
+    eng.on_stream_open(StreamId::Obs, now_ms);
+    let stable_close_ms = now_ms + MIN_STABLE_STREAM_MS + 100;
+    eng.tick(now_ms + MIN_STABLE_STREAM_MS);
+    let stable_close_fx = eng.on_stream_closed(StreamId::Obs, None, stable_close_ms);
+    let (reset_attempt, reset_delay_ms) = stable_close_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Post(DataEvent::Connection(ConnState::Reconnecting {
+                attempt,
+                retry_in_ms,
+            })) => Some((*attempt, *retry_in_ms)),
+            _ => None,
+        })
+        .expect("ConnState::Reconnecting emitted after stable close");
+    assert_eq!(reset_attempt, 1);
+    assert!(
+        (400..=600).contains(&reset_delay_ms),
+        "expected reset base backoff in 400..=600ms, got {reset_delay_ms}ms"
+    );
 }
