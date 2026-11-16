@@ -1290,31 +1290,76 @@ fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
         .is_empty());
     assert_eq!(eng.store().badges(), AreaBadges::default());
 
-    // 2. Authenticated 0-Passkey session opens non-dismissible PasskeyEnrollmentGate,
-    // blocks non-auth REST/LoadOffline/SSE, permits auth profile & passkey enrollment,
-    // and unblocks once Passkey enrollment + session refresh completes.
+    // 2a. Authenticated 0-Passkey session WITH anonymous_lockdown opens PasskeyEnrollmentGate,
+    // suppresses LoadOffline/SSE/non-auth REST, yet allows dismiss and Passkey registration.
+    let locked_zero_pk_json = r#"{
+        "authenticated": true,
+        "github_login": "alice",
+        "invite_bound": true,
+        "passkey_count": 0,
+        "passkey_enrollment_required": true,
+        "anonymous_lockdown": true,
+        "baseline_role": "operator",
+        "bound_roles": ["operator"],
+        "active_policies": []
+    }"#;
+    let locked_gate_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(locked_zero_pk_json.into()), 25);
+    assert!(!locked_gate_fx.contains(&Effect::LoadOffline));
+    assert!(!locked_gate_fx
+        .iter()
+        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(!locked_gate_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch { kind, .. }
+            if !matches!(
+                kind,
+                FetchKind::AuthSession | FetchKind::AuthPasskeys
+            )
+    )));
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::PasskeyEnrollmentGate(ref g)) if g.github_login == "alice" && g.passkey_count == 0
+    ));
+
+    // 2b. Authenticated 0-Passkey session WITHOUT anonymous_lockdown opens PasskeyEnrollmentGate
+    // as a dismissible guiding modal, permits baseline public reads/streams, withholds LoadOffline
+    // and operator/private endpoints, and unblocks full workspace on Passkey enrollment.
     let zero_pk_json = r#"{
         "authenticated": true,
         "github_login": "alice",
         "invite_bound": true,
         "passkey_count": 0,
         "passkey_enrollment_required": true,
+        "anonymous_lockdown": false,
         "baseline_role": "operator",
         "bound_roles": ["operator"],
         "active_policies": []
     }"#;
     let gate_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(zero_pk_json.into()), 30);
     assert!(!gate_fx.contains(&Effect::LoadOffline));
-    assert!(!gate_fx
-        .iter()
-        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(gate_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Ci,
+            ..
+        }
+    )));
+    assert!(gate_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
     assert!(!gate_fx.iter().any(|e| matches!(
         e,
-        Effect::Fetch { kind, .. }
-            if !matches!(
-                kind,
-                FetchKind::AuthSession | FetchKind::AuthProfile | FetchKind::AuthPasskeys
-            )
+        Effect::Fetch {
+            kind: FetchKind::ClusterNodes
+                | FetchKind::ObsLogs
+                | FetchKind::RegPackages
+                | FetchKind::AuthProfile,
+            ..
+        }
     )));
 
     let v_gate = eng.store().view();
@@ -1324,12 +1369,9 @@ fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
         Some(DialogModel::PasskeyEnrollmentGate(ref g)) if g.github_login == "alice" && g.passkey_count == 0
     ));
 
-    // CloseDialog cannot dismiss PasskeyEnrollmentGate.
+    // CloseDialog dismisses PasskeyEnrollmentGate while operator-only subviews remain gated.
     eng.handle(UiCommand::CloseDialog, 40);
-    assert!(matches!(
-        eng.store().view().active_dialog,
-        Some(DialogModel::PasskeyEnrollmentGate(_))
-    ));
+    assert!(eng.store().view().active_dialog.is_none());
     assert!(eng
         .handle(
             UiCommand::SelectSubView(SubView::Repository(RepositorySubView::Packages)),
@@ -1337,7 +1379,29 @@ fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
         )
         .is_empty());
 
-    // Profile queries and Passkey enrollment DO dispatch in 0-Passkey state.
+    // Opening UserProfile in 0-Passkey mode skips 403-gated AuthProfile while fetching AuthPasskeys.
+    let profile_fx = eng.handle(
+        UiCommand::OpenDialog(DialogModel::UserProfile(Default::default())),
+        48,
+    );
+    assert!(profile_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthPasskeys,
+            ..
+        }
+    )));
+    assert!(!profile_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthProfile,
+            ..
+        }
+    )));
+    eng.handle(UiCommand::CloseDialog, 49);
+    assert!(eng.store().view().active_dialog.is_none());
+
+    // Passkey enrollment DOES dispatch in 0-Passkey state.
     let enroll_fx = eng.handle(
         UiCommand::EnrollPasskey {
             label: Some("YubiKey".into()),
@@ -1381,8 +1445,8 @@ fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
     assert!(unlock_fx.contains(&Effect::LoadOffline));
     assert!(unlock_fx.iter().any(|e| matches!(
         e,
-        Effect::OpenStream {
-            stream: StreamId::Ci,
+        Effect::Fetch {
+            kind: FetchKind::ClusterNodes,
             ..
         }
     )));
@@ -1407,9 +1471,14 @@ fn auth_passkey_register_finish_with_session_envelope_bootstraps_streams_and_rep
         "active_policies": []
     }"#;
     let gate_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(zero_pk_json.into()), 10);
-    assert!(!gate_fx
-        .iter()
-        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(!gate_fx.contains(&Effect::LoadOffline));
+    assert!(!gate_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ClusterNodes,
+            ..
+        }
+    )));
     assert!(matches!(
         eng.store().view().active_dialog,
         Some(DialogModel::PasskeyEnrollmentGate(_))
@@ -1429,7 +1498,7 @@ fn auth_passkey_register_finish_with_session_envelope_bootstraps_streams_and_rep
             "baseline_role": "operator",
             "bound_roles": ["operator"],
             "active_roles": [{"id": "operator"}],
-            "active_policies": ["system:status.read", "ci:repos.public.read", "ci:queue.read"]
+            "active_policies": ["system:status.read", "ci:repos.public.read", "ci:repos.private.read", "ci:queue.read", "ci:nodes.read"]
         }
     }"#;
     let finish_fx = eng.on_fetch(
@@ -1446,13 +1515,6 @@ fn auth_passkey_register_finish_with_session_envelope_bootstraps_streams_and_rep
     assert!(finish_fx.contains(&Effect::LoadOffline));
     assert!(finish_fx.iter().any(|e| matches!(
         e,
-        Effect::OpenStream {
-            stream: StreamId::Ci,
-            ..
-        }
-    )));
-    assert!(finish_fx.iter().any(|e| matches!(
-        e,
         Effect::Fetch {
             kind: FetchKind::Repos,
             ..
@@ -1461,7 +1523,7 @@ fn auth_passkey_register_finish_with_session_envelope_bootstraps_streams_and_rep
     assert!(finish_fx.iter().any(|e| matches!(
         e,
         Effect::Fetch {
-            kind: FetchKind::CiQueue,
+            kind: FetchKind::ClusterNodes,
             ..
         }
     )));
