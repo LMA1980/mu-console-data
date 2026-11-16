@@ -29,9 +29,9 @@ use mu_console_protocol::{
     OtelLogEntry, PackageEcosystem, ParentRef, PasskeyEnrollmentGateModel, PrState,
     ProblemCategory, PurePathTrace, RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus,
     RepoTopology, RoleActivationDto, RoleBadgeView, RoleLeaseView, RollbackReason,
-    SandboxProfileSummary, Selection, SidingPhase, SloProblem, Slot, SmartscapeEdge,
-    SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState, TraceSpan,
-    Train, ViewModel, DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
+    SandboxProfileSummary, Selection, SessionRoleDescriptor, SidingPhase, SloProblem, Slot,
+    SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState,
+    TraceSpan, Train, ViewModel, DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
 };
 
 /// A merged or deleted siding is removed this long after it starts fading.
@@ -1012,6 +1012,7 @@ fn scenario_operator_auth() -> AuthState {
         anonymous_lockdown: false,
         baseline_role: Some("operator".into()),
         bound_roles: vec!["operator".into()],
+        bound_role_specs: Vec::new(),
         active_roles: vec![RoleBadgeView {
             role_id: "operator".into(),
             display_name: Some("Operator".into()),
@@ -1162,6 +1163,7 @@ impl Store {
             }
         }
         self.sync_active_role_leases();
+        self.sync_open_session_roles_dialog();
         if changed {
             self.dirty = true;
         }
@@ -1176,6 +1178,37 @@ impl Store {
                 .iter()
                 .find(|l| l.role_id == badge.role_id)
                 .cloned();
+        }
+    }
+
+    fn resolve_session_role_descriptors(&self) -> Vec<SessionRoleDescriptor> {
+        let mut descs = self.auth.session_role_descriptors();
+        for d in &mut descs {
+            if let Some(spec) = self.platform.roles.iter().find(|r| r.id == d.role_id) {
+                if d.description.is_empty() {
+                    d.description.clone_from(&spec.description);
+                }
+                if d.display_name.is_none() {
+                    d.display_name.clone_from(&spec.display_name);
+                }
+                if !self.auth.bound_role_specs.iter().any(|s| s.id == d.role_id) {
+                    d.activation = spec.activation;
+                    d.step_up = spec.step_up;
+                }
+            }
+        }
+        descs
+    }
+
+    fn sync_open_session_roles_dialog(&mut self) {
+        if !matches!(self.active_dialog, Some(DialogModel::SessionRoles(_))) {
+            return;
+        }
+        let roles = self.resolve_session_role_descriptors();
+        let lock_all = !self.auth.leases.is_empty();
+        if let Some(DialogModel::SessionRoles(ref mut sr)) = self.active_dialog {
+            sr.roles = roles;
+            sr.lock_all_enabled = lock_all;
         }
     }
 
@@ -1379,6 +1412,7 @@ impl Store {
 
         let changed = self.auth != next;
         self.auth = next;
+        self.sync_open_session_roles_dialog();
         let scrubbed = self.scrub_for_current_auth();
         if lost_privileges || scrubbed {
             self.force_snapshot_pending = true;
@@ -1465,9 +1499,9 @@ impl Store {
         let mut expired_roles = Vec::new();
         for lease in &mut self.auth.leases {
             normalize_lease_deadlines(lease, now_ms);
-            let prev = (lease.seconds_remaining, lease.idle_timer);
+            let prev = (lease.seconds_remaining, lease.idle_timer, lease.can_renew);
             let alive = lease.tick_at(now_ms);
-            if (lease.seconds_remaining, lease.idle_timer) != prev {
+            if (lease.seconds_remaining, lease.idle_timer, lease.can_renew) != prev {
                 changed = true;
             }
             if !alive {
@@ -1475,6 +1509,7 @@ impl Store {
             }
         }
         self.sync_active_role_leases();
+        self.sync_open_session_roles_dialog();
         if !expired_roles.is_empty() {
             self.deactivate_expired_roles(&expired_roles);
             changed = true;
@@ -2933,9 +2968,15 @@ impl Store {
                     false
                 }
             }
-            Input::OpenDialog(dlg) => {
+            Input::OpenDialog(mut dlg) => {
                 if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
                     self.passkey_gate_dismissed = false;
+                }
+                if let DialogModel::SessionRoles(ref mut sr) = dlg {
+                    if sr.roles.is_empty() {
+                        sr.roles = self.resolve_session_role_descriptors();
+                    }
+                    sr.lock_all_enabled = !self.auth.leases.is_empty();
                 }
                 if self.auth.passkey_enrollment_required {
                     if !matches!(
