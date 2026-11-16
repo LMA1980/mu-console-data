@@ -18,7 +18,7 @@ use mu_console_protocol::dto::{
     PlatformUserDto, PolicyFolioDto, PrStateChangedDto, ProblemDto, PromotedDto, RepoDto,
     RepoSummaryDto, RoleFolioIndexDto, RoleSpecDto, RolledBackDto, SmartscapeDto, StoreStatusDto,
     SubsystemHealthSummary, SubsystemId, SubsystemStatus, SubsystemStatusEntryDto, TaintedDto,
-    TopologyDto, TraceDto, UserProfileDto, Visibility,
+    TopologyDto, TraceDto, UserPreferencesDto, UserProfileDto, Visibility,
 };
 use mu_console_protocol::{
     format_job_id, sanitize_ansi_log_lines, sanitize_public_log, Area, AreaBadges, AuthState,
@@ -131,6 +131,12 @@ pub enum Input {
         skin: Option<ConsoleSkin>,
         font: Option<CrtFont>,
     },
+    /// Optimistic profile update from `UiCommand::UpdateUserProfile`.
+    UpdateProfileOptimistic {
+        display_name: Option<String>,
+        preferred_skin: Option<ConsoleSkin>,
+        preferred_font: Option<CrtFont>,
+    },
     /// Operator restarted a CI job (`POST /api/jobs/{job_id}/restart`).
     JobRestarted(u64),
     /// Operator resumed a CI job (`POST /api/jobs/{job_id}/resume`).
@@ -181,6 +187,7 @@ pub struct Store {
     auth: AuthState,
     max_active_roles_header_chars: u32,
     user_profile: Option<UserProfileDto>,
+    local_preferences: UserPreferencesDto,
     active_dialog: Option<DialogModel>,
     passkey_gate_dismissed: bool,
     subsystem_health: SubsystemHealthSummary,
@@ -1331,6 +1338,7 @@ impl Store {
                 github_login: login.clone(),
                 bound_roles: next.bound_roles.clone(),
                 passkey_count: next.passkey_count,
+                preferences: self.local_preferences,
                 ..UserProfileDto::default()
             });
             entry.github_login = login;
@@ -1340,10 +1348,15 @@ impl Store {
                 entry.display_name = Some(name);
             }
             if let Some(prefs) = dto.preferences {
+                self.local_preferences = prefs;
                 entry.preferences = prefs;
+            }
+            if let Some(DialogModel::UserProfile(ref mut dlg)) = self.active_dialog {
+                dlg.profile = entry.clone();
             }
         } else {
             self.user_profile = None;
+            self.local_preferences.skin = ConsoleSkin::Html;
             if matches!(
                 self.active_dialog,
                 Some(
@@ -2716,6 +2729,7 @@ impl Store {
             }
             Input::UserProfile(profile) => {
                 self.auth.passkey_count = profile.passkey_count;
+                self.local_preferences = profile.preferences;
                 self.user_profile = Some(profile);
                 if let Some(DialogModel::UserProfile(ref mut dlg)) = self.active_dialog {
                     if let Some(ref p) = self.user_profile {
@@ -2955,12 +2969,50 @@ impl Store {
                 }
             }
             Input::LocalUserPrefs { skin, font } => {
+                if let Some(s) = skin {
+                    self.local_preferences.skin = s;
+                }
+                if let Some(f) = font {
+                    self.local_preferences.font = f;
+                }
                 if let Some(ref mut p) = self.user_profile {
                     if let Some(s) = skin {
                         p.preferences.skin = s;
                     }
                     if let Some(f) = font {
                         p.preferences.font = f;
+                    }
+                    if let Some(DialogModel::UserProfile(ref mut dlg)) = self.active_dialog {
+                        dlg.profile.preferences = p.preferences;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::UpdateProfileOptimistic {
+                display_name,
+                preferred_skin,
+                preferred_font,
+            } => {
+                if let Some(s) = preferred_skin {
+                    self.local_preferences.skin = s;
+                }
+                if let Some(f) = preferred_font {
+                    self.local_preferences.font = f;
+                }
+                if let Some(ref mut p) = self.user_profile {
+                    if let Some(name) = display_name {
+                        p.display_name = Some(name);
+                    }
+                    if let Some(s) = preferred_skin {
+                        p.preferences.skin = s;
+                    }
+                    if let Some(f) = preferred_font {
+                        p.preferences.font = f;
+                    }
+                    if let Some(DialogModel::UserProfile(ref mut dlg)) = self.active_dialog {
+                        dlg.profile = p.clone();
                     }
                     true
                 } else {

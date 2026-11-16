@@ -359,11 +359,19 @@ impl Engine {
                 preferred_font,
             } => {
                 let kind = FetchKind::AuthProfilePut {
-                    display_name,
+                    display_name: display_name.clone(),
                     preferred_skin,
                     preferred_font,
                 };
                 if self.can_fetch(&kind) {
+                    self.store.apply(
+                        Input::UpdateProfileOptimistic {
+                            display_name,
+                            preferred_skin,
+                            preferred_font,
+                        },
+                        now_ms,
+                    );
                     if self.mode == Mode::Live {
                         self.fetch(kind, &mut fx);
                     }
@@ -1316,6 +1324,7 @@ impl Engine {
                         | FetchKind::ClusterNodes
                         | FetchKind::CiQueue
                         | FetchKind::AuthProfile
+                        | FetchKind::AuthProfilePut { .. }
                         | FetchKind::AuthPasskeys
                         | FetchKind::AuthActivity
                         | FetchKind::AuthRoles
