@@ -88,6 +88,10 @@ pub enum FetchKind {
         role_id: String,
         assertion_json: String,
     },
+    AuthRenewRole {
+        role_id: String,
+        assertion_json: String,
+    },
     AuthLockRoles,
     AuthActivity,
     AuthRoles,
@@ -149,12 +153,18 @@ fn json<T: DeserializeOwned>(body: &str) -> Result<T, String> {
     serde_json::from_str(body).map_err(|e| e.to_string())
 }
 
-/// Decode a `/api/auth/session` or `/api/auth/redeem` JSON body.
+/// Decode a `/api/auth/session`, `/api/auth/redeem`, `/api/auth/elevate/finish`, or
+/// `/api/auth/roles/{role_id}/renew` JSON body (either raw `AuthSessionDto` or `{"session": ...}`).
 ///
 /// # Errors
 /// Returns the JSON error message when the payload is malformed.
 pub fn parse_auth_session(bytes: &[u8]) -> Result<AuthSessionDto, String> {
-    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    let val: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if let Some(inner) = val.get("session").filter(|v| v.is_object()) {
+        serde_json::from_value(inner.clone()).map_err(|e| e.to_string())
+    } else {
+        serde_json::from_value(val).map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Deserialize)]
@@ -822,6 +832,7 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
         | FetchKind::AuthEnableRole(_)
         | FetchKind::AuthDisableRole(_)
         | FetchKind::AuthElevateFinish { .. }
+        | FetchKind::AuthRenewRole { .. }
         | FetchKind::AuthLockRoles => Input::AuthSession(parse_auth_session(body.as_bytes())?),
         FetchKind::RestartJob(job_id) => Input::JobRestarted(*job_id),
         FetchKind::ResumeJob(job_id) => Input::JobResumed(*job_id),

@@ -334,6 +334,22 @@ impl Engine {
                     );
                 }
             }
+            UiCommand::RenewRoleWithPasskey {
+                role_id,
+                assertion_json,
+            } => {
+                if self.require_active_auth(&mut fx, "Active session required for role renewal")
+                    && self.mode == Mode::Live
+                {
+                    self.fetch(
+                        FetchKind::AuthRenewRole {
+                            role_id,
+                            assertion_json,
+                        },
+                        &mut fx,
+                    );
+                }
+            }
             UiCommand::LockTimedRoles => {
                 if self.require_active_auth(&mut fx, "Active session required to lock timed roles")
                     && self.mode == Mode::Live
@@ -1113,6 +1129,7 @@ impl Engine {
             FetchKind::AuthEnableRole(role_id) => paths::role_enable(role_id),
             FetchKind::AuthDisableRole(role_id) => paths::role_disable(role_id),
             FetchKind::AuthElevateFinish { .. } => paths::AUTH_ELEVATE_FINISH.to_owned(),
+            FetchKind::AuthRenewRole { role_id, .. } => paths::role_renew(role_id),
             FetchKind::AuthLockRoles => paths::AUTH_ROLE_LOCK.to_owned(),
             FetchKind::AuthActivity => paths::AUTH_ACTIVITY.to_owned(),
             FetchKind::AuthRoles | FetchKind::AuthUpsertRole(_) => paths::AUTH_ROLES.to_owned(),
@@ -1403,6 +1420,7 @@ impl Engine {
                 | FetchKind::AuthEnableRole(_)
                 | FetchKind::AuthDisableRole(_)
                 | FetchKind::AuthElevateFinish { .. }
+                | FetchKind::AuthRenewRole { .. }
                 | FetchKind::AuthLockRoles
         );
         let prev_allowed = self.store.can_emit_operational_data();
@@ -1817,6 +1835,7 @@ fn can_fetch_for_auth(
         | FetchKind::AuthEnableRole(_)
         | FetchKind::AuthDisableRole(_)
         | FetchKind::AuthElevateFinish { .. }
+        | FetchKind::AuthRenewRole { .. }
         | FetchKind::AuthLockRoles => status == AuthStatus::Active,
         _ if !can_op_data => false,
         FetchKind::Repos | FetchKind::Summary(_) | FetchKind::Topology(_) => {

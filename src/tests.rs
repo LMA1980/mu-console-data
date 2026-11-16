@@ -2270,6 +2270,7 @@ fn cold_boot_elevated_non_admin_expiry_preserves_baseline_and_blocks_maintenance
             hard_expires_at_ms: 4_010,
             idle_timer: 4,
             idle_expires_at_ms: 4_010,
+            ..RoleLeaseView::default()
         }],
         active_folios: vec![
             "folio:system:dashboard".into(),
@@ -2435,6 +2436,7 @@ fn timed_elevation_refreshes_active_subview_and_elective_toggle_prunes_non_timed
             hard_expires_at_ms: 5_030,
             idle_timer: 5,
             idle_expires_at_ms: 5_030,
+            ..RoleLeaseView::default()
         }],
         active_policies: vec![
             "system:status.read".into(),
@@ -2758,4 +2760,134 @@ fn update_user_profile_optimistically_updates_store_and_treats_404_put_as_option
         e,
         Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
     )));
+}
+
+#[test]
+fn super_operator_renewal_envelope_tick_transition_and_dialog_sync() {
+    use crate::api::parse_auth_session;
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        DialogModel, RoleActivationDto, RoleLeaseView, RoleSpecDto, SessionRolesDialogModel,
+        StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(308);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "All-access Passkey role".into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let mut s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "super-operator".into()],
+        bound_role_specs: vec![super_spec.clone()],
+        active_roles: vec![super_spec.clone()],
+        leases: vec![RoleLeaseView {
+            role_id: "super-operator".into(),
+            display_name: Some("Super Operator".into()),
+            activated_at_ms: 0,
+            last_activity_at_ms: 775_000,
+            hard_expires_at_ms: 900_000,
+            idle_expires_at_ms: 895_000,
+            hard_ttl_secs: 900,
+            idle_ttl_secs: 120,
+            renew_window_secs: 120,
+            renew_extend_secs: 900,
+            max_renewals: 1,
+            renewals_used: 0,
+            seconds_remaining: 125,
+            idle_timer: 120,
+            can_renew: false,
+        }],
+        active_policies: vec!["system:status.read".into(), "platform:roles.write".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        775_000,
+    );
+
+    // Open empty SessionRoles dialog -> Store populates bound_role_specs automatically.
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel {
+            github_login: "LMA1980".into(),
+            roles: Vec::new(),
+            lock_all_enabled: true,
+        })),
+        775_000,
+    );
+
+    // At 779_000ms (121s remaining), can_renew stays false.
+    let _ = eng.tick(779_000);
+    assert!(!eng.store().view().auth.leases[0].can_renew);
+
+    // At 780_000ms (120s remaining), can_renew transitions to true and updates both ViewModel and dialog.
+    let fx_win = eng.tick(780_000);
+    assert!(fx_win
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Patch(_)))));
+    assert!(eng.store().view().auth.leases[0].can_renew);
+    if let Some(DialogModel::SessionRoles(sr)) = &eng.store().view().active_dialog {
+        assert!(sr.roles.iter().any(
+            |r| r.role_id == "super-operator" && r.lease.as_ref().is_some_and(|l| l.can_renew)
+        ));
+    } else {
+        panic!("expected SessionRoles dialog to remain open");
+    }
+
+    // Dispatch RenewRoleWithPasskey -> emits FetchKind::AuthRenewRole for /api/auth/roles/super-operator/renew.
+    let fx_cmd = eng.handle(
+        UiCommand::RenewRoleWithPasskey {
+            role_id: "super-operator".into(),
+            assertion_json: r#"{"challenge_id":"c1","credential":{}}"#.into(),
+        },
+        780_000,
+    );
+    assert!(fx_cmd.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthRenewRole { role_id, .. },
+            url,
+        } if role_id == "super-operator" && url.ends_with("/api/auth/roles/super-operator/renew")
+    )));
+
+    // parse_auth_session unwraps controller `{"elevated": true, "renewed": true, "session": ...}` envelope.
+    s1.leases[0].hard_expires_at_ms = 1_800_000;
+    s1.leases[0].idle_expires_at_ms = 900_000;
+    s1.leases[0].renewals_used = 1;
+    s1.leases[0].can_renew = false;
+    s1.leases[0].seconds_remaining = 1_020;
+    let envelope = serde_json::json!({
+        "elevated": true,
+        "renewed": true,
+        "role_id": "super-operator",
+        "session": s1,
+    })
+    .to_string();
+    let parsed = parse_auth_session(envelope.as_bytes()).expect("unwrap session envelope");
+    assert_eq!(parsed.leases[0].renewals_used, 1);
+
+    eng.on_fetch(
+        &FetchKind::AuthRenewRole {
+            role_id: "super-operator".into(),
+            assertion_json: "{}".into(),
+        },
+        Ok(envelope),
+        780_000,
+    );
+    assert_eq!(
+        eng.store().view().auth.leases[0].hard_expires_at_ms,
+        1_800_000
+    );
+    assert_eq!(eng.store().view().auth.leases[0].renewals_used, 1);
+    assert!(!eng.store().view().auth.leases[0].can_renew);
 }

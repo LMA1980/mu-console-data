@@ -221,6 +221,10 @@ fn build_fetch_request(kind: &FetchKind, url: &str) -> Result<Request, JsValue> 
         FetchKind::AuthElevateFinish {
             role_id,
             assertion_json,
+        }
+        | FetchKind::AuthRenewRole {
+            role_id,
+            assertion_json,
         } => {
             let payload = merge_json_field(
                 assertion_json,
