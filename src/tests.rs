@@ -2650,3 +2650,112 @@ fn live_fetch_and_sse_short_lived_eof_backs_off_until_stable() {
         "expected reset base backoff in 400..=600ms, got {reset_delay_ms}ms"
     );
 }
+
+#[test]
+fn local_skin_and_font_preferences_survive_auth_session_without_preferences() {
+    use mu_console_protocol::ConsoleSkin;
+
+    let mut eng = Engine::new(410);
+    let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    // Local preferences set before AuthSession resolves emit no effects and are preserved.
+    assert!(eng
+        .handle(UiCommand::SetCrtFont(CrtFont::OpenDyslexic), 10)
+        .is_empty());
+    assert!(eng
+        .handle(UiCommand::SetSkin(ConsoleSkin::Wireframe), 15)
+        .is_empty());
+
+    // Resolve AuthSession without server `preferences` field.
+    let _ = resolve_operator_session(&mut eng, 20);
+    let tick_fx = eng.tick(20 + MIN_INTERVAL_MS);
+    let view = tick_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Post(DataEvent::Snapshot(v)) => Some(v.clone()),
+            Effect::Post(DataEvent::Patch(ops)) => {
+                let mut v = ViewModel::default();
+                apply_all(&mut v, ops);
+                Some(v)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| eng.store().view());
+    let profile = view
+        .user_profile
+        .expect("authenticated session populates user_profile");
+    assert_eq!(profile.preferences.font, CrtFont::OpenDyslexic);
+    assert_eq!(profile.preferences.skin, ConsoleSkin::Wireframe);
+}
+
+#[test]
+fn update_user_profile_optimistically_updates_store_and_treats_404_put_as_optional() {
+    use mu_console_protocol::ConsoleSkin;
+
+    let mut eng = Engine::new(411);
+    let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = resolve_operator_session(&mut eng, 10);
+
+    let cmd = UiCommand::UpdateUserProfile {
+        display_name: Some("Ops Lead".into()),
+        preferred_skin: Some(ConsoleSkin::Wireframe),
+        preferred_font: Some(CrtFont::OpenDyslexic),
+    };
+    let fx = eng.handle(cmd, 20);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthProfilePut { .. },
+            ..
+        }
+    )));
+
+    let tick_fx = eng.tick(20 + MIN_INTERVAL_MS);
+    assert!(!tick_fx.is_empty());
+    let profile = eng
+        .store()
+        .view()
+        .user_profile
+        .expect("optimistic user_profile updated");
+    assert_eq!(profile.display_name.as_deref(), Some("Ops Lead"));
+    assert_eq!(profile.preferences.skin, ConsoleSkin::Wireframe);
+    assert_eq!(profile.preferences.font, CrtFont::OpenDyslexic);
+
+    // Optional PUT /api/auth/profile returning 404 preserves local preferences without UiError.
+    let kind = FetchKind::AuthProfilePut {
+        display_name: Some("Ops Lead".into()),
+        preferred_skin: Some(ConsoleSkin::Wireframe),
+        preferred_font: Some(CrtFont::OpenDyslexic),
+    };
+    let fx_404 = eng.on_fetch(
+        &kind,
+        Err(HttpError {
+            status: 404,
+            message: "Not Found".into(),
+        }),
+        20 + MIN_INTERVAL_MS + 10,
+    );
+    assert!(
+        !fx_404
+            .iter()
+            .any(|e| matches!(e, Effect::Post(DataEvent::Error(_)))),
+        "404 on optional /api/auth/profile PUT must not emit DataEvent::Error"
+    );
+    let retained = eng.store().view().user_profile.expect("retained profile");
+    assert_eq!(retained.preferences.skin, ConsoleSkin::Wireframe);
+    assert_eq!(retained.preferences.font, CrtFont::OpenDyslexic);
+
+    // 403 still surfaces UiError::Http.
+    let fx_403 = eng.on_fetch(
+        &kind,
+        Err(HttpError {
+            status: 403,
+            message: "Forbidden".into(),
+        }),
+        20 + MIN_INTERVAL_MS + 20,
+    );
+    assert!(fx_403.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
+    )));
+}
