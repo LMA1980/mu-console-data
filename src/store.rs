@@ -182,6 +182,7 @@ pub struct Store {
     max_active_roles_header_chars: u32,
     user_profile: Option<UserProfileDto>,
     active_dialog: Option<DialogModel>,
+    passkey_gate_dismissed: bool,
     subsystem_health: SubsystemHealthSummary,
     cd_runs: Vec<CdRunDto>,
     model_runner: ModelRunnerView,
@@ -1044,6 +1045,30 @@ fn normalize_lease_deadlines(lease: &mut RoleLeaseView, now_ms: u64) {
     }
 }
 
+pub(crate) fn baseline_public_policies() -> Vec<String> {
+    vec![
+        "system:status.read".into(),
+        "ci:queue.read".into(),
+        "ci:repos.public.read".into(),
+    ]
+}
+
+pub(crate) fn auth_has_policy(auth: &AuthState, policy: &str) -> bool {
+    auth.is_resolved()
+        && !auth.anonymous_lockdown
+        && auth.active_policies.iter().any(|p| p == policy)
+}
+
+pub(crate) fn auth_can_access_area(auth: &AuthState, area: Area) -> bool {
+    if !auth.is_resolved() || auth.anonymous_lockdown {
+        return false;
+    }
+    let prefix = area.subsystem().policy_prefix();
+    auth.active_policies
+        .iter()
+        .any(|p| p.split(':').next() == Some(prefix))
+}
+
 impl Store {
     #[must_use]
     pub fn new(source: DataSource) -> Self {
@@ -1080,9 +1105,8 @@ impl Store {
     #[must_use]
     pub fn can_emit_operational_data(&self) -> bool {
         self.auth.is_resolved()
-            && !self.auth.passkey_enrollment_required
             && self.auth.status != AuthStatus::AuthorizationDenied
-            && !(self.auth.status == AuthStatus::Anonymous && self.auth.anonymous_lockdown)
+            && !self.auth.anonymous_lockdown
     }
 
     /// Return `true` when reading/persisting an offline snapshot is authorized (`Active` with Passkey).
@@ -1107,7 +1131,7 @@ impl Store {
     /// Return `true` if any policy in `policies` is active in the current session.
     #[must_use]
     pub fn has_any_policy(&self, policies: &[&str]) -> bool {
-        policies.iter().any(|p| self.auth.has_policy(p))
+        policies.iter().any(|p| auth_has_policy(&self.auth, p))
     }
 
     /// Refresh `idle_expires_at_ms` across all active `Timed` leases on explicit user activity.
@@ -1245,6 +1269,19 @@ impl Store {
     fn apply_auth_session(&mut self, dto: AuthSessionDto, now_ms: u64) -> bool {
         let prev = self.auth.clone();
         let mut next = AuthState::from_session(&dto);
+        if next.passkey_enrollment_required {
+            next.anonymous_lockdown = dto.anonymous_lockdown;
+            next.active_folios = if dto.anonymous_lockdown {
+                Vec::new()
+            } else {
+                dto.active_folios.clone()
+            };
+            next.active_policies = if dto.anonymous_lockdown {
+                Vec::new()
+            } else {
+                baseline_public_policies()
+            };
+        }
         for lease in &mut next.leases {
             normalize_lease_deadlines(lease, now_ms);
             let _ = lease.tick_at(now_ms);
@@ -1257,17 +1294,27 @@ impl Store {
         }
         self.record_auth_policy_diffs(&prev, &next);
 
+        if !next.passkey_enrollment_required
+            || (prev.is_resolved() && prev.github_login != next.github_login)
+        {
+            self.passkey_gate_dismissed = false;
+        }
+
         if next.passkey_enrollment_required {
-            self.active_dialog = Some(DialogModel::PasskeyEnrollmentGate(
-                PasskeyEnrollmentGateModel {
-                    github_login: next
-                        .github_login
-                        .clone()
-                        .unwrap_or_else(|| "operator".into()),
-                    passkey_count: next.passkey_count,
-                    reason_code: next.reason_code,
-                },
-            ));
+            if !self.passkey_gate_dismissed
+                && !matches!(self.active_dialog, Some(DialogModel::UserProfile(_)))
+            {
+                self.active_dialog = Some(DialogModel::PasskeyEnrollmentGate(
+                    PasskeyEnrollmentGateModel {
+                        github_login: next
+                            .github_login
+                            .clone()
+                            .unwrap_or_else(|| "operator".into()),
+                        passkey_count: next.passkey_count,
+                        reason_code: next.reason_code,
+                    },
+                ));
+            }
         } else if matches!(
             self.active_dialog,
             Some(DialogModel::PasskeyEnrollmentGate(_))
@@ -1466,45 +1513,45 @@ impl Store {
         }
 
         let mut scrubbed = false;
-        let can_ci = self.auth.can_access_area(Area::Ci);
-        let can_public_repos = self.auth.has_policy("ci:repos.public.read");
-        let can_private_repos = self.auth.has_policy("ci:repos.private.read");
-        let can_nodes = self.auth.has_policy("ci:nodes.read");
-        let can_sandboxes = self.auth.has_policy("ci:sandboxes.read");
-        let can_job_logs =
-            self.auth.has_policy("ci:jobs.logs.read") || self.auth.has_policy("obs:logs.read");
-        let can_jobs =
-            self.auth.has_policy("ci:jobs.read") || self.auth.has_policy("ci:queue.read");
-        let can_cd_runs = self.auth.has_policy("cd:runs.read");
-        let can_ab = self.auth.can_access_area(Area::AbDeploy);
-        let can_ab_gate_logs = self.auth.has_policy("ab:gate.logs.read");
-        let can_repo_area = self.auth.can_access_area(Area::Repository);
-        let can_reg_pkg = self.auth.has_policy("reg:packages.read");
-        let can_reg_canaries = self.auth.has_policy("reg:canaries.read");
-        let can_reg_cas = self.auth.has_policy("reg:cas.read");
-        let can_obs_area = self.auth.can_access_area(Area::Observability);
-        let can_obs_logs = self.auth.has_policy("obs:logs.read");
-        let can_obs_traces = self.auth.has_policy("obs:traces.read");
-        let can_obs_metrics = self.auth.has_policy("obs:metrics.read");
-        let can_obs_problems = self.auth.has_policy("obs:problems.read");
-        let can_obs_smartscape = self.auth.has_policy("obs:smartscape.read");
-        let can_obs_store = self.auth.has_policy("obs:store.read");
-        let can_obs_ingress = self.auth.has_policy("obs:ingress.read");
-        let can_mr_area = self.auth.can_access_area(Area::ModelRunner);
-        let can_mr_status =
-            self.auth.has_policy("mr:models.read") || self.auth.has_policy("mr:queue.read");
-        let can_mr_conn = self.auth.has_policy("mr:openai_api.read")
-            || self.auth.has_policy("mr:wireguard_vpn.read");
+        let can_ci = auth_can_access_area(&self.auth, Area::Ci);
+        let can_public_repos = auth_has_policy(&self.auth, "ci:repos.public.read");
+        let can_private_repos = auth_has_policy(&self.auth, "ci:repos.private.read");
+        let can_nodes = auth_has_policy(&self.auth, "ci:nodes.read");
+        let can_sandboxes = auth_has_policy(&self.auth, "ci:sandboxes.read");
+        let can_job_logs = auth_has_policy(&self.auth, "ci:jobs.logs.read")
+            || auth_has_policy(&self.auth, "obs:logs.read");
+        let can_jobs = auth_has_policy(&self.auth, "ci:jobs.read")
+            || auth_has_policy(&self.auth, "ci:queue.read");
+        let can_cd_runs = auth_has_policy(&self.auth, "cd:runs.read");
+        let can_ab = auth_can_access_area(&self.auth, Area::AbDeploy);
+        let can_ab_gate_logs = auth_has_policy(&self.auth, "ab:gate.logs.read");
+        let can_repo_area = auth_can_access_area(&self.auth, Area::Repository);
+        let can_reg_pkg = auth_has_policy(&self.auth, "reg:packages.read");
+        let can_reg_canaries = auth_has_policy(&self.auth, "reg:canaries.read");
+        let can_reg_cas = auth_has_policy(&self.auth, "reg:cas.read");
+        let can_obs_area = auth_can_access_area(&self.auth, Area::Observability);
+        let can_obs_logs = auth_has_policy(&self.auth, "obs:logs.read");
+        let can_obs_traces = auth_has_policy(&self.auth, "obs:traces.read");
+        let can_obs_metrics = auth_has_policy(&self.auth, "obs:metrics.read");
+        let can_obs_problems = auth_has_policy(&self.auth, "obs:problems.read");
+        let can_obs_smartscape = auth_has_policy(&self.auth, "obs:smartscape.read");
+        let can_obs_store = auth_has_policy(&self.auth, "obs:store.read");
+        let can_obs_ingress = auth_has_policy(&self.auth, "obs:ingress.read");
+        let can_mr_area = auth_can_access_area(&self.auth, Area::ModelRunner);
+        let can_mr_status = auth_has_policy(&self.auth, "mr:models.read")
+            || auth_has_policy(&self.auth, "mr:queue.read");
+        let can_mr_conn = auth_has_policy(&self.auth, "mr:openai_api.read")
+            || auth_has_policy(&self.auth, "mr:wireguard_vpn.read");
         let can_subsystems = self.has_any_policy(&[
             "system:status.read",
             "system:dashboard.read",
             "platform:maintenance.read",
         ]);
-        let can_plat_users = self.auth.has_policy("platform:users.read");
-        let can_plat_invites = self.auth.has_policy("platform:invites.read");
-        let can_plat_roles = self.auth.has_policy("platform:roles.read");
-        let can_plat_folios = self.auth.has_policy("platform:folios.read");
-        let can_plat_activity = self.auth.has_policy("platform:activity.read");
+        let can_plat_users = auth_has_policy(&self.auth, "platform:users.read");
+        let can_plat_invites = auth_has_policy(&self.auth, "platform:invites.read");
+        let can_plat_roles = auth_has_policy(&self.auth, "platform:roles.read");
+        let can_plat_folios = auth_has_policy(&self.auth, "platform:folios.read");
+        let can_plat_activity = auth_has_policy(&self.auth, "platform:activity.read");
         let can_plat_subsystems =
             self.has_any_policy(&["platform:maintenance.read", "system:status.read"]);
 
@@ -2730,8 +2777,13 @@ impl Store {
                     self.auth.passkey_enrollment_required = true;
                     self.auth.active_roles.clear();
                     self.auth.leases.clear();
-                    self.auth.active_folios.clear();
-                    self.auth.active_policies.clear();
+                    if self.auth.anonymous_lockdown {
+                        self.auth.active_folios.clear();
+                        self.auth.active_policies.clear();
+                    } else {
+                        self.auth.active_policies = baseline_public_policies();
+                    }
+                    self.passkey_gate_dismissed = false;
                     self.active_dialog = Some(DialogModel::PasskeyEnrollmentGate(
                         PasskeyEnrollmentGateModel {
                             github_login: self
@@ -2868,10 +2920,19 @@ impl Store {
                 }
             }
             Input::OpenDialog(dlg) => {
-                if self.auth.passkey_enrollment_required
-                    && !matches!(dlg, DialogModel::PasskeyEnrollmentGate(_))
-                {
-                    return false;
+                if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
+                    self.passkey_gate_dismissed = false;
+                }
+                if self.auth.passkey_enrollment_required {
+                    if !matches!(
+                        dlg,
+                        DialogModel::PasskeyEnrollmentGate(_) | DialogModel::UserProfile(_)
+                    ) {
+                        return false;
+                    }
+                    if matches!(dlg, DialogModel::UserProfile(_)) {
+                        self.passkey_gate_dismissed = true;
+                    }
                 }
                 let changed = self.active_dialog.as_ref() != Some(&dlg);
                 self.active_dialog = Some(dlg);
@@ -2879,7 +2940,12 @@ impl Store {
             }
             Input::CloseDialog => {
                 if let Some(ref dlg) = self.active_dialog {
-                    if !dlg.is_dismissible() || self.auth.passkey_enrollment_required {
+                    if matches!(dlg, DialogModel::PasskeyEnrollmentGate(_)) {
+                        self.passkey_gate_dismissed = true;
+                        self.active_dialog = None;
+                        return true;
+                    }
+                    if !dlg.is_dismissible() {
                         return false;
                     }
                     self.active_dialog = None;
@@ -4349,7 +4415,10 @@ impl Store {
             } else {
                 None
             };
-            let active_dialog = if self.auth.status == AuthStatus::PasskeyEnrollmentRequired {
+            let active_dialog = if self.auth.status == AuthStatus::PasskeyEnrollmentRequired
+                && !self.passkey_gate_dismissed
+                && !matches!(self.active_dialog, Some(DialogModel::UserProfile(_)))
+            {
                 Some(DialogModel::PasskeyEnrollmentGate(
                     PasskeyEnrollmentGateModel {
                         github_login: self.auth.github_login.clone().unwrap_or_default(),
@@ -4589,9 +4658,9 @@ fn reset_default_if<T: Default + PartialEq>(v: &mut T) -> bool {
 
 fn sanitize_view_for_auth(v: &mut ViewModel, auth: &AuthState) -> bool {
     let mut scrubbed = false;
-    let can_ci = auth.can_access_area(Area::Ci);
-    let can_public_repos = auth.has_policy("ci:repos.public.read");
-    let can_private_repos = auth.has_policy("ci:repos.private.read");
+    let can_ci = auth_can_access_area(auth, Area::Ci);
+    let can_public_repos = auth_has_policy(auth, "ci:repos.public.read");
+    let can_private_repos = auth_has_policy(auth, "ci:repos.private.read");
     if !can_ci {
         scrubbed |= clear_vec_if(&mut v.repos);
         scrubbed |= clear_opt_if(&mut v.topology);
@@ -4605,110 +4674,116 @@ fn sanitize_view_for_auth(v: &mut ViewModel, auth: &AuthState) -> bool {
             Visibility::Private => can_private_repos,
         });
         scrubbed |= v.repos.len() != before;
-        if !auth.has_policy("ci:nodes.read") {
+        if !auth_has_policy(auth, "ci:nodes.read") {
             scrubbed |= clear_vec_if(&mut v.nodes);
         }
-        if !auth.has_policy("ci:sandboxes.read") {
+        if !auth_has_policy(auth, "ci:sandboxes.read") {
             scrubbed |= clear_vec_if(&mut v.sandboxes);
         }
-        if !auth.has_policy("ci:jobs.read") && !auth.has_policy("ci:queue.read") {
+        if !auth_has_policy(auth, "ci:jobs.read") && !auth_has_policy(auth, "ci:queue.read") {
             scrubbed |= clear_vec_if(&mut v.ci_jobs);
-        } else if !auth.has_policy("ci:jobs.logs.read") && !auth.has_policy("obs:logs.read") {
+        } else if !auth_has_policy(auth, "ci:jobs.logs.read")
+            && !auth_has_policy(auth, "obs:logs.read")
+        {
             for j in &mut v.ci_jobs {
                 scrubbed |= clear_vec_if(&mut j.raw_log_lines);
             }
         }
     }
-    if !auth.has_policy("cd:runs.read") {
+    if !auth_has_policy(auth, "cd:runs.read") {
         scrubbed |= clear_vec_if(&mut v.cd_runs);
     }
-    if !auth.can_access_area(Area::AbDeploy) {
+    if !auth_can_access_area(auth, Area::AbDeploy) {
         scrubbed |= clear_opt_if(&mut v.gate);
         scrubbed |= clear_vec_if(&mut v.history);
         scrubbed |= clear_vec_if(&mut v.leases);
         for r in &mut v.repos {
             scrubbed |= clear_opt_if(&mut r.cd);
         }
-    } else if !auth.has_policy("ab:gate.logs.read") {
+    } else if !auth_has_policy(auth, "ab:gate.logs.read") {
         if let Some(g) = v.gate.as_mut() {
             scrubbed |= clear_vec_if(&mut g.tests);
         }
     }
-    if !auth.can_access_area(Area::Repository) {
+    if !auth_can_access_area(auth, Area::Repository) {
         scrubbed |= reset_default_if(&mut v.registry);
     } else {
-        if !auth.has_policy("reg:packages.read") {
+        if !auth_has_policy(auth, "reg:packages.read") {
             scrubbed |= clear_vec_if(&mut v.registry.packages);
         }
-        if !auth.has_policy("reg:canaries.read") {
+        if !auth_has_policy(auth, "reg:canaries.read") {
             scrubbed |= clear_vec_if(&mut v.registry.canaries);
         }
-        if !auth.has_policy("reg:cas.read") {
+        if !auth_has_policy(auth, "reg:cas.read") {
             scrubbed |= reset_default_if(&mut v.registry.cas);
         }
     }
-    if !auth.can_access_area(Area::Observability) {
+    if !auth_can_access_area(auth, Area::Observability) {
         scrubbed |= reset_default_if(&mut v.observe);
     } else {
-        if !auth.has_policy("obs:logs.read") {
+        if !auth_has_policy(auth, "obs:logs.read") {
             scrubbed |= clear_vec_if(&mut v.observe.logs);
         }
-        if !auth.has_policy("obs:traces.read") {
+        if !auth_has_policy(auth, "obs:traces.read") {
             scrubbed |= clear_vec_if(&mut v.observe.traces);
         }
-        if !auth.has_policy("obs:metrics.read") {
+        if !auth_has_policy(auth, "obs:metrics.read") {
             scrubbed |= clear_vec_if(&mut v.observe.metrics);
         }
-        if !auth.has_policy("obs:problems.read") {
+        if !auth_has_policy(auth, "obs:problems.read") {
             scrubbed |= clear_vec_if(&mut v.observe.problems);
         }
-        if !auth.has_policy("obs:smartscape.read") {
+        if !auth_has_policy(auth, "obs:smartscape.read") {
             scrubbed |= clear_vec_if(&mut v.observe.smartscape_nodes);
             scrubbed |= clear_vec_if(&mut v.observe.smartscape_edges);
         }
-        if !auth.has_policy("obs:store.read") {
+        if !auth_has_policy(auth, "obs:store.read") {
             scrubbed |= reset_default_if(&mut v.observe.store);
         }
-        if !auth.has_policy("obs:ingress.read") {
+        if !auth_has_policy(auth, "obs:ingress.read") {
             scrubbed |= clear_opt_if(&mut v.observe.tls_health);
             scrubbed |= clear_vec_if(&mut v.observe.ingress_routes);
             scrubbed |= clear_vec_if(&mut v.observe.ingress_upstreams);
         }
     }
-    if !auth.can_access_area(Area::ModelRunner) {
+    if !auth_can_access_area(auth, Area::ModelRunner) {
         scrubbed |= reset_default_if(&mut v.model_runner);
     } else {
-        if !auth.has_policy("mr:models.read") && !auth.has_policy("mr:queue.read") {
+        if !auth_has_policy(auth, "mr:models.read") && !auth_has_policy(auth, "mr:queue.read") {
             scrubbed |= clear_opt_if(&mut v.model_runner.status);
         }
-        if !auth.has_policy("mr:openai_api.read") && !auth.has_policy("mr:wireguard_vpn.read") {
+        if !auth_has_policy(auth, "mr:openai_api.read")
+            && !auth_has_policy(auth, "mr:wireguard_vpn.read")
+        {
             scrubbed |= clear_opt_if(&mut v.model_runner.connection);
         }
     }
-    if !auth.has_policy("system:status.read")
-        && !auth.has_policy("system:dashboard.read")
-        && !auth.has_policy("platform:maintenance.read")
+    if !auth_has_policy(auth, "system:status.read")
+        && !auth_has_policy(auth, "system:dashboard.read")
+        && !auth_has_policy(auth, "platform:maintenance.read")
     {
         scrubbed |= reset_default_if(&mut v.subsystem_health);
     }
-    if !auth.has_policy("platform:users.read") {
+    if !auth_has_policy(auth, "platform:users.read") {
         scrubbed |= clear_vec_if(&mut v.platform.users);
     }
-    if !auth.has_policy("platform:invites.read") {
+    if !auth_has_policy(auth, "platform:invites.read") {
         scrubbed |= clear_vec_if(&mut v.platform.invites);
     }
-    if !auth.has_policy("platform:roles.read") {
+    if !auth_has_policy(auth, "platform:roles.read") {
         scrubbed |= clear_vec_if(&mut v.platform.roles);
     }
-    if !auth.has_policy("platform:folios.read") {
+    if !auth_has_policy(auth, "platform:folios.read") {
         scrubbed |= clear_vec_if(&mut v.platform.folios);
         scrubbed |= clear_vec_if(&mut v.platform.policies);
         scrubbed |= reset_default_if(&mut v.platform.role_folio_index);
     }
-    if !auth.has_policy("platform:activity.read") {
+    if !auth_has_policy(auth, "platform:activity.read") {
         scrubbed |= clear_vec_if(&mut v.platform.recent_activity);
     }
-    if !auth.has_policy("platform:maintenance.read") && !auth.has_policy("system:status.read") {
+    if !auth_has_policy(auth, "platform:maintenance.read")
+        && !auth_has_policy(auth, "system:status.read")
+    {
         scrubbed |= clear_vec_if(&mut v.platform.subsystems);
     }
     scrubbed

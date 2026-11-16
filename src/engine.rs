@@ -23,7 +23,7 @@ use crate::coalesce::Coalescer;
 use crate::offline::{OfflinePolicy, OfflineSnapshot};
 use crate::scenario::{Scenario, ScenarioPlayer};
 use crate::sse::SseParser;
-use crate::store::{Input, Store};
+use crate::store::{auth_can_access_area, auth_has_policy, Input, Store};
 
 /// History-strip length requested from `/api/cd/deployments`.
 pub const HISTORY_LIMIT: u32 = 8;
@@ -454,7 +454,7 @@ impl Engine {
                     if self.mode == Mode::Live {
                         self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                         if self.fallback_job_logs.contains(&job_id)
-                            && !self.store.auth().has_policy("ci:jobs.logs.read")
+                            && !auth_has_policy(self.store.auth(), "ci:jobs.logs.read")
                         {
                             self.fetch_obs_job_log(job_id, &mut fx);
                         } else {
@@ -748,7 +748,7 @@ impl Engine {
                     self.fetch(FetchKind::ObsLogsQuery(q.to_owned()), fx);
                 } else {
                     self.store.clear_active_log_query();
-                    if self.store.auth().has_policy("obs:logs.read") {
+                    if auth_has_policy(self.store.auth(), "obs:logs.read") {
                         self.fetch(FetchKind::ObsLogs, fx);
                     }
                 }
@@ -870,7 +870,7 @@ impl Engine {
     }
 
     fn require_policy(&self, policy: &str, fx: &mut Vec<Effect>, msg: &str) -> bool {
-        if self.store.can_emit_operational_data() && self.store.auth().has_policy(policy) {
+        if self.store.can_emit_operational_data() && auth_has_policy(self.store.auth(), policy) {
             true
         } else {
             deny_403(fx, msg);
@@ -893,13 +893,15 @@ impl Engine {
         }
         let auth = self.store.auth();
         match s {
-            StreamId::Ci => auth.can_access_area(Area::Ci),
-            StreamId::Cd => auth.can_access_area(Area::Cd) || auth.can_access_area(Area::AbDeploy),
+            StreamId::Ci => auth_can_access_area(auth, Area::Ci),
+            StreamId::Cd => {
+                auth_can_access_area(auth, Area::Cd) || auth_can_access_area(auth, Area::AbDeploy)
+            }
             StreamId::Obs => {
-                auth.can_access_area(Area::Observability)
-                    || auth.has_policy("system:status.read")
-                    || auth.has_policy("system:dashboard.read")
-                    || auth.has_policy("platform:maintenance.read")
+                auth_can_access_area(auth, Area::Observability)
+                    || auth_has_policy(auth, "system:status.read")
+                    || auth_has_policy(auth, "system:dashboard.read")
+                    || auth_has_policy(auth, "platform:maintenance.read")
             }
         }
     }
@@ -939,10 +941,7 @@ impl Engine {
         if self.mode != Mode::Live {
             return;
         }
-        if !prev_allowed
-            && self.store.can_cache_offline()
-            && !self.offline_requested
-            && !self.store.has_live_data()
+        if self.store.can_cache_offline() && !self.offline_requested && !self.store.has_live_data()
         {
             self.offline_requested = true;
             fx.push(Effect::LoadOffline);
@@ -984,7 +983,7 @@ impl Engine {
             if self.can_fetch(&kind)
                 && policies
                     .iter()
-                    .any(|p| self.store.auth().has_policy(p) && gained_policy(p))
+                    .any(|p| auth_has_policy(self.store.auth(), p) && gained_policy(p))
             {
                 self.fetch(kind, fx);
             }
@@ -1143,7 +1142,8 @@ impl Engine {
     }
 
     fn fetch_obs_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
-        if !self.store.can_emit_operational_data() || !self.store.auth().has_policy("obs:logs.read")
+        if !self.store.can_emit_operational_data()
+            || !auth_has_policy(self.store.auth(), "obs:logs.read")
         {
             return;
         }
@@ -1156,9 +1156,9 @@ impl Engine {
     }
 
     fn fetch_active_job_log(&self, job_id: u64, fx: &mut Vec<Effect>) {
-        if self.store.auth().has_policy("ci:jobs.logs.read") {
+        if auth_has_policy(self.store.auth(), "ci:jobs.logs.read") {
             self.fetch(FetchKind::JobLog(job_id), fx);
-        } else if self.store.auth().has_policy("obs:logs.read") {
+        } else if auth_has_policy(self.store.auth(), "obs:logs.read") {
             self.fetch_obs_job_log(job_id, fx);
         }
     }
@@ -1346,7 +1346,7 @@ impl Engine {
                 );
                 if let FetchKind::JobLog(job_id) = kind {
                     if matches!(e.status, 401 | 403)
-                        && self.store.auth().has_policy("obs:logs.read")
+                        && auth_has_policy(self.store.auth(), "obs:logs.read")
                         && self.fallback_job_logs.insert(*job_id)
                     {
                         self.fetch_obs_job_log(*job_id, &mut fx);
@@ -1389,6 +1389,7 @@ impl Engine {
             kind,
             FetchKind::AuthSession
                 | FetchKind::AuthRedeem(_)
+                | FetchKind::AuthPasskeyRegisterFinish { .. }
                 | FetchKind::AuthPasskeyDelete { .. }
                 | FetchKind::AuthEnableRole(_)
                 | FetchKind::AuthDisableRole(_)
@@ -1707,7 +1708,7 @@ impl Engine {
                     } else if matches!(self.active_subview, Some(SubView::Ci(CiSubView::QueueLogs)))
                     {
                         polled = true;
-                        if self.store.auth().has_policy("obs:logs.read") {
+                        if auth_has_policy(self.store.auth(), "obs:logs.read") {
                             self.fetch(FetchKind::ObsLogs, &mut fx);
                         }
                         self.fetch(FetchKind::CiQueue, &mut fx);
@@ -1795,79 +1796,87 @@ fn can_fetch_for_auth(
 ) -> bool {
     match kind {
         FetchKind::AuthSession | FetchKind::AuthRedeem(_) => true,
-        FetchKind::AuthProfile
-        | FetchKind::AuthProfilePut { .. }
-        | FetchKind::AuthPasskeys
+        FetchKind::AuthPasskeys
         | FetchKind::AuthPasskeyRegisterFinish { .. }
         | FetchKind::AuthPasskeyDelete { .. }
         | FetchKind::AuthActivity => matches!(
             status,
             AuthStatus::PasskeyEnrollmentRequired | AuthStatus::Active
         ),
-        FetchKind::AuthEnableRole(_)
+        FetchKind::AuthProfile
+        | FetchKind::AuthProfilePut { .. }
+        | FetchKind::AuthEnableRole(_)
         | FetchKind::AuthDisableRole(_)
         | FetchKind::AuthElevateFinish { .. }
         | FetchKind::AuthLockRoles => status == AuthStatus::Active,
         _ if !can_op_data => false,
         FetchKind::Repos | FetchKind::Summary(_) | FetchKind::Topology(_) => {
-            auth.has_policy("ci:repos.public.read") || auth.has_policy("ci:repos.private.read")
+            auth_has_policy(auth, "ci:repos.public.read")
+                || auth_has_policy(auth, "ci:repos.private.read")
         }
-        FetchKind::CiQueue => auth.has_policy("ci:queue.read") || auth.has_policy("ci:jobs.read"),
-        FetchKind::ClusterNodes => auth.has_policy("ci:nodes.read"),
-        FetchKind::JobDetail(_) => auth.has_policy("ci:jobs.read"),
+        FetchKind::CiQueue => {
+            auth_has_policy(auth, "ci:queue.read") || auth_has_policy(auth, "ci:jobs.read")
+        }
+        FetchKind::ClusterNodes => auth_has_policy(auth, "ci:nodes.read"),
+        FetchKind::JobDetail(_) => auth_has_policy(auth, "ci:jobs.read"),
         FetchKind::JobLog(_) => {
-            auth.has_policy("ci:jobs.logs.read") || auth.has_policy("obs:logs.read")
+            auth_has_policy(auth, "ci:jobs.logs.read") || auth_has_policy(auth, "obs:logs.read")
         }
-        FetchKind::RestartJob(_) => auth.has_policy("ci:jobs.restart"),
-        FetchKind::ResumeJob(_) => auth.has_policy("ci:jobs.resume"),
-        FetchKind::CdRuns { .. } => auth.has_policy("cd:runs.read"),
+        FetchKind::RestartJob(_) => auth_has_policy(auth, "ci:jobs.restart"),
+        FetchKind::ResumeJob(_) => auth_has_policy(auth, "ci:jobs.resume"),
+        FetchKind::CdRuns { .. } => auth_has_policy(auth, "cd:runs.read"),
         FetchKind::Deployments(_) | FetchKind::Gate(_) | FetchKind::Leases => {
-            auth.can_access_area(Area::AbDeploy)
+            auth_can_access_area(auth, Area::AbDeploy)
         }
-        FetchKind::AbRollback { .. } => auth.has_policy("ab:rollback"),
-        FetchKind::RegPackages => auth.has_policy("reg:packages.read"),
+        FetchKind::AbRollback { .. } => auth_has_policy(auth, "ab:rollback"),
+        FetchKind::RegPackages => auth_has_policy(auth, "reg:packages.read"),
         FetchKind::RegCanaries => {
-            auth.has_policy("reg:canaries.read") || auth.has_policy("reg:taints.read")
+            auth_has_policy(auth, "reg:canaries.read") || auth_has_policy(auth, "reg:taints.read")
         }
-        FetchKind::RegCasStatus => auth.has_policy("reg:cas.read"),
-        FetchKind::ObsSmartscape => auth.has_policy("obs:smartscape.read"),
-        FetchKind::ObsProblems => auth.has_policy("obs:problems.read"),
-        FetchKind::ObsTraces | FetchKind::ObsTraceDetail(_) => auth.has_policy("obs:traces.read"),
-        FetchKind::ObsLogs | FetchKind::ObsLogsQuery(_) => auth.has_policy("obs:logs.read"),
-        FetchKind::ObsMetrics => auth.has_policy("obs:metrics.read"),
-        FetchKind::ObsStoreStatus => auth.has_policy("obs:store.read"),
+        FetchKind::RegCasStatus => auth_has_policy(auth, "reg:cas.read"),
+        FetchKind::ObsSmartscape => auth_has_policy(auth, "obs:smartscape.read"),
+        FetchKind::ObsProblems => auth_has_policy(auth, "obs:problems.read"),
+        FetchKind::ObsTraces | FetchKind::ObsTraceDetail(_) => {
+            auth_has_policy(auth, "obs:traces.read")
+        }
+        FetchKind::ObsLogs | FetchKind::ObsLogsQuery(_) => auth_has_policy(auth, "obs:logs.read"),
+        FetchKind::ObsMetrics => auth_has_policy(auth, "obs:metrics.read"),
+        FetchKind::ObsStoreStatus => auth_has_policy(auth, "obs:store.read"),
         FetchKind::ObsIngressOverview
         | FetchKind::ObsIngressRoutes
-        | FetchKind::ObsIngressUpstreams => auth.has_policy("obs:ingress.read"),
+        | FetchKind::ObsIngressUpstreams => auth_has_policy(auth, "obs:ingress.read"),
         FetchKind::ObsSubsystemStatus => {
-            auth.has_policy("system:status.read")
-                || auth.has_policy("system:dashboard.read")
-                || auth.has_policy("platform:maintenance.read")
+            auth_has_policy(auth, "system:status.read")
+                || auth_has_policy(auth, "system:dashboard.read")
+                || auth_has_policy(auth, "platform:maintenance.read")
         }
-        FetchKind::SetSubsystemMaintenance { .. } => auth.has_policy("platform:maintenance.write"),
+        FetchKind::SetSubsystemMaintenance { .. } => {
+            auth_has_policy(auth, "platform:maintenance.write")
+        }
         FetchKind::MrStatus => {
-            auth.has_policy("mr:models.read") || auth.has_policy("mr:queue.read")
+            auth_has_policy(auth, "mr:models.read") || auth_has_policy(auth, "mr:queue.read")
         }
         FetchKind::MrConnection => {
-            auth.has_policy("mr:openai_api.read") || auth.has_policy("mr:wireguard_vpn.read")
+            auth_has_policy(auth, "mr:openai_api.read")
+                || auth_has_policy(auth, "mr:wireguard_vpn.read")
         }
-        FetchKind::AuthRoles => auth.has_policy("platform:roles.read"),
+        FetchKind::AuthRoles => auth_has_policy(auth, "platform:roles.read"),
         FetchKind::AuthUpsertRole(_) | FetchKind::AuthDeleteRole(_) => {
-            auth.has_policy("platform:roles.write")
+            auth_has_policy(auth, "platform:roles.write")
         }
         FetchKind::AuthFolios | FetchKind::AuthRoleFolioIndex => {
-            auth.has_policy("platform:folios.read")
+            auth_has_policy(auth, "platform:folios.read")
         }
         FetchKind::AuthUpsertFolio(_)
         | FetchKind::AuthDeleteFolio(_)
-        | FetchKind::AuthUpdateRoleFolioIndex(_) => auth.has_policy("platform:folios.write"),
-        FetchKind::AuthUsers => auth.has_policy("platform:users.read"),
+        | FetchKind::AuthUpdateRoleFolioIndex(_) => auth_has_policy(auth, "platform:folios.write"),
+        FetchKind::AuthUsers => auth_has_policy(auth, "platform:users.read"),
         FetchKind::AuthUpdateUserRoles { .. }
         | FetchKind::AuthResetUserPasskeys(_)
-        | FetchKind::AuthRevokeUser(_) => auth.has_policy("platform:users.write"),
-        FetchKind::AuthInvites => auth.has_policy("platform:invites.read"),
+        | FetchKind::AuthRevokeUser(_) => auth_has_policy(auth, "platform:users.write"),
+        FetchKind::AuthInvites => auth_has_policy(auth, "platform:invites.read"),
         FetchKind::AuthCreateInvite { .. } | FetchKind::AuthRevokeInvite(_) => {
-            auth.has_policy("platform:invites.write")
+            auth_has_policy(auth, "platform:invites.write")
         }
     }
 }
