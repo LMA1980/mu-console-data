@@ -1389,6 +1389,7 @@ impl Engine {
             kind,
             FetchKind::AuthSession
                 | FetchKind::AuthRedeem(_)
+                | FetchKind::AuthPasskeyRegisterFinish { .. }
                 | FetchKind::AuthPasskeyDelete { .. }
                 | FetchKind::AuthEnableRole(_)
                 | FetchKind::AuthDisableRole(_)

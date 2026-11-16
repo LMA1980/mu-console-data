@@ -1390,6 +1390,84 @@ fn anonymous_lockdown_and_zero_passkey_gate_suppress_non_auth_fetches() {
 }
 
 #[test]
+fn auth_passkey_register_finish_with_session_envelope_bootstraps_streams_and_repos() {
+    use mu_console_protocol::DialogModel;
+
+    let mut eng = Engine::new(304);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let zero_pk_json = r#"{
+        "authenticated": true,
+        "github_login": "alice",
+        "invite_bound": true,
+        "passkey_count": 0,
+        "passkey_enrollment_required": true,
+        "baseline_role": "operator",
+        "bound_roles": ["operator"],
+        "active_policies": []
+    }"#;
+    let gate_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(zero_pk_json.into()), 10);
+    assert!(!gate_fx
+        .iter()
+        .any(|e| matches!(e, Effect::OpenStream { .. })));
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::PasskeyEnrollmentGate(_))
+    ));
+
+    let enroll_finish_json = r#"{
+        "enrolled": true,
+        "credential_id": "pk-1",
+        "passkey_count": 1,
+        "passkey_enrollment_required": false,
+        "session": {
+            "authenticated": true,
+            "github_login": "alice",
+            "invite_bound": true,
+            "passkey_count": 1,
+            "passkey_enrollment_required": false,
+            "baseline_role": "operator",
+            "bound_roles": ["operator"],
+            "active_roles": [{"id": "operator"}],
+            "active_policies": ["system:status.read", "ci:repos.public.read", "ci:queue.read"]
+        }
+    }"#;
+    let finish_fx = eng.on_fetch(
+        &FetchKind::AuthPasskeyRegisterFinish {
+            label: Some("Security Key".into()),
+            attestation_json: r#"{"challenge_id":"ch-1","credential":{"id":"pk-1"}}"#.into(),
+        },
+        Ok(enroll_finish_json.into()),
+        20,
+    );
+
+    assert_eq!(eng.store().view().auth.status, AuthStatus::Active);
+    assert!(eng.store().view().active_dialog.is_none());
+    assert!(finish_fx.contains(&Effect::LoadOffline));
+    assert!(finish_fx.iter().any(|e| matches!(
+        e,
+        Effect::OpenStream {
+            stream: StreamId::Ci,
+            ..
+        }
+    )));
+    assert!(finish_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
+    assert!(finish_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::CiQueue,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn anonymous_bounded_polling_eliminates_log_node_and_registry_leaks() {
     let mut eng = Engine::new(303);
     eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
