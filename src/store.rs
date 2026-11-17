@@ -126,6 +126,10 @@ pub enum Input {
     /// Skin-agnostic dialog open / close transitions.
     OpenDialog(DialogModel),
     CloseDialog,
+    /// Close `DialogModel::SessionRoles` after a successful role elevation or toggle.
+    CloseSessionRolesDialog,
+    /// Surface or clear an inline error inside an open `DialogModel::SessionRoles`.
+    SessionRolesError(Option<String>),
     /// Local or synced skin/font preference update reflected on loaded profile.
     LocalUserPrefs {
         skin: Option<ConsoleSkin>,
@@ -1013,6 +1017,7 @@ fn scenario_operator_auth() -> AuthState {
         baseline_role: Some("operator".into()),
         bound_roles: vec!["operator".into()],
         bound_role_specs: Vec::new(),
+        catalog_role_specs: Vec::new(),
         active_roles: vec![RoleBadgeView {
             role_id: "operator".into(),
             display_name: Some("Operator".into()),
@@ -1191,9 +1196,32 @@ impl Store {
                 if d.display_name.is_none() {
                     d.display_name.clone_from(&spec.display_name);
                 }
-                if !self.auth.bound_role_specs.iter().any(|s| s.id == d.role_id) {
+                if !self.auth.bound_role_specs.iter().any(|s| s.id == d.role_id)
+                    && !self
+                        .auth
+                        .catalog_role_specs
+                        .iter()
+                        .any(|s| s.id == d.role_id)
+                {
                     d.activation = spec.activation;
                     d.step_up = spec.step_up;
+                }
+            }
+        }
+        if self.auth.is_operator() && self.auth.catalog_role_specs.is_empty() {
+            for spec in &self.platform.roles {
+                if !descs.iter().any(|d| d.role_id == spec.id) {
+                    descs.push(SessionRoleDescriptor {
+                        role_id: spec.id.clone(),
+                        display_name: spec.display_name.clone(),
+                        description: spec.description.clone(),
+                        activation: spec.activation,
+                        step_up: spec.step_up,
+                        active: false,
+                        lease: None,
+                        step_up_verified: false,
+                        unassigned: true,
+                    });
                 }
             }
         }
@@ -1412,8 +1440,8 @@ impl Store {
 
         let changed = self.auth != next;
         self.auth = next;
-        self.sync_open_session_roles_dialog();
         let scrubbed = self.scrub_for_current_auth();
+        self.sync_open_session_roles_dialog();
         if lost_privileges || scrubbed {
             self.force_snapshot_pending = true;
         }
@@ -1509,11 +1537,11 @@ impl Store {
             }
         }
         self.sync_active_role_leases();
-        self.sync_open_session_roles_dialog();
         if !expired_roles.is_empty() {
             self.deactivate_expired_roles(&expired_roles);
             changed = true;
         }
+        self.sync_open_session_roles_dialog();
         changed
     }
 
@@ -2852,16 +2880,22 @@ impl Store {
             Input::UserActivityRecorded => self.refresh_idle_timers(now_ms),
             Input::PlatformRoles(roles) => {
                 self.platform.roles = roles;
+                self.sync_open_session_roles_dialog();
                 true
             }
             Input::RoleSpecUpserted(spec) => {
                 upsert_sorted(&mut self.platform.roles, spec, |r| r.id.clone());
+                self.sync_open_session_roles_dialog();
                 true
             }
             Input::RoleSpecDeleted(role_id) => {
                 let before = self.platform.roles.len();
                 self.platform.roles.retain(|r| r.id != role_id);
-                self.platform.roles.len() != before
+                let changed = self.platform.roles.len() != before;
+                if changed {
+                    self.sync_open_session_roles_dialog();
+                }
+                changed
             }
             Input::PlatformFolios(folios) => {
                 self.platform.folios = folios;
@@ -2973,8 +3007,14 @@ impl Store {
                     self.passkey_gate_dismissed = false;
                 }
                 if let DialogModel::SessionRoles(ref mut sr) = dlg {
-                    if sr.roles.is_empty() {
-                        sr.roles = self.resolve_session_role_descriptors();
+                    if sr.github_login.is_empty() {
+                        if let Some(ref login) = self.auth.github_login {
+                            sr.github_login.clone_from(login);
+                        }
+                    }
+                    let resolved = self.resolve_session_role_descriptors();
+                    if sr.roles.is_empty() || !resolved.is_empty() {
+                        sr.roles = resolved;
                     }
                     sr.lock_all_enabled = !self.auth.leases.is_empty();
                 }
@@ -3005,6 +3045,23 @@ impl Store {
                     }
                     self.active_dialog = None;
                     true
+                } else {
+                    false
+                }
+            }
+            Input::CloseSessionRolesDialog => {
+                if matches!(self.active_dialog, Some(DialogModel::SessionRoles(_))) {
+                    self.active_dialog = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            Input::SessionRolesError(err) => {
+                if let Some(DialogModel::SessionRoles(ref mut sr)) = self.active_dialog {
+                    let changed = sr.error_message != err;
+                    sr.error_message = err;
+                    changed
                 } else {
                     false
                 }

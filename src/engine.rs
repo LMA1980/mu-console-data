@@ -305,57 +305,56 @@ impl Engine {
                 }
             }
             UiCommand::EnableRole { role_id } => {
-                if self.require_active_auth(&mut fx, "Active session required to enable roles")
-                    && self.mode == Mode::Live
-                {
-                    self.fetch(FetchKind::AuthEnableRole(role_id), &mut fx);
-                }
+                self.dispatch_role_action(
+                    FetchKind::AuthEnableRole(role_id),
+                    "Active session required to enable roles",
+                    now_ms,
+                    &mut fx,
+                );
             }
             UiCommand::DisableRole { role_id } => {
-                if self.require_active_auth(&mut fx, "Active session required to disable roles")
-                    && self.mode == Mode::Live
-                {
-                    self.fetch(FetchKind::AuthDisableRole(role_id), &mut fx);
-                }
+                self.dispatch_role_action(
+                    FetchKind::AuthDisableRole(role_id),
+                    "Active session required to disable roles",
+                    now_ms,
+                    &mut fx,
+                );
             }
             UiCommand::ElevateWithPasskey {
                 role_id,
                 assertion_json,
             } => {
-                if self.require_active_auth(&mut fx, "Active session required for role elevation")
-                    && self.mode == Mode::Live
-                {
-                    self.fetch(
-                        FetchKind::AuthElevateFinish {
-                            role_id,
-                            assertion_json,
-                        },
-                        &mut fx,
-                    );
-                }
+                self.dispatch_role_action(
+                    FetchKind::AuthElevateFinish {
+                        role_id,
+                        assertion_json,
+                    },
+                    "Active session required for role elevation",
+                    now_ms,
+                    &mut fx,
+                );
             }
             UiCommand::RenewRoleWithPasskey {
                 role_id,
                 assertion_json,
             } => {
-                if self.require_active_auth(&mut fx, "Active session required for role renewal")
-                    && self.mode == Mode::Live
-                {
-                    self.fetch(
-                        FetchKind::AuthRenewRole {
-                            role_id,
-                            assertion_json,
-                        },
-                        &mut fx,
-                    );
-                }
+                self.dispatch_role_action(
+                    FetchKind::AuthRenewRole {
+                        role_id,
+                        assertion_json,
+                    },
+                    "Active session required for role renewal",
+                    now_ms,
+                    &mut fx,
+                );
             }
             UiCommand::LockTimedRoles => {
-                if self.require_active_auth(&mut fx, "Active session required to lock timed roles")
-                    && self.mode == Mode::Live
-                {
-                    self.fetch(FetchKind::AuthLockRoles, &mut fx);
-                }
+                self.dispatch_role_action(
+                    FetchKind::AuthLockRoles,
+                    "Active session required to lock timed roles",
+                    now_ms,
+                    &mut fx,
+                );
             }
             UiCommand::RecordUserActivity => {
                 self.store.apply(Input::UserActivityRecorded, now_ms);
@@ -436,7 +435,9 @@ impl Engine {
                         }
                         DialogModel::SessionRoles(_) => {
                             self.fetch(FetchKind::AuthSession, &mut fx);
-                            self.fetch(FetchKind::AuthRoles, &mut fx);
+                            if self.can_fetch(&FetchKind::AuthRoles) {
+                                self.fetch(FetchKind::AuthRoles, &mut fx);
+                            }
                         }
                         _ => {}
                     }
@@ -881,6 +882,24 @@ impl Engine {
                 self.fetch(FetchKind::AuthFolios, fx);
                 self.fetch(FetchKind::AuthRoleFolioIndex, fx);
             }
+        }
+    }
+
+    fn dispatch_role_action(
+        &mut self,
+        kind: FetchKind,
+        err_msg: &str,
+        now_ms: u64,
+        fx: &mut Vec<Effect>,
+    ) {
+        if self.require_active_auth(fx, err_msg) {
+            self.store.apply(Input::SessionRolesError(None), now_ms);
+            if self.mode == Mode::Live {
+                self.fetch(kind, fx);
+            }
+        } else {
+            self.store
+                .apply(Input::SessionRolesError(Some(err_msg.to_owned())), now_ms);
         }
     }
 
@@ -1384,6 +1403,11 @@ impl Engine {
                 if !((is_optional_probe && matches!(e.status, 404 | 502 | 503))
                     || is_auth_gated_log)
                 {
+                    if is_session_role_mutation(kind) {
+                        let inline_err = format_role_action_http_error(e.status, &e.message);
+                        self.store
+                            .apply(Input::SessionRolesError(Some(inline_err)), now_ms);
+                    }
                     let message = if matches!(kind, FetchKind::AuthSession) {
                         let trimmed = e.message.trim();
                         if trimmed.is_empty() {
@@ -1407,22 +1431,23 @@ impl Engine {
         let input = match parse_fetch(kind, &body) {
             Ok(i) => i,
             Err(msg) => {
+                if is_session_role_mutation(kind) {
+                    let inline_err = crate::api::extract_http_error_message(&msg, Some(&body));
+                    self.store
+                        .apply(Input::SessionRolesError(Some(inline_err)), now_ms);
+                }
                 fx.push(Effect::Post(DataEvent::Error(UiError::Decode(msg))));
                 return fx;
             }
         };
-        let is_auth_kind = matches!(
-            kind,
-            FetchKind::AuthSession
-                | FetchKind::AuthRedeem(_)
-                | FetchKind::AuthPasskeyRegisterFinish { .. }
-                | FetchKind::AuthPasskeyDelete { .. }
-                | FetchKind::AuthEnableRole(_)
-                | FetchKind::AuthDisableRole(_)
-                | FetchKind::AuthElevateFinish { .. }
-                | FetchKind::AuthRenewRole { .. }
-                | FetchKind::AuthLockRoles
-        );
+        let is_auth_kind = is_session_role_mutation(kind)
+            || matches!(
+                kind,
+                FetchKind::AuthSession
+                    | FetchKind::AuthRedeem(_)
+                    | FetchKind::AuthPasskeyRegisterFinish { .. }
+                    | FetchKind::AuthPasskeyDelete { .. }
+            );
         let prev_allowed = self.store.can_emit_operational_data();
         let prev_policies = if is_auth_kind {
             self.store.auth().active_policies.clone()
@@ -1430,6 +1455,9 @@ impl Engine {
             Vec::new()
         };
         self.store.apply(input, now_ms);
+        if is_session_role_mutation(kind) {
+            self.store.apply(Input::CloseSessionRolesDialog, now_ms);
+        }
         if is_auth_kind {
             self.on_auth_transition(prev_allowed, &prev_policies, now_ms, &mut fx);
         }
@@ -1813,6 +1841,31 @@ fn deny_403(fx: &mut Vec<Effect>, message: &str) {
         status: 403,
         message: message.to_owned(),
     })));
+}
+
+const fn is_session_role_mutation(kind: &FetchKind) -> bool {
+    matches!(
+        kind,
+        FetchKind::AuthEnableRole(_)
+            | FetchKind::AuthDisableRole(_)
+            | FetchKind::AuthElevateFinish { .. }
+            | FetchKind::AuthRenewRole { .. }
+            | FetchKind::AuthLockRoles
+    )
+}
+
+fn format_role_action_http_error(status: u32, raw_message: &str) -> String {
+    let fallback = if status == 0 {
+        String::from("Network error")
+    } else {
+        format!("HTTP {status}")
+    };
+    let extracted = crate::api::extract_http_error_message(&fallback, Some(raw_message));
+    if extracted.is_empty() {
+        fallback
+    } else {
+        extracted
+    }
 }
 
 fn can_fetch_for_auth(

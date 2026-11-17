@@ -343,9 +343,20 @@ async fn fetch_json(kind: FetchKind, url: String) {
             message: js_msg(&e),
         })?;
         if !resp.ok() {
+            let status = u32::from(resp.status());
+            let status_text = resp.status_text();
+            let body = match resp.text() {
+                Ok(p) => JsFuture::from(p).await.ok().and_then(|v| v.as_string()),
+                Err(_) => None,
+            };
+            let fallback = if status_text.trim().is_empty() {
+                format!("HTTP {status}")
+            } else {
+                status_text
+            };
             return Err(HttpError {
-                status: u32::from(resp.status()),
-                message: resp.status_text(),
+                status,
+                message: crate::api::extract_http_error_message(&fallback, body.as_deref()),
             });
         }
         let text = match resp.text() {

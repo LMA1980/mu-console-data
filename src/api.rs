@@ -167,6 +167,34 @@ pub fn parse_auth_session(bytes: &[u8]) -> Result<AuthSessionDto, String> {
     }
 }
 
+/// Extract a human-readable error message from a JSON (`{"error": ...}` / `{"message": ...}`)
+/// or plain-text HTTP error body, falling back to `fallback` when the body is empty or HTML.
+#[must_use]
+pub fn extract_http_error_message(fallback: &str, body: Option<&str>) -> String {
+    if let Some(raw) = body {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(trimmed)
+            {
+                if let Some(msg) = map
+                    .get("error")
+                    .or_else(|| map.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return msg.to_owned();
+                }
+            }
+            if !trimmed.starts_with('<') {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    fallback.trim().to_owned()
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ReposEnvelope {
@@ -1910,5 +1938,33 @@ pub(crate) mod tests {
         };
         assert_eq!(folios.len(), 1);
         assert_eq!(folios[0].policies.len(), 2);
+    }
+
+    #[test]
+    fn extract_http_error_message_handles_json_plain_html_and_empty() {
+        assert_eq!(
+            extract_http_error_message(
+                "Forbidden",
+                Some(r#"{"error":"Invalid Passkey assertion"}"#)
+            ),
+            "Invalid Passkey assertion"
+        );
+        assert_eq!(
+            extract_http_error_message("Forbidden", Some(r#"{"message":"Step-up expired"}"#)),
+            "Step-up expired"
+        );
+        assert_eq!(
+            extract_http_error_message("Forbidden", Some("Role not bound")),
+            "Role not bound"
+        );
+        assert_eq!(
+            extract_http_error_message("Bad Gateway", Some("<html><body>502</body></html>")),
+            "Bad Gateway"
+        );
+        assert_eq!(
+            extract_http_error_message("HTTP 403", Some("   ")),
+            "HTTP 403"
+        );
+        assert_eq!(extract_http_error_message("HTTP 403", None), "HTTP 403");
     }
 }

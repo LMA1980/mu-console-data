@@ -2822,6 +2822,7 @@ fn super_operator_renewal_envelope_tick_transition_and_dialog_sync() {
             github_login: "LMA1980".into(),
             roles: Vec::new(),
             lock_all_enabled: true,
+            error_message: None,
         })),
         775_000,
     );
@@ -2890,4 +2891,558 @@ fn super_operator_renewal_envelope_tick_transition_and_dialog_sync() {
     );
     assert_eq!(eng.store().view().auth.leases[0].renewals_used, 1);
     assert!(!eng.store().view().auth.leases[0].can_renew);
+    assert!(eng.store().view().active_dialog.is_none());
+}
+
+#[test]
+fn session_roles_hydrates_from_session_without_platform_roles_read_and_skips_auth_roles_fetch() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        DialogModel, RoleActivationDto, RoleSpecDto, SessionRolesDialogModel, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(309);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let op_spec = RoleSpecDto {
+        id: "operator".into(),
+        display_name: Some("Operator".into()),
+        description: "Baseline CI/CD read-only operator".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let ci_spec = RoleSpecDto {
+        id: "ci-operator".into(),
+        display_name: Some("CI Operator".into()),
+        description: "Elective CI job restart and resume".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let admin_spec = RoleSpecDto {
+        id: "platform-admin".into(),
+        display_name: Some("Platform Admin".into()),
+        description: "Timed Passkey role for platform configuration".into(),
+        activation: RoleActivationDto::timed(900, 300),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "All-access Passkey role".into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let auditor_spec = RoleSpecDto {
+        id: "audit-viewer".into(),
+        display_name: Some("Audit Viewer".into()),
+        description: "Unassigned catalog audit role".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec![
+            "operator".into(),
+            "ci-operator".into(),
+            "platform-admin".into(),
+        ],
+        bound_role_specs: vec![op_spec.clone(), ci_spec.clone(), admin_spec.clone()],
+        catalog_role_specs: vec![
+            op_spec.clone(),
+            ci_spec.clone(),
+            admin_spec.clone(),
+            super_spec,
+            auditor_spec,
+        ],
+        active_roles: vec![op_spec],
+        active_policies: vec!["system:status.read".into(), "ci:queue.read".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        10,
+    );
+    assert!(!eng.store().auth().has_policy("platform:roles.read"));
+
+    let open_fx = eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        20,
+    );
+    assert!(open_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+    assert!(!open_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthRoles,
+            ..
+        }
+    )));
+
+    let Some(DialogModel::SessionRoles(sr)) = eng.store().view().active_dialog else {
+        panic!("expected SessionRoles dialog to be open");
+    };
+    assert_eq!(sr.github_login, "LMA1980");
+    assert!(!sr.lock_all_enabled);
+    assert_eq!(sr.error_message, None);
+
+    let bound: Vec<_> = sr.roles.iter().filter(|r| !r.unassigned).collect();
+    let unassigned: Vec<_> = sr.roles.iter().filter(|r| r.unassigned).collect();
+    assert_eq!(
+        bound.iter().map(|r| r.role_id.as_str()).collect::<Vec<_>>(),
+        vec!["operator", "ci-operator", "platform-admin"]
+    );
+    assert!(bound[0].active);
+    assert!(!bound[1].active);
+    assert!(!bound[2].active);
+    assert_eq!(bound[2].step_up, StepUpRequirement::Passkey);
+    assert_eq!(
+        unassigned
+            .iter()
+            .map(|r| r.role_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["super-operator", "audit-viewer"]
+    );
+    assert!(unassigned.iter().all(|r| !r.active && r.lease.is_none()));
+
+    // Refetching GET /api/auth/session refreshes descriptors while keeping SessionRoles open.
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        30,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(ref dlg)) if dlg.roles.len() == 5
+    ));
+}
+
+#[test]
+fn session_roles_auto_closes_on_elective_toggle_and_passkey_elevation_success() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        DialogModel, RoleActivationDto, RoleLeaseView, RoleSpecDto, SessionRolesDialogModel,
+        StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(310);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let op_spec = RoleSpecDto {
+        id: "operator".into(),
+        display_name: Some("Operator".into()),
+        description: "Baseline".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let ci_spec = RoleSpecDto {
+        id: "ci-operator".into(),
+        display_name: Some("CI Operator".into()),
+        description: "Elective CI".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let admin_spec = RoleSpecDto {
+        id: "platform-admin".into(),
+        display_name: Some("Platform Admin".into()),
+        description: "Timed admin".into(),
+        activation: RoleActivationDto::timed(900, 300),
+        step_up: StepUpRequirement::Passkey,
+    };
+
+    let base_session = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec![
+            "operator".into(),
+            "ci-operator".into(),
+            "platform-admin".into(),
+        ],
+        bound_role_specs: vec![op_spec.clone(), ci_spec.clone(), admin_spec.clone()],
+        catalog_role_specs: vec![op_spec.clone(), ci_spec.clone(), admin_spec.clone()],
+        active_roles: vec![op_spec.clone()],
+        active_policies: vec!["system:status.read".into(), "ci:queue.read".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&base_session).unwrap()),
+        10,
+    );
+    let _ = eng.tick(100);
+
+    // 1. Enable Elective role `ci-operator` -> auto-closes SessionRoles on success.
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        110,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(_))
+    ));
+    let enable_cmd_fx = eng.handle(
+        UiCommand::EnableRole {
+            role_id: "ci-operator".into(),
+        },
+        120,
+    );
+    assert!(enable_cmd_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthEnableRole(r),
+            ..
+        } if r == "ci-operator"
+    )));
+    let enabled_session = AuthSessionDto {
+        active_roles: vec![op_spec.clone(), ci_spec.clone()],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:jobs.restart".into(),
+        ],
+        ..base_session.clone()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthEnableRole("ci-operator".into()),
+        Ok(serde_json::to_string(&enabled_session).unwrap()),
+        130,
+    );
+    assert!(eng.store().view().active_dialog.is_none());
+    let tick_fx = eng.tick(250);
+    assert!(tick_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Patch(_)))));
+
+    // 2. Elevate Timed role `platform-admin` via Passkey -> auto-closes SessionRoles on success.
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        260,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(_))
+    ));
+    eng.handle(
+        UiCommand::ElevateWithPasskey {
+            role_id: "platform-admin".into(),
+            assertion_json: r#"{"challenge_id":"c1","credential":{}}"#.into(),
+        },
+        270,
+    );
+    let elevated_session = AuthSessionDto {
+        active_roles: vec![op_spec.clone(), ci_spec, admin_spec],
+        leases: vec![RoleLeaseView {
+            role_id: "platform-admin".into(),
+            display_name: Some("Platform Admin".into()),
+            activated_at_ms: 280,
+            last_activity_at_ms: 280,
+            hard_expires_at_ms: 900_280,
+            idle_expires_at_ms: 300_280,
+            hard_ttl_secs: 900,
+            idle_ttl_secs: 300,
+            seconds_remaining: 900,
+            idle_timer: 300,
+            ..RoleLeaseView::default()
+        }],
+        active_policies: vec![
+            "system:status.read".into(),
+            "ci:queue.read".into(),
+            "ci:jobs.restart".into(),
+            "platform:roles.read".into(),
+        ],
+        ..base_session.clone()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthElevateFinish {
+            role_id: "platform-admin".into(),
+            assertion_json: "{}".into(),
+        },
+        Ok(serde_json::json!({ "elevated": true, "session": elevated_session }).to_string()),
+        280,
+    );
+    assert!(eng.store().view().active_dialog.is_none());
+    assert_eq!(eng.store().view().auth.leases.len(), 1);
+
+    // 3. Disable Elective role `ci-operator` -> auto-closes SessionRoles on success.
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        290,
+    );
+    eng.on_fetch(
+        &FetchKind::AuthDisableRole("ci-operator".into()),
+        Ok(serde_json::to_string(&base_session).unwrap()),
+        300,
+    );
+    assert!(eng.store().view().active_dialog.is_none());
+
+    // 4. Lock timed roles -> auto-closes SessionRoles on success.
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        310,
+    );
+    eng.on_fetch(
+        &FetchKind::AuthLockRoles,
+        Ok(serde_json::to_string(&base_session).unwrap()),
+        320,
+    );
+    assert!(eng.store().view().active_dialog.is_none());
+}
+
+#[test]
+fn session_roles_stays_open_with_error_message_on_step_up_or_toggle_failure() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        DialogModel, RoleActivationDto, RoleSpecDto, SessionRolesDialogModel, StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(311);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let op_spec = RoleSpecDto {
+        id: "operator".into(),
+        display_name: Some("Operator".into()),
+        description: "Baseline".into(),
+        activation: RoleActivationDto::pinned_baseline(),
+        step_up: StepUpRequirement::None,
+    };
+    let ci_spec = RoleSpecDto {
+        id: "ci-operator".into(),
+        display_name: Some("CI Operator".into()),
+        description: "Elective CI".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+    let admin_spec = RoleSpecDto {
+        id: "platform-admin".into(),
+        display_name: Some("Platform Admin".into()),
+        description: "Timed admin".into(),
+        activation: RoleActivationDto::timed(900, 300),
+        step_up: StepUpRequirement::Passkey,
+    };
+
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec![
+            "operator".into(),
+            "ci-operator".into(),
+            "platform-admin".into(),
+        ],
+        bound_role_specs: vec![op_spec.clone(), ci_spec.clone(), admin_spec.clone()],
+        catalog_role_specs: vec![op_spec.clone(), ci_spec.clone(), admin_spec],
+        active_roles: vec![op_spec.clone()],
+        active_policies: vec!["system:status.read".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        10,
+    );
+    let _ = eng.tick(100);
+
+    eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        110,
+    );
+    let _ = eng.tick(250);
+
+    // 1. Passkey step-up HTTP failure preserves SessionRoles open with extracted error_message.
+    let err_fx = eng.on_fetch(
+        &FetchKind::AuthElevateFinish {
+            role_id: "platform-admin".into(),
+            assertion_json: "{}".into(),
+        },
+        Err(HttpError {
+            status: 403,
+            message: r#"{"code":"step_up_failed","error":"Invalid Passkey assertion"}"#.into(),
+        }),
+        260,
+    );
+    assert!(err_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Error(UiError::Http { status: 403, .. }))
+    )));
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(ref dlg))
+            if dlg.error_message.as_deref() == Some("Invalid Passkey assertion")
+    ));
+    let patch_fx = eng.tick(400);
+    assert!(patch_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Patch(_)))));
+
+    // Background AuthSession refresh keeps SessionRoles open and preserves error_message.
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        410,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(ref dlg))
+            if dlg.error_message.as_deref() == Some("Invalid Passkey assertion")
+    ));
+
+    // 2. Dispatching a new toggle clears stale error_message; failure on toggle preserves new error.
+    eng.handle(
+        UiCommand::EnableRole {
+            role_id: "ci-operator".into(),
+        },
+        420,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(ref dlg)) if dlg.error_message.is_none()
+    ));
+    eng.on_fetch(
+        &FetchKind::AuthEnableRole("ci-operator".into()),
+        Err(HttpError {
+            status: 403,
+            message: "Role binding revoked".into(),
+        }),
+        430,
+    );
+    assert!(matches!(
+        eng.store().view().active_dialog,
+        Some(DialogModel::SessionRoles(ref dlg))
+            if dlg.error_message.as_deref() == Some("Role binding revoked")
+    ));
+
+    // 3. Subsequent successful Elective toggle auto-closes SessionRoles.
+    let s2 = AuthSessionDto {
+        active_roles: vec![op_spec, ci_spec],
+        ..s1
+    };
+    eng.on_fetch(
+        &FetchKind::AuthEnableRole("ci-operator".into()),
+        Ok(serde_json::to_string(&s2).unwrap()),
+        440,
+    );
+    assert!(eng.store().view().active_dialog.is_none());
+}
+
+#[test]
+fn session_roles_expiry_updates_open_dialog_and_legacy_platform_roles_enrichment() {
+    use mu_console_protocol::dto::AuthSessionDto;
+    use mu_console_protocol::{
+        DialogModel, RoleActivationDto, RoleLeaseView, RoleSpecDto, SessionRolesDialogModel,
+        StepUpRequirement,
+    };
+
+    let mut eng = Engine::new(312);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let admin_spec = RoleSpecDto {
+        id: "platform-admin".into(),
+        display_name: Some("Platform Admin".into()),
+        description: "Timed admin".into(),
+        activation: RoleActivationDto::timed(10, 10),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let catalog_only_spec = RoleSpecDto {
+        id: "audit-viewer".into(),
+        display_name: Some("Audit Viewer".into()),
+        description: "Read-only audit catalog role".into(),
+        activation: RoleActivationDto::elective(),
+        step_up: StepUpRequirement::None,
+    };
+
+    // Older controller shape: bound_roles without bound_role_specs/catalog_role_specs,
+    // while active role holds platform:roles.read so AuthRoles enriches the open dialog.
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("LMA1980".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "platform-admin".into()],
+        active_roles: vec![admin_spec.clone()],
+        leases: vec![RoleLeaseView {
+            role_id: "platform-admin".into(),
+            display_name: Some("Platform Admin".into()),
+            activated_at_ms: 0,
+            last_activity_at_ms: 0,
+            hard_expires_at_ms: 10_000,
+            idle_expires_at_ms: 10_000,
+            hard_ttl_secs: 10,
+            idle_ttl_secs: 10,
+            seconds_remaining: 10,
+            idle_timer: 10,
+            ..RoleLeaseView::default()
+        }],
+        active_policies: vec!["system:status.read".into(), "platform:roles.read".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        0,
+    );
+
+    let open_fx = eng.handle(
+        UiCommand::OpenDialog(DialogModel::SessionRoles(SessionRolesDialogModel::default())),
+        100,
+    );
+    assert!(open_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthRoles,
+            ..
+        }
+    )));
+    eng.on_fetch(
+        &FetchKind::AuthRoles,
+        Ok(serde_json::to_string(&vec![admin_spec, catalog_only_spec]).unwrap()),
+        150,
+    );
+
+    if let Some(DialogModel::SessionRoles(sr)) = eng.store().view().active_dialog {
+        assert!(sr.lock_all_enabled);
+        assert!(sr
+            .roles
+            .iter()
+            .any(|r| r.role_id == "audit-viewer" && r.unassigned));
+        assert!(sr
+            .roles
+            .iter()
+            .any(|r| r.role_id == "platform-admin" && !r.unassigned && r.active));
+    } else {
+        panic!("expected SessionRoles open");
+    }
+
+    // Lease hits 00:00 at t = 10_000 -> open SessionRoles immediately transitions role to dormant
+    // and scrubs platform.roles once platform:roles.read is revoked.
+    let _ = eng.tick(10_000);
+    if let Some(DialogModel::SessionRoles(sr)) = eng.store().view().active_dialog {
+        assert!(!sr.lock_all_enabled);
+        let admin = sr
+            .roles
+            .iter()
+            .find(|r| r.role_id == "platform-admin")
+            .expect("platform-admin descriptor");
+        assert!(!admin.active);
+        assert!(admin.lease.is_none());
+        assert!(!admin.step_up_verified);
+        assert!(!sr.roles.iter().any(|r| r.role_id == "audit-viewer"));
+    } else {
+        panic!("expected SessionRoles to remain open after passive lease expiry");
+    }
 }
