@@ -208,6 +208,7 @@ pub struct Store {
     offline: Option<(u64, ViewModel)>,
     loaded: bool,
     dirty: bool,
+    lease_timer_dirty: bool,
 }
 
 fn pct_to_bp(pct: f64) -> u32 {
@@ -1148,11 +1149,18 @@ impl Store {
     }
 
     /// Refresh `idle_expires_at_ms` across all active `Timed` leases on explicit user activity.
+    ///
+    /// Returns `true` only when a structural auth transition occurs (`can_renew` or expiry);
+    /// pure countdown extensions set `lease_timer_dirty` without marking the full view dirty.
     pub fn refresh_idle_timers(&mut self, now_ms: u64) -> bool {
-        let mut changed = false;
+        let mut structural_changed = false;
+        let mut timer_changed = false;
         for lease in &mut self.auth.leases {
             normalize_lease_deadlines(lease, now_ms);
             let prev_idle = lease.idle_timer;
+            let prev_idle_exp = lease.idle_expires_at_ms;
+            let prev_can_renew = lease.can_renew;
+            let prev_expired = lease.is_expired();
             lease.last_activity_at_ms = now_ms;
             if lease.idle_ttl_secs > 0 {
                 let target = now_ms
@@ -1163,16 +1171,23 @@ impl Store {
                 }
             }
             let _ = lease.tick_at(now_ms);
-            if lease.idle_timer != prev_idle {
-                changed = true;
+            if lease.can_renew != prev_can_renew || lease.is_expired() != prev_expired {
+                structural_changed = true;
+            } else if lease.idle_timer != prev_idle || lease.idle_expires_at_ms != prev_idle_exp {
+                timer_changed = true;
             }
         }
         self.sync_active_role_leases();
         self.sync_open_session_roles_dialog();
-        if changed {
+        if structural_changed {
             self.dirty = true;
+            true
+        } else {
+            if timer_changed {
+                self.lease_timer_dirty = true;
+            }
+            false
         }
-        changed
     }
 
     fn sync_active_role_leases(&mut self) {
@@ -1523,14 +1538,17 @@ impl Store {
         if self.auth.leases.is_empty() {
             return false;
         }
-        let mut changed = false;
+        let mut structural_changed = false;
+        let mut timer_changed = false;
         let mut expired_roles = Vec::new();
         for lease in &mut self.auth.leases {
             normalize_lease_deadlines(lease, now_ms);
             let prev = (lease.seconds_remaining, lease.idle_timer, lease.can_renew);
             let alive = lease.tick_at(now_ms);
-            if (lease.seconds_remaining, lease.idle_timer, lease.can_renew) != prev {
-                changed = true;
+            if lease.can_renew != prev.2 {
+                structural_changed = true;
+            } else if (lease.seconds_remaining, lease.idle_timer) != (prev.0, prev.1) {
+                timer_changed = true;
             }
             if !alive {
                 expired_roles.push(lease.role_id.clone());
@@ -1539,10 +1557,17 @@ impl Store {
         self.sync_active_role_leases();
         if !expired_roles.is_empty() {
             self.deactivate_expired_roles(&expired_roles);
-            changed = true;
+            structural_changed = true;
         }
         self.sync_open_session_roles_dialog();
-        changed
+        if structural_changed {
+            true
+        } else {
+            if timer_changed {
+                self.lease_timer_dirty = true;
+            }
+            false
+        }
     }
 
     fn scrub_for_current_auth(&mut self) -> bool {
@@ -1585,6 +1610,7 @@ impl Store {
             self.model_runner = ModelRunnerView::default();
             self.platform = PlatformSnapshotDto::default();
             self.offline = None;
+            self.lease_timer_dirty = false;
             return had_data;
         }
 
@@ -1775,9 +1801,41 @@ impl Store {
         self.dirty
     }
 
-    /// Read and clear the dirty flag.
+    /// Read and clear the dirty flag (along with any pending lease-timer-only flag).
     pub fn take_dirty(&mut self) -> bool {
+        self.lease_timer_dirty = false;
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Whether only `Timed` role lease countdown fields changed since the last emission.
+    #[must_use]
+    pub fn is_lease_timer_dirty(&self) -> bool {
+        self.lease_timer_dirty
+    }
+
+    /// Read and clear the lease-timer-only dirty flag.
+    pub fn take_lease_timer_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.lease_timer_dirty)
+    }
+
+    /// Current modal dialog as projected into [`Self::view`].
+    #[must_use]
+    pub fn projected_active_dialog(&self) -> Option<DialogModel> {
+        if !self.can_emit_operational_data()
+            && self.auth.status == AuthStatus::PasskeyEnrollmentRequired
+            && !self.passkey_gate_dismissed
+            && !matches!(self.active_dialog, Some(DialogModel::UserProfile(_)))
+        {
+            Some(DialogModel::PasskeyEnrollmentGate(
+                PasskeyEnrollmentGateModel {
+                    github_login: self.auth.github_login.clone().unwrap_or_default(),
+                    passkey_count: self.auth.passkey_count,
+                    reason_code: self.auth.reason_code,
+                },
+            ))
+        } else {
+            self.active_dialog.clone()
+        }
     }
 
     /// Whether an explicit log search query is currently active in the view.
@@ -4565,20 +4623,7 @@ impl Store {
             } else {
                 None
             };
-            let active_dialog = if self.auth.status == AuthStatus::PasskeyEnrollmentRequired
-                && !self.passkey_gate_dismissed
-                && !matches!(self.active_dialog, Some(DialogModel::UserProfile(_)))
-            {
-                Some(DialogModel::PasskeyEnrollmentGate(
-                    PasskeyEnrollmentGateModel {
-                        github_login: self.auth.github_login.clone().unwrap_or_default(),
-                        passkey_count: self.auth.passkey_count,
-                        reason_code: self.auth.reason_code,
-                    },
-                ))
-            } else {
-                self.active_dialog.clone()
-            };
+            let active_dialog = self.projected_active_dialog();
             return ViewModel {
                 source: self.source.clone(),
                 auth: self.auth.clone(),
