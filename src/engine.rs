@@ -1605,6 +1605,7 @@ impl Engine {
                     if let Some((repo, job_id)) = stage_changed {
                         self.fetch(FetchKind::CiQueue, &mut fx);
                         self.fetch(FetchKind::Summary(repo), &mut fx);
+                        self.fetch(FetchKind::ObsProblems, &mut fx);
                         if job_id > 0 {
                             self.fetch(FetchKind::JobDetail(job_id), &mut fx);
                             self.fetch_active_job_log(job_id, &mut fx);

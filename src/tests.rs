@@ -3561,3 +3561,54 @@ fn timed_lease_countdown_and_activity_emit_auth_only_patches_without_dirtying_vi
         }
     )));
 }
+
+#[test]
+fn job_stage_changed_refreshes_obs_problems_and_clears_fixed_test_alerts() {
+    let mut eng = Engine::new(42);
+    let _ = eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(
+            r#"{
+                "authenticated":true,"invite_bound":true,"github_login":"viewer","passkey_count":1,
+                "baseline_role":"viewer","bound_roles":["viewer"],
+                "active_policies":["system:status.read","ci:queue.read","ci:repos.public.read","ci:jobs.read","obs:problems.read"]
+            }"#
+            .into(),
+        ),
+        2,
+    );
+    let _ = eng.on_stream_open(StreamId::Ci, 5);
+
+    let _ = eng.on_fetch(
+        &FetchKind::ObsProblems,
+        Ok(
+            r#"{"problems":[{"problem_id":"PROB-TEST-jero-core-cargo-test-foo","title":"Failing Test jero-core::foo (cargo-test)","category":"test_flakiness","severity":"error","impacted_entity":"lma1980/jero-core","active":true,"status":"OPEN"}]}"#
+                .into(),
+        ),
+        10,
+    );
+    assert_eq!(eng.store().view().observe.problems.len(), 1);
+
+    let sse_stage = concat!(
+        "event: job_stage_changed\n",
+        "data: {\"owner\":\"LMA1980\",\"repo\":\"jero-core\",\"job_id\":\"job-1794054805-5cec9056\",\"ref\":\"main\",\"stage\":\"test-check\",\"state\":\"passed\",\"fabric_rev\":12}\n\n"
+    );
+    let stage_fx = eng.on_stream_chunk(StreamId::Ci, sse_stage.as_bytes(), 20);
+    assert!(
+        stage_fx.iter().any(|e| matches!(
+            e,
+            Effect::Fetch {
+                kind: FetchKind::ObsProblems,
+                url
+            } if url == "/api/obs/v1/problems"
+        )),
+        "job_stage_changed must refresh ObsProblems when obs:problems.read is active"
+    );
+
+    let _ = eng.on_fetch(&FetchKind::ObsProblems, Ok("[]".into()), 30);
+    assert!(
+        eng.store().view().observe.problems.is_empty(),
+        "empty ObsProblems refresh must immediately clear fixed test alert"
+    );
+}
