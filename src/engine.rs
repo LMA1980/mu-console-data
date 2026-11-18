@@ -1811,12 +1811,23 @@ impl Engine {
             self.fetch(FetchKind::AuthSession, &mut fx);
         }
         let dirty = self.store.is_dirty();
-        let store = &mut self.store;
-        if let Some(ev) = self.out.poll(now_ms, dirty, || {
-            store.take_dirty();
-            store.view()
-        }) {
-            fx.push(Effect::Post(ev));
+        if dirty || self.out.needs_snapshot() || self.out.is_hidden() {
+            let store = &mut self.store;
+            if let Some(ev) = self.out.poll(now_ms, dirty, || {
+                store.take_dirty();
+                store.view()
+            }) {
+                fx.push(Effect::Post(ev));
+            }
+        } else if self.store.is_lease_timer_dirty() && self.out.ready(now_ms) {
+            self.store.take_lease_timer_dirty();
+            let active_dialog = self.store.projected_active_dialog();
+            if let Some(ev) = self
+                .out
+                .poll_auth_only(now_ms, self.store.auth(), &active_dialog)
+            {
+                fx.push(Effect::Post(ev));
+            }
         }
         if !self.out.is_hidden() {
             let badges = self.store.badges();

@@ -3446,3 +3446,118 @@ fn session_roles_expiry_updates_open_dialog_and_legacy_platform_roles_enrichment
         panic!("expected SessionRoles to remain open after passive lease expiry");
     }
 }
+
+#[test]
+fn timed_lease_countdown_and_activity_emit_auth_only_patches_without_dirtying_view() {
+    use mu_console_protocol::dto::{AuthSessionDto, RoleActivationDto, RoleSpecDto};
+    use mu_console_protocol::{Delta, RoleLeaseView, StepUpRequirement};
+
+    let mut eng = Engine::new(711);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+
+    let super_spec = RoleSpecDto {
+        id: "super-operator".into(),
+        display_name: Some("Super Operator".into()),
+        description: "All-access Passkey role".into(),
+        activation: RoleActivationDto::super_operator(),
+        step_up: StepUpRequirement::Passkey,
+    };
+    let s1 = AuthSessionDto {
+        authenticated: true,
+        github_login: Some("ops".into()),
+        invite_bound: true,
+        passkey_count: 1,
+        baseline_role: Some("operator".into()),
+        bound_roles: vec!["operator".into(), "super-operator".into()],
+        bound_role_specs: vec![super_spec.clone()],
+        active_roles: vec![super_spec],
+        leases: vec![RoleLeaseView {
+            role_id: "super-operator".into(),
+            display_name: Some("Super Operator".into()),
+            activated_at_ms: 0,
+            last_activity_at_ms: 0,
+            hard_expires_at_ms: 900_000,
+            idle_expires_at_ms: 300_000,
+            hard_ttl_secs: 900,
+            idle_ttl_secs: 300,
+            renew_window_secs: 120,
+            renew_extend_secs: 900,
+            max_renewals: 1,
+            renewals_used: 0,
+            seconds_remaining: 900,
+            idle_timer: 300,
+            can_renew: false,
+        }],
+        active_policies: vec!["system:status.read".into(), "ci:queue.read".into()],
+        ..AuthSessionDto::default()
+    };
+    eng.on_fetch(
+        &FetchKind::AuthSession,
+        Ok(serde_json::to_string(&s1).unwrap()),
+        50,
+    );
+    let init_fx = eng.tick(100);
+    assert!(init_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))));
+    assert!(!eng.store().is_dirty());
+
+    // 1 Hz passive countdown tick must NOT mark full store dirty; emits auth-only Delta::Auth.
+    let tick_fx = eng.tick(1_100);
+    assert!(!eng.store().is_dirty());
+    assert!(!eng.store().is_lease_timer_dirty());
+    let patches: Vec<_> = tick_fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Post(DataEvent::Patch(deltas)) => Some(deltas),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(patches.len(), 1);
+    assert!(matches!(patches[0].as_slice(), [Delta::Auth(_)]));
+
+    // Explicit RecordUserActivity extends idle_timer via lease_timer_dirty without dirtying full view.
+    let _ = eng.handle(UiCommand::RecordUserActivity, 2_100);
+    assert!(!eng.store().is_dirty());
+    assert!(eng.store().is_lease_timer_dirty());
+    let act_tick_fx = eng.tick(2_200);
+    assert!(!eng.store().is_dirty());
+    let act_patches: Vec<_> = act_tick_fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Post(DataEvent::Patch(deltas)) => Some(deltas),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(act_patches.len(), 1);
+    assert!(matches!(act_patches[0].as_slice(), [Delta::Auth(_)]));
+
+    // Keep idle timer alive into the 120s renewal window, then enter window at 780_000ms.
+    let _ = eng.handle(UiCommand::RecordUserActivity, 775_000);
+    let _ = eng.tick(775_100);
+    // Entering the 120s renewal window (780_000ms) is a structural transition (can_renew flips true).
+    let win_fx = eng.tick(780_000);
+    assert!(eng
+        .store()
+        .auth()
+        .leases
+        .first()
+        .is_some_and(|l| l.can_renew));
+    assert!(win_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Patch(deltas)) if deltas.iter().any(|d| matches!(d, Delta::Auth(_)))
+    )));
+
+    // Hitting 00:00 expiry triggers forced Snapshot and session refresh.
+    let exp_fx = eng.tick(900_000);
+    assert!(exp_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Post(DataEvent::Snapshot(_)))));
+    assert!(exp_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::AuthSession,
+            ..
+        }
+    )));
+}

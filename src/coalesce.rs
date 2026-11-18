@@ -10,7 +10,7 @@
 //! [`DataEvent::Heartbeat`]s go out; the first poll after the tab becomes
 //! visible again sends a full [`DataEvent::Snapshot`].
 
-use mu_console_protocol::{diff, DataEvent, ViewModel};
+use mu_console_protocol::{diff, AuthState, DataEvent, Delta, DialogModel, ViewModel};
 
 /// Minimum spacing of view emissions (10 Hz).
 pub const MIN_INTERVAL_MS: u64 = 100;
@@ -113,6 +113,34 @@ impl Coalescer {
         self.last_emit_ms = Some(now_ms);
         Some(event)
     }
+
+    /// Emit a lightweight `DataEvent::Patch` carrying only auth/session-dialog updates
+    /// without cloning or diffing the full [`ViewModel`].
+    pub fn poll_auth_only(
+        &mut self,
+        now_ms: u64,
+        auth: &AuthState,
+        active_dialog: &Option<DialogModel>,
+    ) -> Option<DataEvent> {
+        if self.hidden || !self.ready(now_ms) || self.needs_snapshot() {
+            return None;
+        }
+        let prev = self.sent.as_mut()?;
+        let mut patch = Vec::new();
+        if &prev.auth != auth {
+            prev.auth = auth.clone();
+            patch.push(Delta::Auth(auth.clone()));
+        }
+        if &prev.active_dialog != active_dialog {
+            prev.active_dialog = active_dialog.clone();
+            patch.push(Delta::ActiveDialog(active_dialog.clone()));
+        }
+        if patch.is_empty() {
+            return None;
+        }
+        self.last_emit_ms = Some(now_ms);
+        Some(DataEvent::Patch(patch))
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +215,47 @@ mod tests {
             c.poll(61_000, false, || vm(5)),
             Some(DataEvent::Snapshot(v)) if v.nodes.len() == 5
         ));
+    }
+
+    #[test]
+    fn poll_auth_only_emits_only_auth_and_dialog_deltas_and_updates_sent_mirror() {
+        use mu_console_protocol::{AuthStatus, RoleLeaseView};
+
+        let mut c = Coalescer::new();
+        assert_eq!(
+            c.poll_auth_only(0, &AuthState::default(), &None),
+            None,
+            "must wait until initial snapshot is sent"
+        );
+        let initial = vm(3);
+        let Some(DataEvent::Snapshot(mut mirror)) = c.poll(0, true, || initial) else {
+            panic!("expected initial snapshot");
+        };
+
+        let mut next_auth = mirror.auth.clone();
+        next_auth.status = AuthStatus::Active;
+        next_auth.leases.push(RoleLeaseView {
+            role_id: "super-operator".into(),
+            seconds_remaining: 899,
+            idle_timer: 299,
+            ..RoleLeaseView::default()
+        });
+
+        // Respects MIN_INTERVAL_MS coalescing window.
+        assert_eq!(c.poll_auth_only(50, &next_auth, &None), None);
+
+        let ev = c
+            .poll_auth_only(100, &next_auth, &None)
+            .expect("expected auth-only patch");
+        match &ev {
+            DataEvent::Patch(deltas) => {
+                assert_eq!(deltas.len(), 1);
+                assert!(matches!(&deltas[0], Delta::Auth(a) if a == &next_auth));
+                apply_all(&mut mirror, deltas);
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
+        assert_eq!(Some(&mirror), c.sent());
+        assert_eq!(c.poll_auth_only(250, &next_auth, &None), None);
     }
 }
