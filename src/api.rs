@@ -14,12 +14,13 @@ use mu_console_protocol::dto::{
     TaintedDigestDto, TaintedDto, TopologyDto, TraceDto, UserProfileDto,
 };
 use mu_console_protocol::{
-    sanitize_ansi_log_lines, CanaryBundleState, CdLease, ConsoleSkin, CrtFont, RepoId,
+    sanitize_ansi_log_lines, CanaryBundleState, CdLease, ConsoleSkin, CrtFont, LogSeverity, RepoId,
     DEFAULT_MAX_JOB_LOG_LINES,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use crate::log_cache::CachedObsLog;
 use crate::store::Input;
 
 /// Which REST resource or mutating endpoint a fetch targets.
@@ -50,6 +51,11 @@ pub enum FetchKind {
     ObsTraces,
     ObsTraceDetail(String),
     ObsLogs,
+    ObsLogsOlder {
+        before: String,
+        limit: usize,
+        gen: u64,
+    },
     ObsMetrics,
     ObsStoreStatus,
     ObsSubsystemStatus,
@@ -63,6 +69,12 @@ pub enum FetchKind {
     ObsIngressRoutes,
     ObsIngressUpstreams,
     ObsLogsQuery(String),
+    ObsLogsQueryPage {
+        query: String,
+        before: Option<String>,
+        limit: usize,
+        gen: u64,
+    },
     MrStatus,
     MrConnection,
     AuthSession,
@@ -588,14 +600,156 @@ enum TracesEnvelope {
     },
 }
 
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawObsLogItemDto {
+    #[serde(default, alias = "timestamp_ns", deserialize_with = "null_default")]
+    timestamp_unix_nano: i64,
+    #[serde(default, deserialize_with = "null_default")]
+    timestamp_ms: u64,
+    #[serde(default, alias = "severity_text", deserialize_with = "null_default")]
+    severity: LogSeverity,
+    #[serde(default, deserialize_with = "null_default")]
+    service: String,
+    #[serde(default, deserialize_with = "null_default")]
+    service_name: String,
+    #[serde(default)]
+    span_id: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    trace_id: String,
+    #[serde(default, alias = "body", deserialize_with = "null_default")]
+    message: String,
+    #[serde(default, deserialize_with = "null_default")]
+    line_no: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    dedup_hash: u64,
+}
+
+impl RawObsLogItemDto {
+    fn resolved_service(&self) -> String {
+        if !self.service.trim().is_empty() {
+            self.service.clone()
+        } else {
+            self.service_name.clone()
+        }
+    }
+
+    fn resolved_span_id(&self) -> Option<String> {
+        self.span_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn into_cached_log(self) -> CachedObsLog {
+        let timestamp_unix_nano = self.timestamp_unix_nano;
+        let line_no = self.line_no;
+        let dedup_hash = self.dedup_hash;
+        let dto = self.into_otel_dto();
+        let entry = mu_console_protocol::OtelLogEntry {
+            timestamp_ms: dto.timestamp_ms,
+            severity: dto.severity,
+            service: dto.service,
+            span_id: dto.span_id,
+            trace_id: dto.trace_id,
+            message: dto.message,
+        };
+        CachedObsLog::with_meta(entry, timestamp_unix_nano, line_no, dedup_hash)
+    }
+
+    fn into_otel_dto(self) -> OtelLogDto {
+        let service = self.resolved_service();
+        let span_id = self.resolved_span_id();
+        let timestamp_ms = if self.timestamp_ms > 0 {
+            self.timestamp_ms
+        } else {
+            u64::try_from(self.timestamp_unix_nano.max(0)).unwrap_or(0) / 1_000_000
+        };
+        OtelLogDto {
+            timestamp_ms,
+            severity: self.severity,
+            service,
+            span_id,
+            trace_id: self.trace_id,
+            message: self.message,
+        }
+    }
+}
+
+/// Paginated response decoded from `GET /api/obs/v1/logs`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObsLogsPageDto {
+    pub logs: Vec<CachedObsLog>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub total_matched: Option<u64>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum LogsEnvelope {
-    List(Vec<OtelLogDto>),
+    List(Vec<RawObsLogItemDto>),
     Envelope {
         #[serde(default)]
-        logs: Vec<OtelLogDto>,
+        logs: Vec<RawObsLogItemDto>,
+        #[serde(default)]
+        next_cursor: Option<String>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default)]
+        total_matched: Option<u64>,
     },
+}
+
+impl LogsEnvelope {
+    fn into_page(self) -> ObsLogsPageDto {
+        match self {
+            Self::List(v) => ObsLogsPageDto {
+                logs: v
+                    .into_iter()
+                    .map(RawObsLogItemDto::into_cached_log)
+                    .collect(),
+                next_cursor: None,
+                has_more: false,
+                total_matched: None,
+            },
+            Self::Envelope {
+                logs,
+                next_cursor,
+                has_more,
+                total_matched,
+            } => ObsLogsPageDto {
+                logs: logs
+                    .into_iter()
+                    .map(RawObsLogItemDto::into_cached_log)
+                    .collect(),
+                next_cursor: next_cursor
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty()),
+                has_more,
+                total_matched,
+            },
+        }
+    }
+
+    fn into_otel_list(self) -> Vec<OtelLogDto> {
+        let items = match self {
+            Self::List(v) | Self::Envelope { logs: v, .. } => v,
+        };
+        items
+            .into_iter()
+            .map(RawObsLogItemDto::into_otel_dto)
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -783,12 +937,9 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             Input::ObsTraces(list)
         }
         FetchKind::ObsTraceDetail(_) => Input::ObsTraceDetail(json::<TraceDto>(body)?),
-        FetchKind::ObsLogs => {
-            let list = match json::<LogsEnvelope>(body)? {
-                LogsEnvelope::List(v) => v,
-                LogsEnvelope::Envelope { logs } => logs,
-            };
-            Input::ObsLogs(list)
+        FetchKind::ObsLogs => Input::ObsLogsPage(json::<LogsEnvelope>(body)?.into_page()),
+        FetchKind::ObsLogsOlder { .. } => {
+            Input::ObsLogsOlderPage(json::<LogsEnvelope>(body)?.into_page())
         }
         FetchKind::ObsMetrics => {
             let list = match json::<MetricsEnvelope>(body)? {
@@ -849,12 +1000,12 @@ pub fn parse_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
             Input::ObsIngressUpstreams(json::<Vec<IngressUpstreamDto>>(body)?)
         }
         FetchKind::ObsLogsQuery(_) => {
-            let list = match json::<LogsEnvelope>(body)? {
-                LogsEnvelope::List(v) => v,
-                LogsEnvelope::Envelope { logs } => logs,
-            };
-            Input::ObsLogsQueryResult(list)
+            Input::ObsLogsQueryResult(json::<LogsEnvelope>(body)?.into_otel_list())
         }
+        FetchKind::ObsLogsQueryPage { before, .. } => Input::ObsLogsQueryPage {
+            page: json::<LogsEnvelope>(body)?.into_page(),
+            append: before.is_some(),
+        },
         FetchKind::AuthSession
         | FetchKind::AuthRedeem(_)
         | FetchKind::AuthEnableRole(_)
@@ -1078,7 +1229,7 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         (StreamId::Cd, "tainted") => Input::Tainted(json::<TaintedDto>(data)?),
         (StreamId::Cd, "lease_expired") => Input::LeaseExpired(json::<LeaseExpiredDto>(data)?),
         (StreamId::Obs, "log_entry") => {
-            let entry = json::<OtelLogDto>(data)?;
+            let entry = json::<RawObsLogItemDto>(data)?.into_otel_dto();
             Input::ObsLogEntry(entry)
         }
         (StreamId::Obs, "problem_opened" | "problem_resolved") => {
@@ -1966,5 +2117,88 @@ pub(crate) mod tests {
             "HTTP 403"
         );
         assert_eq!(extract_http_error_message("HTTP 403", None), "HTTP 403");
+    }
+
+    #[test]
+    fn paginated_hub_logs_response_and_cursor_decode() {
+        let hub_page_json = r#"{
+          "severity": "all",
+          "total": 2,
+          "logs": [
+            {
+              "timestamp_unix_nano": 1793858300000123456,
+              "timestamp_ms": 1793858300000,
+              "trace_id": "tr-hub-1",
+              "span_id": "",
+              "severity_number": 13,
+              "severity_text": "WARN",
+              "service": "muobserve-collector",
+              "service_name": "muobserve-collector",
+              "node_id": "worker-riscv64",
+              "body": "Batch flush slow",
+              "line_no": 7,
+              "dedup_hash": 99887766
+            }
+          ],
+          "next_cursor": "1793858300000123456:7:99887766",
+          "has_more": true,
+          "total_matched": 12450
+        }"#;
+
+        let Input::ObsLogsPage(page) =
+            parse_fetch(&FetchKind::ObsLogs, hub_page_json).expect("hub obs logs page")
+        else {
+            panic!("expected ObsLogsPage");
+        };
+        assert_eq!(page.logs.len(), 1);
+        assert_eq!(page.logs[0].timestamp_unix_nano, 1_793_858_300_000_123_456);
+        assert_eq!(page.logs[0].line_no, 7);
+        assert_eq!(page.logs[0].dedup_hash, 99_887_766);
+        assert_eq!(page.logs[0].span_id, None);
+        assert_eq!(page.logs[0].severity, LogSeverity::Warn);
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("1793858300000123456:7:99887766")
+        );
+        assert!(page.has_more);
+        assert_eq!(page.total_matched, Some(12_450));
+
+        let Input::ObsLogsQueryPage {
+            page: search_page,
+            append,
+        } = parse_fetch(
+            &FetchKind::ObsLogsQueryPage {
+                query: "slow".into(),
+                before: Some("1793858400000000000:1:2".into()),
+                limit: 200,
+                gen: 3,
+            },
+            hub_page_json,
+        )
+        .expect("hub search page")
+        else {
+            panic!("expected ObsLogsQueryPage");
+        };
+        assert!(append);
+        assert_eq!(search_page.logs[0].service, "muobserve-collector");
+        assert_eq!(search_page.total_matched, Some(12_450));
+
+        // Legacy bare JSON array decodes uniformly via fallback nanos/hash.
+        let legacy_json = r#"[{"timestamp_ms":1000,"severity":"INFO","service":"obs","trace_id":"t1","message":"log stays"}]"#;
+        let Input::ObsLogsOlderPage(legacy_page) = parse_fetch(
+            &FetchKind::ObsLogsOlder {
+                before: "2000000000:0:1".into(),
+                limit: 200,
+                gen: 1,
+            },
+            legacy_json,
+        )
+        .expect("legacy array page") else {
+            panic!("expected ObsLogsOlderPage");
+        };
+        assert_eq!(legacy_page.logs.len(), 1);
+        assert_eq!(legacy_page.logs[0].timestamp_unix_nano, 1_000_000_000);
+        assert_ne!(legacy_page.logs[0].dedup_hash, 0);
+        assert!(!legacy_page.has_more);
     }
 }

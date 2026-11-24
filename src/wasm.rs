@@ -103,6 +103,42 @@ fn run(effects: Vec<Effect>) {
                 let fx = with_engine(|e| e.on_offline_loaded(bytes.as_deref(), now_ms()));
                 run(fx);
             }),
+            Effect::CacheObsLogs(items) => spawn_local(async move {
+                if let Ok(total) = crate::idb::put_batch(&items).await {
+                    let fx = with_engine(|e| e.on_obs_log_cache_written(total, now_ms()));
+                    run(fx);
+                }
+            }),
+            Effect::ReadObsLogCacheOlder {
+                before_key,
+                limit,
+                gen,
+            } => spawn_local(async move {
+                let (items, total) = crate::idb::read_older(&before_key, limit)
+                    .await
+                    .unwrap_or_default();
+                let fx = with_engine(|e| e.on_obs_log_cache_older(gen, items, total, now_ms()));
+                run(fx);
+            }),
+            Effect::ReadObsLogCacheNewer {
+                after_key,
+                limit,
+                gen,
+            } => spawn_local(async move {
+                let (items, total) = crate::idb::read_newer(&after_key, limit)
+                    .await
+                    .unwrap_or_default();
+                let fx = with_engine(|e| e.on_obs_log_cache_newer(gen, items, total, now_ms()));
+                run(fx);
+            }),
+            Effect::ReadObsLogCacheLatest { limit, gen } => spawn_local(async move {
+                let (items, total) = crate::idb::read_latest(limit).await.unwrap_or_default();
+                let fx = with_engine(|e| e.on_obs_log_cache_latest(gen, items, total, now_ms()));
+                run(fx);
+            }),
+            Effect::ClearObsLogCache => spawn_local(async {
+                let _ = crate::idb::clear().await;
+            }),
         }
     }
 }

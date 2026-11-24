@@ -20,6 +20,7 @@ use mu_console_protocol::{
 use crate::api::{parse_event, parse_fetch, FetchKind, StreamId};
 use crate::backoff::Backoff;
 use crate::coalesce::Coalescer;
+use crate::log_cache::{CachedObsLog, OBS_LOG_PAGE_SIZE, OBS_LOG_WINDOW_CAPACITY};
 use crate::offline::{OfflinePolicy, OfflineSnapshot};
 use crate::scenario::{Scenario, ScenarioPlayer};
 use crate::sse::SseParser;
@@ -60,6 +61,24 @@ pub enum Effect {
     /// Read the offline snapshot; report back with
     /// [`Engine::on_offline_loaded`].
     LoadOffline,
+    /// Persist newly received log rows into the browser-local IndexedDB cache.
+    CacheObsLogs(Vec<CachedObsLog>),
+    /// Read up to `limit` logs strictly older than `before_key` from IndexedDB.
+    ReadObsLogCacheOlder {
+        before_key: String,
+        limit: usize,
+        gen: u64,
+    },
+    /// Read up to `limit` logs strictly newer than `after_key` from IndexedDB.
+    ReadObsLogCacheNewer {
+        after_key: String,
+        limit: usize,
+        gen: u64,
+    },
+    /// Read the newest `limit` logs from IndexedDB.
+    ReadObsLogCacheLatest { limit: usize, gen: u64 },
+    /// Fail-closed wipe of all cached logs in browser IndexedDB.
+    ClearObsLogCache,
 }
 
 /// Failed fetch.
@@ -121,6 +140,9 @@ pub struct Engine {
     offline_requested: bool,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
+    obs_log_query_gen: u64,
+    active_obs_log_query: Option<String>,
+    last_auth_login: Option<String>,
 }
 
 impl Engine {
@@ -151,6 +173,9 @@ impl Engine {
             offline_requested: false,
             selection_gen: 0,
             pending_select: None,
+            obs_log_query_gen: 0,
+            active_obs_log_query: None,
+            last_auth_login: None,
         }
     }
 
@@ -229,6 +254,32 @@ impl Engine {
             UiCommand::Configure(cfg) => self.configure(cfg, now_ms, &mut fx),
             UiCommand::Subscribe(route) => {
                 self.active_subview = Some(route.subview);
+                let filter_q = route
+                    .filter
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let is_log_subview = matches!(
+                    route.subview,
+                    SubView::Observability(ObservabilitySubView::Logs)
+                        | SubView::Ci(CiSubView::QueueLogs)
+                );
+                if is_log_subview && filter_q != self.active_obs_log_query {
+                    self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                    self.active_obs_log_query.clone_from(&filter_q);
+                    if filter_q.is_none() {
+                        self.store.clear_active_log_query();
+                        if self.mode == Mode::Live
+                            && auth_has_policy(self.store.auth(), "obs:logs.read")
+                        {
+                            fx.push(Effect::ReadObsLogCacheLatest {
+                                limit: OBS_LOG_WINDOW_CAPACITY,
+                                gen: self.obs_log_query_gen,
+                            });
+                        }
+                    }
+                }
                 if let Some(repo) = route.repo {
                     self.select(
                         Selection {
@@ -251,6 +302,10 @@ impl Engine {
             }
             UiCommand::SelectSubView(subview) => {
                 self.active_subview = Some(subview);
+                if self.active_obs_log_query.is_some() || self.store.is_active_log_query() {
+                    self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                    self.active_obs_log_query = None;
+                }
                 self.store.clear_active_log_query();
                 if self.mode == Mode::Live {
                     self.fetch_subview(subview, None, &mut fx);
@@ -639,6 +694,95 @@ impl Engine {
                     self.fetch(FetchKind::AuthUpdateRoleFolioIndex(index), &mut fx);
                 }
             }
+            UiCommand::LoadOlderObsLogs => {
+                if self.mode == Mode::Live
+                    && auth_has_policy(self.store.auth(), "obs:logs.read")
+                    && self.store.can_load_older_obs_logs()
+                {
+                    if self.store.is_active_log_query() {
+                        if let (Some(query), Some(cursor)) = (
+                            self.active_obs_log_query.clone(),
+                            self.store.search_next_cursor(),
+                        ) {
+                            self.store.set_obs_loading_older(true);
+                            let gen = self.obs_log_query_gen;
+                            self.fetch(
+                                FetchKind::ObsLogsQueryPage {
+                                    query,
+                                    before: Some(cursor),
+                                    limit: OBS_LOG_PAGE_SIZE,
+                                    gen,
+                                },
+                                &mut fx,
+                            );
+                        }
+                    } else if let Some(before_key) = self.store.oldest_obs_log_key() {
+                        self.store.set_obs_loading_older(true);
+                        fx.push(Effect::ReadObsLogCacheOlder {
+                            before_key,
+                            limit: OBS_LOG_PAGE_SIZE,
+                            gen: self.obs_log_query_gen,
+                        });
+                    }
+                }
+            }
+            UiCommand::LoadNewerObsLogs => {
+                if self.mode == Mode::Live
+                    && auth_has_policy(self.store.auth(), "obs:logs.read")
+                    && self.store.can_load_newer_obs_logs()
+                {
+                    if self.store.is_active_log_query() {
+                        if let Some(query) = self.active_obs_log_query.clone() {
+                            self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                            self.store.set_obs_loading_newer(true);
+                            let gen = self.obs_log_query_gen;
+                            self.fetch(
+                                FetchKind::ObsLogsQueryPage {
+                                    query,
+                                    before: None,
+                                    limit: OBS_LOG_PAGE_SIZE,
+                                    gen,
+                                },
+                                &mut fx,
+                            );
+                        }
+                    } else if let Some(after_key) = self.store.newest_obs_log_key() {
+                        self.store.set_obs_loading_newer(true);
+                        fx.push(Effect::ReadObsLogCacheNewer {
+                            after_key,
+                            limit: OBS_LOG_PAGE_SIZE,
+                            gen: self.obs_log_query_gen,
+                        });
+                    }
+                }
+            }
+            UiCommand::JumpToLatestObsLogs => {
+                if self.mode == Mode::Live && auth_has_policy(self.store.auth(), "obs:logs.read") {
+                    self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                    let gen = self.obs_log_query_gen;
+                    self.store.set_obs_loading_older(false);
+                    self.store.set_obs_loading_newer(false);
+                    if self.store.is_active_log_query() {
+                        if let Some(query) = self.active_obs_log_query.clone() {
+                            self.fetch(
+                                FetchKind::ObsLogsQueryPage {
+                                    query,
+                                    before: None,
+                                    limit: OBS_LOG_PAGE_SIZE,
+                                    gen,
+                                },
+                                &mut fx,
+                            );
+                        }
+                    } else {
+                        fx.push(Effect::ReadObsLogCacheLatest {
+                            limit: OBS_LOG_WINDOW_CAPACITY,
+                            gen,
+                        });
+                        self.fetch(FetchKind::ObsLogs, &mut fx);
+                    }
+                }
+            }
         }
         fx
     }
@@ -671,6 +815,7 @@ impl Engine {
             let source = DataSource::Scenario(sc.name().to_owned());
             self.store = Store::new(source.clone());
             self.player = Some(ScenarioPlayer::new(sc, now_ms));
+            fx.push(Effect::ClearObsLogCache);
             fx.push(Effect::Post(DataEvent::Ready {
                 protocol: PROTOCOL_VERSION,
                 source,
@@ -770,7 +915,20 @@ impl Engine {
             SubView::Ci(CiSubView::QueueLogs) => {
                 self.fetch(FetchKind::CiQueue, fx);
                 if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
-                    self.fetch(FetchKind::ObsLogsQuery(q.to_owned()), fx);
+                    let q = q.trim().to_owned();
+                    if self.active_obs_log_query.as_deref() != Some(q.as_str()) {
+                        self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                        self.active_obs_log_query = Some(q.clone());
+                    }
+                    self.fetch(
+                        FetchKind::ObsLogsQueryPage {
+                            query: q,
+                            before: None,
+                            limit: OBS_LOG_PAGE_SIZE,
+                            gen: self.obs_log_query_gen,
+                        },
+                        fx,
+                    );
                 } else {
                     self.store.clear_active_log_query();
                     if auth_has_policy(self.store.auth(), "obs:logs.read") {
@@ -846,7 +1004,20 @@ impl Engine {
             SubView::Observability(ObservabilitySubView::Logs) => {
                 self.fetch(FetchKind::CiQueue, fx);
                 if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
-                    self.fetch(FetchKind::ObsLogsQuery(q.to_owned()), fx);
+                    let q = q.trim().to_owned();
+                    if self.active_obs_log_query.as_deref() != Some(q.as_str()) {
+                        self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                        self.active_obs_log_query = Some(q.clone());
+                    }
+                    self.fetch(
+                        FetchKind::ObsLogsQueryPage {
+                            query: q,
+                            before: None,
+                            limit: OBS_LOG_PAGE_SIZE,
+                            gen: self.obs_log_query_gen,
+                        },
+                        fx,
+                    );
                 } else {
                     self.store.clear_active_log_query();
                     self.fetch(FetchKind::ObsLogs, fx);
@@ -973,6 +1144,24 @@ impl Engine {
         if self.store.take_force_snapshot() {
             self.out.force_snapshot();
         }
+        let current_login = self
+            .store
+            .auth()
+            .github_login
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let can_cache_obs = self.store.can_cache_obs_logs();
+        let user_switched = matches!(
+            (&self.last_auth_login, &current_login),
+            (Some(prev), Some(curr)) if prev != curr
+        ) || (self.last_auth_login.is_some() && current_login.is_none());
+        if self.mode == Mode::Live && (!can_cache_obs || user_switched) {
+            self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+            fx.push(Effect::ClearObsLogCache);
+        }
+        self.last_auth_login = if can_cache_obs { current_login } else { None };
         if !self.store.can_emit_operational_data() {
             self.close_disallowed_streams(fx);
             if self.mode == Mode::Live {
@@ -988,6 +1177,12 @@ impl Engine {
         {
             self.offline_requested = true;
             fx.push(Effect::LoadOffline);
+        }
+        if can_cache_obs && (!prev_allowed || !prev_policies.iter().any(|p| p == "obs:logs.read")) {
+            fx.push(Effect::ReadObsLogCacheLatest {
+                limit: OBS_LOG_WINDOW_CAPACITY,
+                gen: self.obs_log_query_gen,
+            });
         }
         for s in StreamId::ALL {
             if self.can_open_stream(s) && !self.streams[s.index()].open {
@@ -1120,7 +1315,10 @@ impl Engine {
             FetchKind::ObsProblems => paths::OBS_PROBLEMS.to_owned(),
             FetchKind::ObsTraces => paths::OBS_TRACES.to_owned(),
             FetchKind::ObsTraceDetail(id) => paths::obs_trace(id),
-            FetchKind::ObsLogs => paths::OBS_LOGS.to_owned(),
+            FetchKind::ObsLogs => paths::obs_logs_page(None, OBS_LOG_PAGE_SIZE),
+            FetchKind::ObsLogsOlder { before, limit, .. } => {
+                paths::obs_logs_page(Some(before), *limit)
+            }
             FetchKind::ObsMetrics => paths::OBS_METRICS.to_owned(),
             FetchKind::ObsStoreStatus => paths::OBS_STORE_STATUS.to_owned(),
             FetchKind::ObsSubsystemStatus => paths::OBS_SUBSYSTEM_STATUS.to_owned(),
@@ -1130,7 +1328,13 @@ impl Engine {
             FetchKind::ObsIngressOverview => paths::OBS_INGRESS_OVERVIEW.to_owned(),
             FetchKind::ObsIngressRoutes => paths::OBS_INGRESS_ROUTES.to_owned(),
             FetchKind::ObsIngressUpstreams => paths::OBS_INGRESS_UPSTREAMS.to_owned(),
-            FetchKind::ObsLogsQuery(q) => paths::obs_logs_query(q, 100),
+            FetchKind::ObsLogsQuery(q) => paths::obs_logs_query(q, OBS_LOG_PAGE_SIZE),
+            FetchKind::ObsLogsQueryPage {
+                query,
+                before,
+                limit,
+                ..
+            } => paths::obs_logs_query_page(query, before.as_deref(), *limit),
             FetchKind::MrStatus => paths::MR_STATUS.to_owned(),
             FetchKind::MrConnection => paths::MR_CONNECTION.to_owned(),
             FetchKind::AuthSession => paths::AUTH_SESSION.to_owned(),
@@ -1345,9 +1549,26 @@ impl Engine {
         if self.mode != Mode::Live {
             return fx;
         }
+        let is_stale_obs_query = match kind {
+            FetchKind::ObsLogsOlder { gen, .. } | FetchKind::ObsLogsQueryPage { gen, .. } => {
+                *gen != self.obs_log_query_gen
+            }
+            _ => false,
+        };
+        if is_stale_obs_query {
+            return fx;
+        }
         let body = match result {
             Ok(b) => b,
             Err(e) => {
+                match kind {
+                    FetchKind::ObsLogsOlder { .. } => self.store.set_obs_loading_older(false),
+                    FetchKind::ObsLogsQueryPage { .. } => {
+                        self.store.set_obs_loading_older(false);
+                        self.store.set_obs_loading_newer(false);
+                    }
+                    _ => {}
+                }
                 // Non-fatal 404/502/503 on optional auxiliary daemon probes.
                 // `FetchKind::AuthSession` is excluded so cold-boot auth probe failures
                 // always surface `DataEvent::Error` instead of leaving the UI stuck.
@@ -1376,6 +1597,8 @@ impl Engine {
                         | FetchKind::ObsTraces
                         | FetchKind::ObsTraceDetail(_)
                         | FetchKind::ObsLogs
+                        | FetchKind::ObsLogsOlder { .. }
+                        | FetchKind::ObsLogsQueryPage { .. }
                         | FetchKind::ObsMetrics
                         | FetchKind::ObsStoreStatus
                         | FetchKind::ObsSubsystemStatus
@@ -1431,6 +1654,14 @@ impl Engine {
         let input = match parse_fetch(kind, &body) {
             Ok(i) => i,
             Err(msg) => {
+                match kind {
+                    FetchKind::ObsLogsOlder { .. } => self.store.set_obs_loading_older(false),
+                    FetchKind::ObsLogsQueryPage { .. } => {
+                        self.store.set_obs_loading_older(false);
+                        self.store.set_obs_loading_newer(false);
+                    }
+                    _ => {}
+                }
                 if is_session_role_mutation(kind) {
                     let inline_err = crate::api::extract_http_error_message(&msg, Some(&body));
                     self.store
@@ -1455,6 +1686,10 @@ impl Engine {
             Vec::new()
         };
         self.store.apply(input, now_ms);
+        let to_cache = self.store.take_pending_cache_obs_logs();
+        if !to_cache.is_empty() && self.store.can_cache_obs_logs() {
+            fx.push(Effect::CacheObsLogs(to_cache));
+        }
         if is_session_role_mutation(kind) {
             self.store.apply(Input::CloseSessionRolesDialog, now_ms);
         }
@@ -1596,6 +1831,10 @@ impl Engine {
                     };
                     let is_ingress_changed = matches!(&input, Input::ObsIngressChanged);
                     self.store.apply(input, now_ms);
+                    let to_cache = self.store.take_pending_cache_obs_logs();
+                    if !to_cache.is_empty() && self.store.can_cache_obs_logs() {
+                        fx.push(Effect::CacheObsLogs(to_cache));
+                    }
                     if is_ingress_changed {
                         self.fetch(FetchKind::ObsIngressOverview, &mut fx);
                     }
@@ -1672,6 +1911,109 @@ impl Engine {
             }
         }
         fx
+    }
+
+    /// Result of [`Effect::CacheObsLogs`]: sync the total count stored in IndexedDB.
+    pub fn on_obs_log_cache_written(&mut self, cached_total: u32, now_ms: u64) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if self.mode == Mode::Live && self.store.can_cache_obs_logs() {
+            self.store.update_obs_cached_total(cached_total);
+            self.flush_view_if_ready(now_ms, &mut fx);
+        }
+        fx
+    }
+
+    /// Result of [`Effect::ReadObsLogCacheOlder`]; falls back to the backend on cache miss.
+    pub fn on_obs_log_cache_older(
+        &mut self,
+        gen: u64,
+        items: Vec<CachedObsLog>,
+        cached_total: u32,
+        now_ms: u64,
+    ) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if self.mode != Mode::Live
+            || gen != self.obs_log_query_gen
+            || !auth_has_policy(self.store.auth(), "obs:logs.read")
+            || self.store.is_active_log_query()
+        {
+            return fx;
+        }
+        let item_len = items.len();
+        self.store
+            .apply_obs_logs_older_items(items, Some(cached_total));
+        if item_len < OBS_LOG_PAGE_SIZE && self.store.obs_server_has_more() {
+            if let Some(before) = self.store.oldest_obs_log_cursor() {
+                self.store.set_obs_loading_older(true);
+                self.fetch(
+                    FetchKind::ObsLogsOlder {
+                        before,
+                        limit: OBS_LOG_PAGE_SIZE,
+                        gen,
+                    },
+                    &mut fx,
+                );
+            }
+        }
+        self.flush_view_if_ready(now_ms, &mut fx);
+        fx
+    }
+
+    /// Result of [`Effect::ReadObsLogCacheNewer`].
+    pub fn on_obs_log_cache_newer(
+        &mut self,
+        gen: u64,
+        items: Vec<CachedObsLog>,
+        cached_total: u32,
+        now_ms: u64,
+    ) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if self.mode != Mode::Live
+            || gen != self.obs_log_query_gen
+            || !auth_has_policy(self.store.auth(), "obs:logs.read")
+            || self.store.is_active_log_query()
+        {
+            return fx;
+        }
+        self.store
+            .apply_obs_logs_newer_items(items, Some(cached_total));
+        self.flush_view_if_ready(now_ms, &mut fx);
+        fx
+    }
+
+    /// Result of [`Effect::ReadObsLogCacheLatest`].
+    pub fn on_obs_log_cache_latest(
+        &mut self,
+        gen: u64,
+        items: Vec<CachedObsLog>,
+        cached_total: u32,
+        now_ms: u64,
+    ) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if self.mode != Mode::Live
+            || gen != self.obs_log_query_gen
+            || !auth_has_policy(self.store.auth(), "obs:logs.read")
+            || self.store.is_active_log_query()
+        {
+            return fx;
+        }
+        self.store
+            .apply_obs_logs_latest_items(items, Some(cached_total));
+        self.flush_view_if_ready(now_ms, &mut fx);
+        fx
+    }
+
+    fn flush_view_if_ready(&mut self, now_ms: u64, fx: &mut Vec<Effect>) {
+        let dirty = self.store.is_dirty();
+        if dirty || self.out.needs_snapshot() {
+            let store = &mut self.store;
+            if let Some(ev) = self.out.poll(now_ms, dirty, || {
+                store.take_dirty();
+                store.view()
+            }) {
+                fx.push(Effect::Post(ev));
+            }
+        }
     }
 
     /// Result of [`Effect::LoadOffline`].
@@ -1932,7 +2274,10 @@ fn can_fetch_for_auth(
         FetchKind::ObsTraces | FetchKind::ObsTraceDetail(_) => {
             auth_has_policy(auth, "obs:traces.read")
         }
-        FetchKind::ObsLogs | FetchKind::ObsLogsQuery(_) => auth_has_policy(auth, "obs:logs.read"),
+        FetchKind::ObsLogs
+        | FetchKind::ObsLogsOlder { .. }
+        | FetchKind::ObsLogsQuery(_)
+        | FetchKind::ObsLogsQueryPage { .. } => auth_has_policy(auth, "obs:logs.read"),
         FetchKind::ObsMetrics => auth_has_policy(auth, "obs:metrics.read"),
         FetchKind::ObsStoreStatus => auth_has_policy(auth, "obs:store.read"),
         FetchKind::ObsIngressOverview
