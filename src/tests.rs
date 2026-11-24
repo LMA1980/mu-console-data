@@ -3900,3 +3900,370 @@ fn obs_logs_sliding_window_cache_first_paging_sse_freeze_stale_gen_and_auth_scru
         mu_console_protocol::ObsLogWindowMeta::default()
     );
 }
+
+#[test]
+fn obs_logs_sse_stream_item_rest_poll_overlap_has_zero_duplicates_and_exact_cursor() {
+    let mut eng = Engine::new(101);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = resolve_operator_session(&mut eng, 5);
+    eng.on_stream_open(StreamId::Ci, 10);
+    eng.on_stream_open(StreamId::Cd, 10);
+    eng.on_stream_open(StreamId::Obs, 10);
+    let _ = eng.handle(
+        UiCommand::SelectSubView(SubView::Observability(ObservabilitySubView::Logs)),
+        20,
+    );
+
+    // Seed initial REST page with 550 items via head + IDB scroll so window_start_index == 100.
+    let head_json =
+        synthetic_obs_logs_json(600, 50, Some("1794551000000000000:551:651"), true, 600);
+    let _ = eng.on_fetch(&FetchKind::ObsLogs, Ok(head_json), 30);
+    let _ = eng.handle(UiCommand::LoadOlderObsLogs, 40);
+    let older_items: Vec<CachedObsLog> = (0..550)
+        .map(|i| {
+            let seq = 550 - i;
+            let ts_ms = 1_794_000_000_000_u64 + (seq as u64) * 1_000;
+            CachedObsLog::with_meta(
+                mu_console_protocol::OtelLogEntry {
+                    timestamp_ms: ts_ms,
+                    severity: LogSeverity::Info,
+                    service: "muobserve".into(),
+                    span_id: Some(format!("sp-w-{seq}")),
+                    trace_id: format!("tr-w-{seq}"),
+                    message: format!("Log sequence #{seq}"),
+                },
+                (ts_ms * 1_000_000) as i64,
+                seq as u32,
+                (seq + 100) as u64,
+            )
+        })
+        .collect();
+    let _ = eng.on_obs_log_cache_older(0, older_items, 600, 45);
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        100
+    );
+
+    // SSE log_entry arrives with sub-ms timestamp_unix_nano, line_no, and server dedup_hash.
+    let sse_chunk = concat!(
+        "event: log_entry\n",
+        "data: {\"timestamp_unix_nano\":1794601000000456789,\"timestamp_ms\":1794601000000,\"trace_id\":\"tr-w-601\",\"span_id\":\"sp-w-601\",\"severity_text\":\"WARN\",\"service_name\":\"muobserve\",\"body\":\"Log sequence #601\",\"line_no\":601,\"dedup_hash\":701}\n\n"
+    );
+    let sse_fx = eng.on_stream_chunk(StreamId::Obs, sse_chunk.as_bytes(), 50);
+    assert_eq!(
+        sse_fx
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CacheObsLogs(items) => Some(items.len()),
+                _ => None,
+            })
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        101
+    );
+    assert_eq!(eng.store().view().observe.log_window.pending_live_count, 1);
+    assert_eq!(eng.store().view().observe.log_window.cached_total, 601);
+
+    // 2s REST ObsLogs poll arrives containing seq #601 alongside #600..=#581 -> 0 double-counting and 0 duplicate IDB writes!
+    let mut poll_json =
+        synthetic_obs_logs_json(600, 20, Some("1794581000000000000:581:681"), true, 601);
+    let sse_item_in_rest = r#"{"timestamp_unix_nano":1794601000000456789,"timestamp_ms":1794601000000,"trace_id":"tr-w-601","span_id":"sp-w-601","severity_text":"WARN","service_name":"muobserve","body":"Log sequence #601","line_no":601,"dedup_hash":701},"#;
+    poll_json = poll_json.replacen(r#""logs":["#, &format!(r#""logs":[{sse_item_in_rest}"#), 1);
+    let poll_fx = eng.on_fetch(&FetchKind::ObsLogs, Ok(poll_json), 55);
+    assert!(
+        !poll_fx.iter().any(|e| matches!(e, Effect::CacheObsLogs(_))),
+        "REST poll overlapping SSE item must not emit duplicate IndexedDB writes: {poll_fx:?}"
+    );
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        101
+    );
+    assert_eq!(eng.store().view().observe.log_window.pending_live_count, 1);
+    assert_eq!(eng.store().view().observe.log_window.cached_total, 601);
+
+    // Jump to latest: #601 appears exactly once at index 0.
+    let jump_fx = eng.handle(UiCommand::JumpToLatestObsLogs, 60);
+    let jump_gen = jump_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::ReadObsLogCacheLatest { gen, .. } => Some(*gen),
+            _ => None,
+        })
+        .expect("ReadObsLogCacheLatest emitted");
+    let idb_latest: Vec<CachedObsLog> = (0..500)
+        .map(|i| {
+            let seq = 600 - i;
+            let ts_ms = 1_794_000_000_000_u64 + (seq as u64) * 1_000;
+            CachedObsLog::with_meta(
+                mu_console_protocol::OtelLogEntry {
+                    timestamp_ms: ts_ms,
+                    severity: LogSeverity::Info,
+                    service: "muobserve".into(),
+                    span_id: Some(format!("sp-w-{seq}")),
+                    trace_id: format!("tr-w-{seq}"),
+                    message: format!("Log sequence #{seq}"),
+                },
+                (ts_ms * 1_000_000) as i64,
+                seq as u32,
+                (seq + 100) as u64,
+            )
+        })
+        .collect();
+    let _ = eng.on_obs_log_cache_latest(jump_gen, idb_latest, 601, 65);
+    assert_eq!(eng.store().view().observe.logs.len(), 500);
+    assert_eq!(
+        eng.store()
+            .view()
+            .observe
+            .logs
+            .iter()
+            .filter(|l| l.message == "Log sequence #601")
+            .count(),
+        1
+    );
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #601"
+    );
+    assert_eq!(
+        eng.store().oldest_obs_log_cursor().as_deref(),
+        Some("1794000102000000000:102:202")
+    );
+}
+
+#[test]
+fn obs_logs_active_search_bidirectional_paging_sanitization_and_http_error_cleanup() {
+    let mut eng = Engine::new(102);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = resolve_operator_session(&mut eng, 5);
+    let _ = eng.tick(10);
+
+    // 1. Disallowed CLI flags and SQL punctuation are sanitized before ObsLogsQueryPage fetch.
+    let route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some("--check --locked; /*drop*/ foo&bar".into()),
+        ..Route::default()
+    };
+    let sub_fx = eng.handle(UiCommand::Subscribe(route), 20);
+    let (q_sanitized, q_gen) = sub_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Fetch {
+                kind: FetchKind::ObsLogsQueryPage { query, gen, .. },
+                ..
+            } => Some((query.clone(), *gen)),
+            _ => None,
+        })
+        .expect("ObsLogsQueryPage emitted");
+    assert_eq!(q_sanitized, "-check -locked drop foo bar");
+
+    // Empty-after-sanitization query exits active search cleanly instead of triggering HTTP 400.
+    let empty_route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some(";;; & | $".into()),
+        ..Route::default()
+    };
+    let empty_fx = eng.handle(UiCommand::Subscribe(empty_route), 25);
+    assert!(!empty_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsLogsQueryPage { .. },
+            ..
+        }
+    )));
+
+    // 2. Multi-page active search: 4 x 200-entry pages (seqs 800..=1).
+    let search_route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some("--check".into()),
+        ..Route::default()
+    };
+    let s1_fx = eng.handle(UiCommand::Subscribe(search_route), 30);
+    let s_gen = s1_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Fetch {
+                kind: FetchKind::ObsLogsQueryPage { query, gen, .. },
+                ..
+            } => {
+                assert_eq!(query, "-check");
+                Some(*gen)
+            }
+            _ => None,
+        })
+        .expect("sanitized search fetch");
+    assert!(s_gen > q_gen);
+
+    let p1 = synthetic_obs_logs_json(800, 200, Some("c601"), true, 1000);
+    let _ = eng.on_fetch(
+        &FetchKind::ObsLogsQueryPage {
+            query: "-check".into(),
+            before: None,
+            limit: OBS_LOG_PAGE_SIZE,
+            gen: s_gen,
+        },
+        Ok(p1),
+        35,
+    );
+    assert_eq!(eng.store().view().observe.logs.len(), 200);
+    assert_eq!(eng.store().view().observe.log_window.window_start_index, 0);
+
+    for (step_idx, (start_seq, prev_cursor, next_cursor, t_ms)) in [
+        (600, "c601", "c401", 40_u64),
+        (400, "c401", "c201", 50_u64),
+        (200, "c201", "c1", 60_u64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let older_fx = eng.handle(UiCommand::LoadOlderObsLogs, t_ms);
+        assert!(
+            older_fx.iter().any(|e| matches!(
+                e,
+                Effect::Fetch {
+                    kind: FetchKind::ObsLogsQueryPage {
+                        before: Some(b),
+                        ..
+                    },
+                    ..
+                } if b == prev_cursor
+            )),
+            "page {} must fetch before={prev_cursor}",
+            step_idx + 2
+        );
+        let page_json = synthetic_obs_logs_json(start_seq, 200, Some(next_cursor), true, 1000);
+        let _ = eng.on_fetch(
+            &FetchKind::ObsLogsQueryPage {
+                query: "-check".into(),
+                before: Some(prev_cursor.into()),
+                limit: OBS_LOG_PAGE_SIZE,
+                gen: s_gen,
+            },
+            Ok(page_json),
+            t_ms + 5,
+        );
+    }
+
+    // Archive now holds 800 rows; visible window is [300..800] -> seqs 500..=1.
+    assert_eq!(eng.store().view().observe.logs.len(), 500);
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        300
+    );
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #500"
+    );
+    assert!(eng.store().view().observe.log_window.has_newer);
+    assert!(eng.store().view().observe.log_window.has_older);
+
+    // 3. LoadNewerObsLogs steps in-memory (300 -> 100 -> 0) WITHOUT issuing before=None wipes!
+    let _ = eng.tick(120);
+    let up1_fx = eng.handle(UiCommand::LoadNewerObsLogs, 230);
+    assert!(!up1_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        100
+    );
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #700"
+    );
+    assert!(eng.store().view().observe.log_window.has_newer);
+    assert!(eng.store().view().observe.log_window.has_older);
+
+    let up2_fx = eng.handle(UiCommand::LoadNewerObsLogs, 340);
+    assert!(!up2_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(eng.store().view().observe.log_window.window_start_index, 0);
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #800"
+    );
+    assert!(!eng.store().view().observe.log_window.has_newer);
+    assert!(eng.store().view().observe.log_window.has_older);
+
+    // Scrolling back down steps through buffered archive first before hitting cursor c1.
+    let down1_fx = eng.handle(UiCommand::LoadOlderObsLogs, 450);
+    assert!(!down1_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        200
+    );
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #600"
+    );
+
+    let down2_fx = eng.handle(UiCommand::LoadOlderObsLogs, 560);
+    assert!(!down2_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        300
+    );
+
+    let down3_fx = eng.handle(UiCommand::LoadOlderObsLogs, 670);
+    assert!(down3_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsLogsQueryPage {
+                before: Some(b),
+                ..
+            },
+            ..
+        } if b == "c1"
+    )));
+
+    // 4. Active HTTP 400 error clears stale search archive, cursor, and logs + emits Error and Patch/Snapshot.
+    let err_route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some("badquery".into()),
+        ..Route::default()
+    };
+    let err_sub_fx = eng.handle(UiCommand::Subscribe(err_route), 700);
+    let err_gen = err_sub_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Fetch {
+                kind: FetchKind::ObsLogsQueryPage { gen, .. },
+                ..
+            } => Some(*gen),
+            _ => None,
+        })
+        .expect("badquery fetch");
+
+    let err_fx = eng.on_fetch(
+        &FetchKind::ObsLogsQueryPage {
+            query: "badquery".into(),
+            before: None,
+            limit: OBS_LOG_PAGE_SIZE,
+            gen: err_gen,
+        },
+        Err(HttpError {
+            status: 400,
+            message: "Filter parameter rejected".into(),
+        }),
+        800,
+    );
+    assert!(err_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Error(UiError::Http { status: 400, .. }))
+    )));
+    assert!(err_fx.iter().any(|e| matches!(
+        e,
+        Effect::Post(DataEvent::Patch(_) | DataEvent::Snapshot(_))
+    )));
+    assert!(eng.store().search_next_cursor().is_none());
+    let v_err = eng.store().view();
+    assert!(v_err.observe.logs.is_empty());
+    assert!(v_err.observe.log_window.search_active);
+    assert_eq!(v_err.observe.log_window.total_matched, Some(0));
+    assert!(!v_err.observe.log_window.has_older);
+    assert!(!v_err.observe.log_window.has_newer);
+}

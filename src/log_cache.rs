@@ -12,6 +12,9 @@ pub const OBS_LOG_WINDOW_CAPACITY: usize = 500;
 /// Default page size for initial fetch, infinite scroll paging, and log search.
 pub const OBS_LOG_PAGE_SIZE: usize = 200;
 
+/// Maximum number of matched search log entries retained in memory for bidirectional paging.
+pub const OBS_SEARCH_ARCHIVE_CAPACITY: usize = 5_000;
+
 /// Hard FIFO capacity for the browser-local IndexedDB log cache.
 pub const IDB_MAX_CACHED_LOGS: usize = 20_000;
 
@@ -30,6 +33,9 @@ pub struct CachedObsLog {
     pub timestamp_ms: u64,
     pub line_no: u32,
     pub dedup_hash: u64,
+    /// Whether `dedup_hash` originated from the server (`true`) rather than client fallback FNV-1a (`false`).
+    #[serde(default)]
+    pub has_server_hash: bool,
     pub severity: LogSeverity,
     pub service: String,
     pub span_id: Option<String>,
@@ -56,12 +62,14 @@ impl CachedObsLog {
                 .unwrap_or(i64::MAX / 1_000_000)
                 .saturating_mul(1_000_000)
         };
-        let resolved_hash = if dedup_hash != 0 {
+        let has_server_hash = dedup_hash != 0;
+        let resolved_hash = if has_server_hash {
             dedup_hash
         } else {
-            compute_fallback_dedup_hash(
+            compute_fallback_dedup_hash_with_span(
                 entry.timestamp_ms,
                 &entry.service,
+                entry.span_id.as_deref(),
                 &entry.trace_id,
                 &entry.message,
             )
@@ -73,6 +81,7 @@ impl CachedObsLog {
             timestamp_ms: entry.timestamp_ms,
             line_no,
             dedup_hash: resolved_hash,
+            has_server_hash,
             severity: entry.severity,
             service: entry.service,
             span_id: entry.span_id,
@@ -87,15 +96,22 @@ impl CachedObsLog {
         Self::with_meta(entry, 0, 0, 0)
     }
 
+    /// Recompute [`Self::dedup_hash`] using the client fallback hash when not server-provided.
+    pub fn recompute_fallback_hash(&mut self) {
+        self.has_server_hash = false;
+        self.dedup_hash = compute_fallback_dedup_hash_with_span(
+            self.timestamp_ms,
+            &self.service,
+            self.span_id.as_deref(),
+            &self.trace_id,
+            &self.message,
+        );
+    }
+
     /// Recompute [`Self::k`] after normalizing fields such as `service` or `message`.
     pub fn refresh_key(&mut self) {
         if self.dedup_hash == 0 {
-            self.dedup_hash = compute_fallback_dedup_hash(
-                self.timestamp_ms,
-                &self.service,
-                &self.trace_id,
-                &self.message,
-            );
+            self.recompute_fallback_hash();
         }
         self.k = make_log_sort_key(self.timestamp_unix_nano, self.line_no, self.dedup_hash);
     }
@@ -116,7 +132,11 @@ impl CachedObsLog {
     /// Format the keyset cursor expected by `/api/obs/v1/logs?before=...`.
     #[must_use]
     pub fn cursor(&self) -> String {
-        format_log_cursor(self.timestamp_unix_nano, self.line_no, self.dedup_hash)
+        if self.line_no == 0 && !self.has_server_hash {
+            format!("{}", self.timestamp_unix_nano.max(0))
+        } else {
+            format_log_cursor(self.timestamp_unix_nano, self.line_no, self.dedup_hash)
+        }
     }
 }
 
@@ -141,6 +161,18 @@ pub fn compute_fallback_dedup_hash(
     trace_id: &str,
     message: &str,
 ) -> u64 {
+    compute_fallback_dedup_hash_with_span(timestamp_ms, service, None, trace_id, message)
+}
+
+/// Deterministic 64-bit FNV-1a fallback hash including `span_id` when `dedup_hash` is absent or `0`.
+#[must_use]
+pub fn compute_fallback_dedup_hash_with_span(
+    timestamp_ms: u64,
+    service: &str,
+    span_id: Option<&str>,
+    trace_id: &str,
+    message: &str,
+) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
         for &b in bytes {
@@ -152,6 +184,7 @@ pub fn compute_fallback_dedup_hash(
     };
     feed(&timestamp_ms.to_le_bytes());
     feed(service.as_bytes());
+    feed(span_id.unwrap_or_default().as_bytes());
     feed(trace_id.as_bytes());
     feed(message.as_bytes());
     if hash == 0 {
@@ -205,8 +238,50 @@ mod tests {
         let h1 = compute_fallback_dedup_hash(1000, "svc", "tr", "hello");
         let h2 = compute_fallback_dedup_hash(1000, "svc", "tr", "hello");
         let h3 = compute_fallback_dedup_hash(1000, "svc", "tr", "world");
+        let h4 = compute_fallback_dedup_hash_with_span(1000, "svc", Some("sp-1"), "tr", "hello");
+        let h5 = compute_fallback_dedup_hash_with_span(1000, "svc", Some("sp-2"), "tr", "hello");
         assert_eq!(h1, h2);
         assert_ne!(h1, 0);
         assert_ne!(h1, h3);
+        assert_ne!(h4, h5);
+        assert_ne!(h1, h4);
+    }
+
+    #[test]
+    fn legacy_cursor_without_server_hash_or_line_no_emits_one_part_nanos() {
+        let legacy = CachedObsLog::from_otel_entry(OtelLogEntry {
+            timestamp_ms: 1_700_000_123_456,
+            severity: LogSeverity::Info,
+            service: "svc".into(),
+            span_id: None,
+            trace_id: "tr-1".into(),
+            message: "legacy".into(),
+        });
+        assert!(!legacy.has_server_hash);
+        assert_eq!(legacy.cursor(), "1700000123456000000");
+
+        let server_zero_line = CachedObsLog::with_meta(
+            OtelLogEntry {
+                timestamp_ms: 1_700_000_123_456,
+                severity: LogSeverity::Info,
+                service: "svc".into(),
+                span_id: None,
+                trace_id: "tr-1".into(),
+                message: "server".into(),
+            },
+            1_700_000_123_456_000_789,
+            0,
+            0xdead_beef,
+        );
+        assert!(server_zero_line.has_server_hash);
+        assert_eq!(
+            server_zero_line.cursor(),
+            format!("1700000123456000789:0:{}", 0xdead_beef_u64)
+        );
+
+        let legacy_json = r#"{"k":"0001700000123456000000:0000000000:000000000000002a","timestamp_unix_nano":1700000123456000000,"timestamp_ms":1700000123456,"line_no":0,"dedup_hash":42,"severity":"INFO","service":"svc","span_id":null,"trace_id":"tr-1","message":"old-idb"}"#;
+        let decoded: CachedObsLog = serde_json::from_str(legacy_json).expect("decode legacy cache");
+        assert!(!decoded.has_server_hash);
+        assert_eq!(decoded.dedup_hash, 42);
     }
 }
