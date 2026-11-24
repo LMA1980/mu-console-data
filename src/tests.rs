@@ -6,9 +6,9 @@
 
 use mu_console_protocol::{
     apply_all, encode, Area, AuthReasonCode, AuthStatus, CiSubView, ConnState, CrtFont, DataEvent,
-    DataSource, FadeReason, GateOutcome, ObservabilitySubView, PanelId, PrState, RepoId,
-    RepositorySubView, Route, Selection, SidingPhase, SubView, SubmoduleId, UiCommand, UiError,
-    ViewModel, WorkerConfig, PROTOCOL_VERSION,
+    DataSource, FadeReason, GateOutcome, LogSeverity, ObservabilitySubView, PanelId, PrState,
+    RepoId, RepositorySubView, Route, Selection, SidingPhase, SubView, SubmoduleId, UiCommand,
+    UiError, ViewModel, WorkerConfig, PROTOCOL_VERSION,
 };
 
 use crate::api::tests::{GATE, REPOS, TOPOLOGY};
@@ -17,6 +17,7 @@ use crate::coalesce::{HEARTBEAT_MS, MIN_INTERVAL_MS};
 use crate::engine::{
     Effect, Engine, HttpError, MIN_STABLE_STREAM_MS, OFFLINE_AFTER_ATTEMPTS, SELECT_SETTLE_MS,
 };
+use crate::log_cache::{CachedObsLog, OBS_LOG_PAGE_SIZE, OBS_LOG_WINDOW_CAPACITY};
 use crate::offline::{OfflineSnapshot, SAVE_INTERVAL_MS};
 use crate::scenario::{offline_snapshot, Scenario, OWNER, SUPERPROJECT};
 use crate::store::FADE_MS;
@@ -3610,5 +3611,292 @@ fn job_stage_changed_refreshes_obs_problems_and_clears_fixed_test_alerts() {
     assert!(
         eng.store().view().observe.problems.is_empty(),
         "empty ObsProblems refresh must immediately clear fixed test alert"
+    );
+}
+
+fn synthetic_obs_logs_json(
+    start_seq_desc: usize,
+    count: usize,
+    next_cursor: Option<&str>,
+    has_more: bool,
+    total_matched: u64,
+) -> String {
+    let items: Vec<String> = (0..count)
+        .map(|i| {
+            let seq = start_seq_desc - i;
+            let ts_ms = 1_794_000_000_000_u64 + (seq as u64) * 1_000;
+            let ts_ns = ts_ms * 1_000_000;
+            format!(
+                r#"{{"timestamp_unix_nano":{ts_ns},"timestamp_ms":{ts_ms},"trace_id":"tr-w-{seq}","span_id":"sp-w-{seq}","severity_number":9,"severity_text":"INFO","service":"muobserve","service_name":"muobserve","node_id":"worker-riscv64","body":"Log sequence #{seq}","line_no":{seq},"dedup_hash":{}}}"#,
+                seq + 100
+            )
+        })
+        .collect();
+    let cursor_json = match next_cursor {
+        Some(c) => format!("\"{c}\""),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"{{"severity":"all","total":{count},"logs":[{}],"next_cursor":{cursor_json},"has_more":{has_more},"total_matched":{total_matched}}}"#,
+        items.join(",")
+    )
+}
+
+#[test]
+fn obs_logs_sliding_window_cache_first_paging_sse_freeze_stale_gen_and_auth_scrub() {
+    let mut eng = Engine::new(99);
+    eng.handle(UiCommand::Configure(WorkerConfig::default()), 0);
+    let _ = resolve_operator_session(&mut eng, 5);
+    eng.on_stream_open(StreamId::Ci, 10);
+    eng.on_stream_open(StreamId::Cd, 10);
+    eng.on_stream_open(StreamId::Obs, 10);
+
+    let _ = eng.handle(
+        UiCommand::SelectSubView(SubView::Observability(ObservabilitySubView::Logs)),
+        20,
+    );
+
+    let mk_cached_page = |start_seq_desc: usize, count: usize| -> Vec<CachedObsLog> {
+        (0..count)
+            .map(|i| {
+                let seq = start_seq_desc - i;
+                let ts_ms = 1_794_000_000_000_u64 + (seq as u64) * 1_000;
+                CachedObsLog::with_meta(
+                    mu_console_protocol::OtelLogEntry {
+                        timestamp_ms: ts_ms,
+                        severity: LogSeverity::Info,
+                        service: "muobserve".into(),
+                        span_id: Some(format!("sp-w-{seq}")),
+                        trace_id: format!("tr-w-{seq}"),
+                        message: format!("Log sequence #{seq}"),
+                    },
+                    (ts_ms * 1_000_000) as i64,
+                    seq as u32,
+                    (seq + 100) as u64,
+                )
+            })
+            .collect()
+    };
+
+    // 1. Load initial head page (seqs 1200..=1171) via JSON REST wire path.
+    let head_json =
+        synthetic_obs_logs_json(1200, 30, Some("1795171000000000000:1171:1271"), true, 1200);
+    let head_fx = eng.on_fetch(&FetchKind::ObsLogs, Ok(head_json), 30);
+    assert!(head_fx
+        .iter()
+        .any(|e| matches!(e, Effect::CacheObsLogs(items) if items.len() == 30)));
+    assert_eq!(eng.store().view().observe.logs.len(), 30);
+    assert!(eng.store().view().observe.log_window.has_older);
+    assert_eq!(
+        eng.store().view().observe.log_window.total_matched,
+        Some(1200)
+    );
+
+    // 2. Cache-miss scroll down #1 -> empty IDB triggers FetchKind::ObsLogsOlder, then server JSON returns seqs 1170..=1151.
+    let older_cmd_fx = eng.handle(UiCommand::LoadOlderObsLogs, 40);
+    assert!(older_cmd_fx.iter().any(|e| matches!(
+        e,
+        Effect::ReadObsLogCacheOlder {
+            limit,
+            ..
+        } if *limit == OBS_LOG_PAGE_SIZE
+    )));
+    let miss_fx = eng.on_obs_log_cache_older(0, Vec::new(), 30, 45);
+    assert!(miss_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::ObsLogsOlder { .. },
+            ..
+        }
+    )));
+    let p2_json =
+        synthetic_obs_logs_json(1170, 20, Some("1795151000000000000:1151:1251"), true, 1200);
+    let p2_fx = eng.on_fetch(
+        &FetchKind::ObsLogsOlder {
+            before: "1795171000000000000:1171:1271".into(),
+            limit: OBS_LOG_PAGE_SIZE,
+            gen: 0,
+        },
+        Ok(p2_json),
+        50,
+    );
+    assert!(p2_fx
+        .iter()
+        .any(|e| matches!(e, Effect::CacheObsLogs(items) if items.len() == 20)));
+    assert_eq!(eng.store().view().observe.logs.len(), 50);
+
+    // 3. Hydrate 550 older cached entries (seqs 1150..=601) via IDB cache callback so the 500-line
+    //    sliding window trims top 100 rows (window_start_index = 100) without slow JSON parsing under Miri.
+    let _ = eng.handle(UiCommand::LoadOlderObsLogs, 55);
+    let slide_fx = eng.on_obs_log_cache_older(0, mk_cached_page(1150, 550), 1200, 58);
+    assert!(!slide_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(
+        eng.store().view().observe.logs.len(),
+        OBS_LOG_WINDOW_CAPACITY
+    );
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        100
+    );
+    assert!(eng.store().view().observe.log_window.has_newer);
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #1100"
+    );
+
+    // 4. Cache-first hit: scroll UP (LoadNewerObsLogs) satisfied locally by IDB with ZERO network Fetch.
+    let newer_cmd_fx = eng.handle(UiCommand::LoadNewerObsLogs, 60);
+    let newer_gen = newer_cmd_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::ReadObsLogCacheNewer { gen, .. } => Some(*gen),
+            _ => None,
+        })
+        .expect("ReadObsLogCacheNewer emitted");
+    let hit_fx = eng.on_obs_log_cache_newer(newer_gen, mk_cached_page(1200, 100), 1200, 65);
+    assert!(!hit_fx.iter().any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(eng.store().view().observe.logs.len(), 500);
+    assert_eq!(eng.store().view().observe.log_window.window_start_index, 0);
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Log sequence #1200"
+    );
+
+    // Cache-first hit scrolling DOWN into already-cached rows [700..=501] -> zero Fetch, window advances to 200.
+    let _ = eng.handle(UiCommand::LoadOlderObsLogs, 70);
+    let cache_hit_older_fx = eng.on_obs_log_cache_older(0, mk_cached_page(700, 200), 1200, 75);
+    assert!(!cache_hit_older_fx
+        .iter()
+        .any(|e| matches!(e, Effect::Fetch { .. })));
+    assert_eq!(eng.store().view().observe.logs.len(), 500);
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        200
+    );
+    let visible_top_msg = eng.store().view().observe.logs[0].message.clone();
+    assert_eq!(visible_top_msg, "Log sequence #1000");
+
+    // 5. SSE live arrival while scrolled down freezes visible window and increments pending_live_count.
+    let sse_live = concat!(
+        "event: log_entry\n",
+        "data: {\"timestamp_ns\":1796000000000000000,\"severity\":\"WARN\",\"service\":\"muobserve\",\"span_id\":\"sp-live\",\"trace_id\":\"tr-live-new\",\"body\":\"Fresh live SSE line\"}\n\n"
+    );
+    let sse_fx = eng.on_stream_chunk(StreamId::Obs, sse_live.as_bytes(), 80);
+    assert!(sse_fx
+        .iter()
+        .any(|e| matches!(e, Effect::CacheObsLogs(items) if items.len() == 1)));
+    assert_eq!(eng.store().view().observe.logs[0].message, visible_top_msg);
+    assert_eq!(eng.store().view().observe.log_window.pending_live_count, 1);
+    assert_eq!(
+        eng.store().view().observe.log_window.window_start_index,
+        201
+    );
+
+    // JumpToLatestObsLogs resets scroll window back to head.
+    let jump_fx = eng.handle(UiCommand::JumpToLatestObsLogs, 85);
+    let jump_gen = jump_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::ReadObsLogCacheLatest { gen, .. } => Some(*gen),
+            _ => None,
+        })
+        .expect("JumpToLatestObsLogs emits ReadObsLogCacheLatest");
+    let _ = eng.on_obs_log_cache_latest(jump_gen, Vec::new(), 1201, 90);
+    assert_eq!(eng.store().view().observe.log_window.window_start_index, 0);
+    assert_eq!(eng.store().view().observe.log_window.pending_live_count, 0);
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Fresh live SSE line"
+    );
+
+    // 4. Stale search query cancellation: old gen response must be discarded.
+    let q1_route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some("first".into()),
+        ..Route::default()
+    };
+    let q1_fx = eng.handle(UiCommand::Subscribe(q1_route), 100);
+    let q1_gen = q1_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Fetch {
+                kind: FetchKind::ObsLogsQueryPage { gen, .. },
+                ..
+            } => Some(*gen),
+            _ => None,
+        })
+        .expect("q1 query fetch");
+
+    let q2_route = Route {
+        area: Area::Observability,
+        subview: SubView::Observability(ObservabilitySubView::Logs),
+        filter: Some("second".into()),
+        ..Route::default()
+    };
+    let q2_fx = eng.handle(UiCommand::Subscribe(q2_route), 105);
+    let q2_gen = q2_fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Fetch {
+                kind: FetchKind::ObsLogsQueryPage { gen, .. },
+                ..
+            } => Some(*gen),
+            _ => None,
+        })
+        .expect("q2 query fetch");
+    assert!(q2_gen > q1_gen);
+
+    // Late arrival for q2 first, then stale arrival for q1 -> q1 must not overwrite q2!
+    let _ = eng.on_fetch(
+        &FetchKind::ObsLogsQueryPage {
+            query: "second".into(),
+            before: None,
+            limit: OBS_LOG_PAGE_SIZE,
+            gen: q2_gen,
+        },
+        Ok(r#"{"logs":[{"timestamp_ms":1796000001000,"severity_text":"INFO","service":"svc","trace_id":"t-q2","body":"Match from query two"}],"has_more":false,"total_matched":1}"#.into()),
+        110,
+    );
+    let _ = eng.on_fetch(
+        &FetchKind::ObsLogsQueryPage {
+            query: "first".into(),
+            before: None,
+            limit: OBS_LOG_PAGE_SIZE,
+            gen: q1_gen,
+        },
+        Ok(r#"{"logs":[{"timestamp_ms":1796000002000,"severity_text":"ERROR","service":"svc","trace_id":"t-q1","body":"Stale query one hit"}],"has_more":false,"total_matched":1}"#.into()),
+        115,
+    );
+    assert_eq!(eng.store().view().observe.logs.len(), 1);
+    assert_eq!(
+        eng.store().view().observe.logs[0].message,
+        "Match from query two"
+    );
+
+    // 5. Fail-closed user switch and auth revocation wipe Store + emit ClearObsLogCache.
+    let switched_user_session = OPERATOR_SESSION_JSON.replace(r#""operator""#, r#""alice""#);
+    let switch_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(switched_user_session), 118);
+    assert!(
+        switch_fx.contains(&Effect::ClearObsLogCache),
+        "switching authenticated user must wipe previous user's IndexedDB cache"
+    );
+
+    let revoked_session = r#"{
+        "authenticated": false,
+        "github_login": null,
+        "invite_bound": false,
+        "passkey_count": 0,
+        "passkey_enrollment_required": false,
+        "baseline_role": "anonymous",
+        "bound_roles": [],
+        "active_policies": []
+    }"#;
+    let scrub_fx = eng.on_fetch(&FetchKind::AuthSession, Ok(revoked_session.into()), 120);
+    assert!(scrub_fx.contains(&Effect::ClearObsLogCache));
+    assert!(eng.store().view().observe.logs.is_empty());
+    assert_eq!(
+        eng.store().view().observe.log_window,
+        mu_console_protocol::ObsLogWindowMeta::default()
     );
 }

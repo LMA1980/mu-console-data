@@ -22,6 +22,9 @@ pub mod api;
 pub mod backoff;
 pub mod coalesce;
 pub mod engine;
+#[cfg(target_arch = "wasm32")]
+pub mod idb;
+pub mod log_cache;
 pub mod offline;
 pub mod scenario;
 pub mod sse;

@@ -25,14 +25,18 @@ use mu_console_protocol::{
     AuthStatus, Branch, CanaryBundle, CanaryBundleState, CasHealth, CdLease, CdScore, CiJobStage,
     CiJobSummary, ConsoleSkin, CrtFont, DataSource, DataStoreHealth, DeploymentGate,
     DeploymentSummary, DialogModel, FabricNode, FadeReason, GateOutcome, GateTest,
-    HardwareMetricSeries, InviteCreatedOnceDialogModel, LogSeverity, ModelRunnerView, ObserveView,
-    OtelLogEntry, PackageEcosystem, ParentRef, PasskeyEnrollmentGateModel, PrState,
-    ProblemCategory, PurePathTrace, RegistryPackage, RegistryView, RepoId, RepoScore, RepoStatus,
-    RepoTopology, RoleActivationDto, RoleBadgeView, RoleLeaseView, RollbackReason,
-    SandboxProfileSummary, Selection, SessionRoleDescriptor, SidingPhase, SloProblem, Slot,
-    SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState, Station, SubmoduleRef, TestState,
-    TraceSpan, Train, ViewModel, DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
+    HardwareMetricSeries, InviteCreatedOnceDialogModel, LogSeverity, ModelRunnerView,
+    ObsLogWindowMeta, ObserveView, OtelLogEntry, PackageEcosystem, ParentRef,
+    PasskeyEnrollmentGateModel, PrState, ProblemCategory, PurePathTrace, RegistryPackage,
+    RegistryView, RepoId, RepoScore, RepoStatus, RepoTopology, RoleActivationDto, RoleBadgeView,
+    RoleLeaseView, RollbackReason, SandboxProfileSummary, Selection, SessionRoleDescriptor,
+    SidingPhase, SloProblem, Slot, SmartscapeEdge, SmartscapeLayer, SmartscapeNode, StageState,
+    Station, SubmoduleRef, TestState, TraceSpan, Train, ViewModel,
+    DEFAULT_MAX_ACTIVE_ROLES_HEADER_CHARS,
 };
+
+use crate::api::ObsLogsPageDto;
+use crate::log_cache::{CachedObsLog, OBS_LOG_WINDOW_CAPACITY};
 
 /// A merged or deleted siding is removed this long after it starts fading.
 pub const FADE_MS: u64 = 2_000;
@@ -63,8 +67,14 @@ pub enum Input {
     ObsTraces(Vec<TraceDto>),
     ObsTraceDetail(TraceDto),
     ObsLogs(Vec<OtelLogDto>),
+    ObsLogsPage(ObsLogsPageDto),
+    ObsLogsOlderPage(ObsLogsPageDto),
     ObsLogEntry(OtelLogDto),
     ObsLogsQueryResult(Vec<OtelLogDto>),
+    ObsLogsQueryPage {
+        page: ObsLogsPageDto,
+        append: bool,
+    },
     ObsMetrics(Vec<MetricSeriesDto>),
     ObsStoreStatus(StoreStatusDto),
     ObsSubsystemStatus(Vec<SubsystemStatusEntryDto>),
@@ -180,6 +190,19 @@ pub struct Store {
     registry: RegistryView,
     observe: ObserveView,
     live_obs_logs: Vec<OtelLogEntry>,
+    window_obs_logs: Vec<CachedObsLog>,
+    obs_server_next_cursor: Option<String>,
+    obs_server_has_more: bool,
+    obs_server_total_matched: Option<u64>,
+    obs_oldest_server_key: Option<String>,
+    newest_seen_live_key: Option<String>,
+    obs_cached_total: u32,
+    obs_local_has_older: bool,
+    search_window_logs: Vec<CachedObsLog>,
+    search_next_cursor: Option<String>,
+    search_has_more: bool,
+    search_total_matched: Option<u64>,
+    pending_cache_obs_logs: Vec<CachedObsLog>,
     live_obs_metrics: Vec<HardwareMetricSeries>,
     live_obs_problems: Vec<SloProblem>,
     live_smartscape_nodes: Vec<SmartscapeNode>,
@@ -903,6 +926,7 @@ fn default_observe() -> ObserveView {
                 ),
             },
         ],
+        log_window: ObsLogWindowMeta::default(),
         metrics: vec![
             HardwareMetricSeries {
                 service: "k3-kernels-rvv".into(),
@@ -1721,6 +1745,7 @@ impl Store {
         if !can_obs_area {
             scrubbed |= reset_default_if(&mut self.observe);
             scrubbed |= clear_vec_if(&mut self.live_obs_logs);
+            scrubbed |= self.scrub_obs_log_window_state();
             scrubbed |= clear_vec_if(&mut self.live_obs_metrics);
             scrubbed |= clear_vec_if(&mut self.live_obs_problems);
             scrubbed |= clear_vec_if(&mut self.live_smartscape_nodes);
@@ -1729,6 +1754,11 @@ impl Store {
             if !can_obs_logs {
                 scrubbed |= clear_vec_if(&mut self.observe.logs);
                 scrubbed |= clear_vec_if(&mut self.live_obs_logs);
+                if self.observe.log_window != ObsLogWindowMeta::default() {
+                    self.observe.log_window = ObsLogWindowMeta::default();
+                    scrubbed = true;
+                }
+                scrubbed |= self.scrub_obs_log_window_state();
             }
             if !can_obs_traces {
                 scrubbed |= clear_vec_if(&mut self.observe.traces);
@@ -1848,8 +1878,161 @@ impl Store {
     pub fn clear_active_log_query(&mut self) {
         if self.active_log_query {
             self.active_log_query = false;
+            self.search_window_logs.clear();
+            self.search_next_cursor = None;
+            self.search_has_more = false;
+            self.search_total_matched = None;
+            self.observe.log_window.search_active = false;
+            self.observe.log_window.window_start_index = 0;
+            self.observe.log_window.has_newer = false;
+            self.observe.log_window.pending_live_count = 0;
+            self.observe.log_window.loading_older = false;
+            self.observe.log_window.loading_newer = false;
+            self.dirty = true;
             if self.source == DataSource::Live {
                 self.refresh_live_logs();
+            }
+        }
+    }
+
+    fn scrub_obs_log_window_state(&mut self) -> bool {
+        let mut changed = false;
+        changed |= clear_vec_if(&mut self.window_obs_logs);
+        changed |= clear_vec_if(&mut self.search_window_logs);
+        changed |= clear_vec_if(&mut self.pending_cache_obs_logs);
+        changed |= clear_opt_if(&mut self.obs_server_next_cursor);
+        if self.obs_server_has_more {
+            self.obs_server_has_more = false;
+            changed = true;
+        }
+        changed |= clear_opt_if(&mut self.obs_server_total_matched);
+        changed |= clear_opt_if(&mut self.obs_oldest_server_key);
+        changed |= clear_opt_if(&mut self.newest_seen_live_key);
+        if self.obs_cached_total != 0 {
+            self.obs_cached_total = 0;
+            changed = true;
+        }
+        if self.obs_local_has_older {
+            self.obs_local_has_older = false;
+            changed = true;
+        }
+        changed |= clear_opt_if(&mut self.search_next_cursor);
+        if self.search_has_more {
+            self.search_has_more = false;
+            changed = true;
+        }
+        changed |= clear_opt_if(&mut self.search_total_matched);
+        if self.active_log_query {
+            self.active_log_query = false;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Return `true` when persisting raw logs in the browser IndexedDB cache is permitted.
+    #[must_use]
+    pub fn can_cache_obs_logs(&self) -> bool {
+        self.source == DataSource::Live
+            && self.can_emit_operational_data()
+            && self.auth.status == AuthStatus::Active
+            && auth_has_policy(&self.auth, "obs:logs.read")
+    }
+
+    /// Drain normalized log records queued for browser IndexedDB persistence.
+    pub fn take_pending_cache_obs_logs(&mut self) -> Vec<CachedObsLog> {
+        std::mem::take(&mut self.pending_cache_obs_logs)
+    }
+
+    /// Primary IndexedDB sort key of the oldest visible row in the current window.
+    #[must_use]
+    pub fn oldest_obs_log_key(&self) -> Option<String> {
+        self.window_obs_logs.last().map(|l| l.k.clone())
+    }
+
+    /// Primary IndexedDB sort key of the newest visible row in the current window.
+    #[must_use]
+    pub fn newest_obs_log_key(&self) -> Option<String> {
+        self.window_obs_logs.first().map(|l| l.k.clone())
+    }
+
+    /// Best server `before` cursor for fetching entries strictly older than the cached tail.
+    #[must_use]
+    pub fn oldest_obs_log_cursor(&self) -> Option<String> {
+        let win_tail = self.window_obs_logs.last();
+        match (
+            &self.obs_server_next_cursor,
+            &self.obs_oldest_server_key,
+            win_tail,
+        ) {
+            (Some(cursor), Some(srv_k), Some(tail)) if srv_k <= &tail.k => Some(cursor.clone()),
+            (_, _, Some(tail)) => Some(tail.cursor()),
+            (Some(cursor), _, None) => Some(cursor.clone()),
+            _ => None,
+        }
+    }
+
+    /// Server `before` cursor for the next page of an active log search.
+    #[must_use]
+    pub fn search_next_cursor(&self) -> Option<String> {
+        self.search_next_cursor.clone()
+    }
+
+    /// Whether the backend indicated older live logs exist beyond its last fetched page.
+    #[must_use]
+    pub fn obs_server_has_more(&self) -> bool {
+        self.obs_server_has_more
+    }
+
+    /// Mark whether an older-page load is currently in flight.
+    pub fn set_obs_loading_older(&mut self, loading: bool) {
+        if self.observe.log_window.loading_older != loading {
+            self.observe.log_window.loading_older = loading;
+            self.dirty = true;
+        }
+    }
+
+    /// Mark whether a newer-page load is currently in flight.
+    pub fn set_obs_loading_newer(&mut self, loading: bool) {
+        if self.observe.log_window.loading_newer != loading {
+            self.observe.log_window.loading_newer = loading;
+            self.dirty = true;
+        }
+    }
+
+    /// Current live log window start offset from head (`0` = latest).
+    #[must_use]
+    pub fn obs_window_start_index(&self) -> u32 {
+        self.observe.log_window.window_start_index
+    }
+
+    /// Whether an older-page trigger should run right now.
+    #[must_use]
+    pub fn can_load_older_obs_logs(&self) -> bool {
+        if self.observe.log_window.loading_older {
+            return false;
+        }
+        if self.active_log_query {
+            self.search_has_more && self.search_next_cursor.is_some()
+        } else {
+            self.oldest_obs_log_key().is_some()
+                && (self.obs_server_has_more
+                    || self.obs_local_has_older
+                    || self.observe.log_window.has_older)
+        }
+    }
+
+    /// Whether a newer-page trigger should run right now.
+    #[must_use]
+    pub fn can_load_newer_obs_logs(&self) -> bool {
+        !self.observe.log_window.loading_newer && self.observe.log_window.window_start_index > 0
+    }
+
+    /// Synchronize the known browser IndexedDB log count and recompute `has_older`.
+    pub fn update_obs_cached_total(&mut self, cached_total: u32) {
+        if self.obs_cached_total != cached_total {
+            self.obs_cached_total = cached_total;
+            if !self.active_log_query {
+                self.sync_obs_window_counters();
             }
         }
     }
@@ -1974,97 +2157,140 @@ impl Store {
         }
     }
 
+    fn normalize_log_record(
+        &mut self,
+        entry: &mut CachedObsLog,
+        dstate_alert_count: &mut usize,
+    ) -> Option<bool> {
+        let clean_msg = clean_otel_message(&entry.message);
+        if self.source == DataSource::Live
+            && (clean_msg.is_empty() || clean_msg.eq_ignore_ascii_case("running 0 tests"))
+        {
+            return None;
+        }
+        if entry
+            .service
+            .eq_ignore_ascii_case("action-runner-controller")
+        {
+            entry.service = String::from("actionrunner-controller");
+        }
+        if entry.severity == LogSeverity::Error
+            && (clean_msg.contains("test result: ok.")
+                || (clean_msg.contains("0 failed") && !clean_msg.contains("FAILED"))
+                || clean_msg.starts_with("Running ")
+                || clean_msg.starts_with("Compiling ")
+                || clean_msg.starts_with("Finished ")
+                || clean_msg.starts_with("Doc-tests "))
+        {
+            entry.severity = LogSeverity::Info;
+        }
+        let is_dstate_alert = clean_msg.contains("Host pressure / D-state alert");
+        if is_dstate_alert {
+            if *dstate_alert_count >= 3 {
+                return None;
+            }
+            if entry.severity == LogSeverity::Error
+                && clean_msg.contains("wchan=0")
+                && (clean_msg.contains("io_some_avg10=0.")
+                    || clean_msg.contains("io_some_avg10=1.")
+                    || clean_msg.contains("io_some_avg10=2.")
+                    || clean_msg.contains("io_some_avg10=3.")
+                    || clean_msg.contains("io_some_avg10=4."))
+            {
+                entry.severity = LogSeverity::Warn;
+            }
+        }
+        entry.message = clean_msg;
+        let has_real_trace =
+            !entry.trace_id.is_empty() && !entry.trace_id.chars().all(|c| c == '0');
+        if matches!(self.source, DataSource::Scenario(_))
+            && has_real_trace
+            && !self
+                .observe
+                .traces
+                .iter()
+                .any(|t| t.trace_id == entry.trace_id)
+        {
+            self.observe.traces.push(PurePathTrace {
+                trace_id: entry.trace_id.clone(),
+                root_service: entry.service.clone(),
+                root_operation: entry.message.clone(),
+                domain: "OBS".into(),
+                duration_ms: 12,
+                error: entry.severity == LogSeverity::Error,
+                slow_p99: false,
+                started_epoch_ms: entry.timestamp_ms,
+                spans: vec![TraceSpan {
+                    span_id: entry
+                        .span_id
+                        .clone()
+                        .unwrap_or_else(|| "sp-obs-log-1".into()),
+                    parent_span_id: None,
+                    service: entry.service.clone(),
+                    operation: entry.message.clone(),
+                    start_offset_us: 0,
+                    duration_us: 12_000,
+                    self_time_us: 12_000,
+                    critical_path: true,
+                    error: entry.severity == LogSeverity::Error,
+                    hardware_class: "fabric-collector".into(),
+                }],
+            });
+        }
+        entry.refresh_key();
+        Some(is_dstate_alert)
+    }
+
     fn normalize_log_dtos(&mut self, list: Vec<OtelLogDto>) -> Vec<OtelLogEntry> {
         let use_set = list.len() > 8;
         let mut incoming = Vec::with_capacity(list.len());
         let mut seen_incoming = std::collections::BTreeSet::new();
         let mut dstate_alert_count = 0_usize;
         for l in list {
-            let clean_msg = clean_otel_message(&l.message);
-            if self.source == DataSource::Live
-                && (clean_msg.is_empty() || clean_msg.eq_ignore_ascii_case("running 0 tests"))
-            {
+            let mut cached = CachedObsLog::from_otel_entry(OtelLogEntry {
+                timestamp_ms: l.timestamp_ms,
+                severity: l.severity,
+                service: l.service,
+                span_id: l.span_id,
+                trace_id: l.trace_id,
+                message: l.message,
+            });
+            let Some(is_dstate_alert) =
+                self.normalize_log_record(&mut cached, &mut dstate_alert_count)
+            else {
                 continue;
-            }
-            let service = if l.service.eq_ignore_ascii_case("action-runner-controller") {
-                String::from("actionrunner-controller")
-            } else {
-                l.service
             };
-            let mut severity = l.severity;
-            if severity == LogSeverity::Error
-                && (clean_msg.contains("test result: ok.")
-                    || (clean_msg.contains("0 failed") && !clean_msg.contains("FAILED"))
-                    || clean_msg.starts_with("Running ")
-                    || clean_msg.starts_with("Compiling ")
-                    || clean_msg.starts_with("Finished ")
-                    || clean_msg.starts_with("Doc-tests "))
-            {
-                severity = LogSeverity::Info;
-            }
-            let is_dstate_alert = clean_msg.contains("Host pressure / D-state alert");
-            if is_dstate_alert {
-                if dstate_alert_count >= 3 {
-                    continue;
-                }
-                if severity == LogSeverity::Error
-                    && clean_msg.contains("wchan=0")
-                    && (clean_msg.contains("io_some_avg10=0.")
-                        || clean_msg.contains("io_some_avg10=1.")
-                        || clean_msg.contains("io_some_avg10=2.")
-                        || clean_msg.contains("io_some_avg10=3.")
-                        || clean_msg.contains("io_some_avg10=4."))
-                {
-                    severity = LogSeverity::Warn;
-                }
-            }
-            let has_real_trace = !l.trace_id.is_empty() && !l.trace_id.chars().all(|c| c == '0');
-            if matches!(self.source, DataSource::Scenario(_))
-                && has_real_trace
-                && !self.observe.traces.iter().any(|t| t.trace_id == l.trace_id)
-            {
-                self.observe.traces.push(PurePathTrace {
-                    trace_id: l.trace_id.clone(),
-                    root_service: service.clone(),
-                    root_operation: clean_msg.clone(),
-                    domain: "OBS".into(),
-                    duration_ms: 12,
-                    error: severity == LogSeverity::Error,
-                    slow_p99: false,
-                    started_epoch_ms: l.timestamp_ms,
-                    spans: vec![TraceSpan {
-                        span_id: l.span_id.clone().unwrap_or_else(|| "sp-obs-log-1".into()),
-                        parent_span_id: None,
-                        service: service.clone(),
-                        operation: clean_msg.clone(),
-                        start_offset_us: 0,
-                        duration_us: 12_000,
-                        self_time_us: 12_000,
-                        critical_path: true,
-                        error: severity == LogSeverity::Error,
-                        hardware_class: "fabric-collector".into(),
-                    }],
-                });
-            }
             let already_seen = if use_set {
-                !seen_incoming.insert((l.trace_id.clone(), clean_msg.clone()))
+                !seen_incoming.insert((cached.trace_id.clone(), cached.message.clone()))
             } else {
-                incoming
-                    .iter()
-                    .any(|e: &OtelLogEntry| e.trace_id == l.trace_id && e.message == clean_msg)
+                incoming.iter().any(|e: &OtelLogEntry| {
+                    e.trace_id == cached.trace_id && e.message == cached.message
+                })
             };
             if !already_seen {
                 if is_dstate_alert {
                     dstate_alert_count += 1;
                 }
-                incoming.push(OtelLogEntry {
-                    timestamp_ms: l.timestamp_ms,
-                    severity,
-                    service,
-                    span_id: l.span_id,
-                    trace_id: l.trace_id,
-                    message: clean_msg,
-                });
+                incoming.push(cached.to_otel_entry());
+            }
+        }
+        incoming
+    }
+
+    fn normalize_cached_logs(&mut self, list: Vec<CachedObsLog>) -> Vec<CachedObsLog> {
+        let mut incoming = Vec::with_capacity(list.len());
+        let mut seen_keys = std::collections::BTreeSet::new();
+        let mut dstate_alert_count = 0_usize;
+        for mut l in list {
+            let Some(is_dstate_alert) = self.normalize_log_record(&mut l, &mut dstate_alert_count)
+            else {
+                continue;
+            };
+            if seen_keys.insert(l.k.clone()) {
+                if is_dstate_alert {
+                    dstate_alert_count += 1;
+                }
+                incoming.push(l);
             }
         }
         incoming
@@ -2564,8 +2790,29 @@ impl Store {
                 self.loaded = true;
                 self.ensure_aux_defaults();
                 let query_results = self.normalize_log_dtos(list);
-                self.active_log_query = true;
-                self.observe.logs = query_results;
+                let cached: Vec<CachedObsLog> = query_results
+                    .into_iter()
+                    .map(CachedObsLog::from_otel_entry)
+                    .collect();
+                self.apply_search_logs_page(
+                    ObsLogsPageDto {
+                        logs: cached,
+                        next_cursor: None,
+                        has_more: false,
+                        total_matched: None,
+                    },
+                    false,
+                );
+                if self.source == DataSource::Live {
+                    self.refresh_live_problems();
+                    self.refresh_live_smartscape();
+                }
+                true
+            }
+            Input::ObsLogsQueryPage { page, append } => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                self.apply_search_logs_page(page, append);
                 if self.source == DataSource::Live {
                     self.refresh_live_problems();
                     self.refresh_live_smartscape();
@@ -2578,24 +2825,59 @@ impl Store {
                 let entries = self.normalize_log_dtos(vec![entry]);
                 if let Some(entry) = entries.into_iter().next() {
                     if self.source == DataSource::Live {
-                        if !self.live_obs_logs.iter().any(|e| {
+                        let cached = CachedObsLog::from_otel_entry(entry.clone());
+                        let is_new_live = !self.live_obs_logs.iter().any(|e| {
                             e.timestamp_ms == entry.timestamp_ms
                                 && e.trace_id == entry.trace_id
                                 && e.message == entry.message
-                        }) {
+                        });
+                        if is_new_live {
                             self.live_obs_logs.push(entry);
                             self.live_obs_logs
                                 .sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-                            self.live_obs_logs.truncate(500);
+                            self.live_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+                            if self.can_cache_obs_logs() {
+                                self.pending_cache_obs_logs.push(cached.clone());
+                            }
+                            self.obs_cached_total = self.obs_cached_total.saturating_add(1);
+                            if let Some(ref mut total) = self.obs_server_total_matched {
+                                *total = total.saturating_add(1);
+                            }
+                            let is_strictly_newer_than_head = self
+                                .newest_seen_live_key
+                                .as_ref()
+                                .is_none_or(|nk| &cached.k > nk);
+                            if is_strictly_newer_than_head {
+                                self.newest_seen_live_key = Some(cached.k.clone());
+                            }
+                            if self.observe.log_window.window_start_index == 0 {
+                                if !self.window_obs_logs.iter().any(|e| e.k == cached.k) {
+                                    self.window_obs_logs.push(cached);
+                                    self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+                                    if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+                                        self.window_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+                                        self.obs_local_has_older = true;
+                                    }
+                                }
+                            } else if is_strictly_newer_than_head {
+                                self.observe.log_window.window_start_index =
+                                    self.observe.log_window.window_start_index.saturating_add(1);
+                                self.observe.log_window.pending_live_count =
+                                    self.observe.log_window.pending_live_count.saturating_add(1);
+                                self.observe.log_window.has_newer = true;
+                            }
                         }
-                        if !self.active_log_query {
+                        if !self.active_log_query && self.observe.log_window.window_start_index == 0
+                        {
                             self.refresh_live_logs();
+                        } else if !self.active_log_query {
+                            self.sync_obs_window_counters();
                         }
                         self.refresh_live_problems();
                         self.refresh_live_smartscape();
                     } else {
                         self.observe.logs.insert(0, entry);
-                        self.observe.logs.truncate(500);
+                        self.observe.logs.truncate(OBS_LOG_WINDOW_CAPACITY);
                     }
                 }
                 true
@@ -2606,11 +2888,12 @@ impl Store {
                 let incoming = self.normalize_log_dtos(list);
                 if self.source == DataSource::Live {
                     if !incoming.is_empty() {
-                        merge_unique_logs(&mut self.live_obs_logs, incoming, |e| {
-                            (e.timestamp_ms, e.trace_id.clone(), e.message.clone())
-                        });
-                    }
-                    if !self.active_log_query {
+                        let cached: Vec<CachedObsLog> = incoming
+                            .into_iter()
+                            .map(CachedObsLog::from_otel_entry)
+                            .collect();
+                        self.apply_live_head_cached_logs(cached, None);
+                    } else if !self.active_log_query {
                         self.refresh_live_logs();
                     }
                     self.refresh_live_problems();
@@ -2626,6 +2909,60 @@ impl Store {
                         (e.trace_id.clone(), e.message.clone())
                     });
                     self.observe.logs = merged;
+                }
+                true
+            }
+            Input::ObsLogsPage(page) => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                let normalized = self.normalize_cached_logs(page.logs);
+                if self.source == DataSource::Live {
+                    self.apply_live_head_cached_logs(
+                        normalized,
+                        Some((page.next_cursor, page.has_more, page.total_matched)),
+                    );
+                    self.refresh_live_problems();
+                    self.refresh_live_smartscape();
+                } else {
+                    self.observe.logs = normalized
+                        .iter()
+                        .take(OBS_LOG_WINDOW_CAPACITY)
+                        .map(CachedObsLog::to_otel_entry)
+                        .collect();
+                }
+                true
+            }
+            Input::ObsLogsOlderPage(page) => {
+                self.loaded = true;
+                self.ensure_aux_defaults();
+                let normalized = self.normalize_cached_logs(page.logs);
+                if self.source == DataSource::Live {
+                    if self.can_cache_obs_logs() && !normalized.is_empty() {
+                        self.pending_cache_obs_logs
+                            .extend(normalized.iter().cloned());
+                    }
+                    if let Some(tail) = normalized.last() {
+                        let replace = self
+                            .obs_oldest_server_key
+                            .as_ref()
+                            .is_none_or(|prev| &tail.k <= prev);
+                        if replace {
+                            self.obs_oldest_server_key = Some(tail.k.clone());
+                            self.obs_server_next_cursor = page.next_cursor;
+                            self.obs_server_has_more = page.has_more;
+                        }
+                    } else {
+                        self.obs_server_next_cursor = page.next_cursor;
+                        self.obs_server_has_more = page.has_more;
+                    }
+                    if let Some(total) = page.total_matched {
+                        self.obs_server_total_matched = Some(total);
+                    }
+                    if !self.active_log_query {
+                        self.apply_obs_logs_older_items(normalized, None);
+                    }
+                    self.refresh_live_problems();
+                    self.refresh_live_smartscape();
                 }
                 true
             }
@@ -3693,10 +4030,365 @@ impl Store {
         if self.source != DataSource::Live || self.active_log_query {
             return;
         }
-        let mut clean_logs = self.live_obs_logs.clone();
-        clean_logs.sort_by_key(|l| std::cmp::Reverse(l.timestamp_ms));
-        clean_logs.truncate(500);
-        self.observe.logs = clean_logs;
+        if self.observe.log_window.window_start_index > 0 {
+            self.sync_obs_window_counters();
+            return;
+        }
+        let mut seen_keys: BTreeSet<String> =
+            self.window_obs_logs.iter().map(|w| w.k.clone()).collect();
+        let mut seen_triples: BTreeSet<(u64, String, String)> = self
+            .window_obs_logs
+            .iter()
+            .map(|w| (w.timestamp_ms, w.trace_id.clone(), w.message.clone()))
+            .collect();
+        for entry in &self.live_obs_logs {
+            let triple = (
+                entry.timestamp_ms,
+                entry.trace_id.clone(),
+                entry.message.clone(),
+            );
+            if seen_triples.contains(&triple) {
+                continue;
+            }
+            let cached = CachedObsLog::from_otel_entry(entry.clone());
+            if seen_keys.insert(cached.k.clone()) {
+                seen_triples.insert(triple);
+                self.window_obs_logs.push(cached);
+            }
+        }
+        self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+        if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+            self.window_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+            self.obs_local_has_older = true;
+        }
+        self.observe.logs = self
+            .window_obs_logs
+            .iter()
+            .map(CachedObsLog::to_otel_entry)
+            .collect();
+        self.observe.log_window.has_newer = false;
+        self.observe.log_window.pending_live_count = 0;
+        self.sync_obs_window_counters();
+    }
+
+    fn sync_obs_window_counters(&mut self) {
+        let len_u32 = u32::try_from(self.window_obs_logs.len()).unwrap_or(u32::MAX);
+        self.obs_cached_total = self.obs_cached_total.max(len_u32);
+        let window_end = self
+            .observe
+            .log_window
+            .window_start_index
+            .saturating_add(len_u32);
+        self.observe.log_window.cached_total = self.obs_cached_total;
+        self.observe.log_window.total_matched = self.obs_server_total_matched;
+        self.observe.log_window.has_older = self.obs_server_has_more
+            || self.obs_local_has_older
+            || self.obs_cached_total > window_end;
+        self.dirty = true;
+    }
+
+    fn apply_live_head_cached_logs(
+        &mut self,
+        incoming: Vec<CachedObsLog>,
+        page_meta: Option<(Option<String>, bool, Option<u64>)>,
+    ) {
+        if let Some((next_cursor, has_more, total_matched)) = page_meta {
+            if let Some(total) = total_matched {
+                self.obs_server_total_matched = Some(total);
+            }
+            let incoming_tail_k = incoming.last().map(|l| l.k.clone());
+            let should_update_cursor = match (&self.obs_oldest_server_key, &incoming_tail_k) {
+                (None, _) => true,
+                (Some(prev_k), Some(new_k)) => new_k <= prev_k || self.window_obs_logs.is_empty(),
+                (Some(_), None) => self.window_obs_logs.is_empty(),
+            };
+            if should_update_cursor {
+                self.obs_server_next_cursor = next_cursor;
+                self.obs_server_has_more = has_more;
+                if let Some(k) = incoming_tail_k {
+                    self.obs_oldest_server_key = Some(k);
+                }
+            }
+        }
+        if incoming.is_empty() {
+            if !self.active_log_query {
+                self.refresh_live_logs();
+            }
+            return;
+        }
+        let prev_newest_k = self.newest_seen_live_key.clone();
+        let mut newly_arrived_count = 0_u32;
+        let mut new_for_cache = Vec::new();
+        let live_seen: Option<BTreeSet<(u64, &str, &str)>> = if incoming.len() > 8 {
+            Some(
+                self.live_obs_logs
+                    .iter()
+                    .map(|e| (e.timestamp_ms, e.trace_id.as_str(), e.message.as_str()))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        for item in &incoming {
+            let strictly_newer = prev_newest_k.as_ref().is_none_or(|nk| &item.k > nk);
+            if strictly_newer {
+                newly_arrived_count = newly_arrived_count.saturating_add(1);
+            }
+            let already_in_live = match &live_seen {
+                Some(set) => set.contains(&(
+                    item.timestamp_ms,
+                    item.trace_id.as_str(),
+                    item.message.as_str(),
+                )),
+                None => self.live_obs_logs.iter().any(|e| {
+                    e.timestamp_ms == item.timestamp_ms
+                        && e.trace_id == item.trace_id
+                        && e.message == item.message
+                }),
+            };
+            if !already_in_live {
+                new_for_cache.push(item.clone());
+            }
+        }
+        if self.can_cache_obs_logs() && !new_for_cache.is_empty() {
+            self.pending_cache_obs_logs.extend(new_for_cache);
+        }
+        if let Some(top) = incoming.iter().map(|i| &i.k).max() {
+            if self.newest_seen_live_key.as_ref().is_none_or(|nk| top > nk) {
+                self.newest_seen_live_key = Some(top.clone());
+            }
+        }
+        let otel_incoming: Vec<OtelLogEntry> =
+            incoming.iter().map(CachedObsLog::to_otel_entry).collect();
+        merge_unique_logs(&mut self.live_obs_logs, otel_incoming, |e| {
+            (e.timestamp_ms, e.trace_id.clone(), e.message.clone())
+        });
+
+        if self.observe.log_window.window_start_index == 0 {
+            let mut seen: BTreeSet<String> =
+                self.window_obs_logs.iter().map(|l| l.k.clone()).collect();
+            for item in incoming {
+                if seen.insert(item.k.clone()) {
+                    self.window_obs_logs.push(item);
+                }
+            }
+            self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+            if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+                self.window_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+                self.obs_local_has_older = true;
+            }
+            if !self.active_log_query {
+                self.refresh_live_logs();
+            }
+        } else if newly_arrived_count > 0 {
+            self.observe.log_window.window_start_index = self
+                .observe
+                .log_window
+                .window_start_index
+                .saturating_add(newly_arrived_count);
+            self.observe.log_window.pending_live_count = self
+                .observe
+                .log_window
+                .pending_live_count
+                .saturating_add(newly_arrived_count);
+            self.observe.log_window.has_newer = true;
+            self.obs_cached_total = self.obs_cached_total.saturating_add(newly_arrived_count);
+            if !self.active_log_query {
+                self.sync_obs_window_counters();
+            }
+        }
+    }
+
+    fn apply_search_logs_page(&mut self, page: ObsLogsPageDto, append: bool) {
+        let normalized = self.normalize_cached_logs(page.logs);
+        self.active_log_query = true;
+        self.observe.log_window.search_active = true;
+        self.observe.log_window.loading_older = false;
+        self.observe.log_window.loading_newer = false;
+        if append {
+            let mut seen: BTreeSet<String> = self
+                .search_window_logs
+                .iter()
+                .map(|l| l.k.clone())
+                .collect();
+            for item in normalized {
+                if seen.insert(item.k.clone()) {
+                    self.search_window_logs.push(item);
+                }
+            }
+            self.search_window_logs.sort_by(|a, b| b.k.cmp(&a.k));
+            if self.search_window_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+                let drop_top = self.search_window_logs.len() - OBS_LOG_WINDOW_CAPACITY;
+                self.search_window_logs.drain(0..drop_top);
+                self.observe.log_window.window_start_index = self
+                    .observe
+                    .log_window
+                    .window_start_index
+                    .saturating_add(u32::try_from(drop_top).unwrap_or(u32::MAX));
+                self.observe.log_window.has_newer = true;
+            }
+        } else {
+            self.search_window_logs = normalized;
+            self.search_window_logs.sort_by(|a, b| b.k.cmp(&a.k));
+            self.search_window_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+            self.observe.log_window.window_start_index = 0;
+            self.observe.log_window.has_newer = false;
+            self.observe.log_window.pending_live_count = 0;
+        }
+        self.search_next_cursor = page.next_cursor;
+        self.search_has_more = page.has_more;
+        self.search_total_matched = page.total_matched;
+        self.observe.log_window.has_older = page.has_more;
+        self.observe.log_window.total_matched = page.total_matched;
+        self.observe.log_window.cached_total =
+            u32::try_from(self.search_window_logs.len()).unwrap_or(u32::MAX);
+        self.observe.logs = self
+            .search_window_logs
+            .iter()
+            .map(CachedObsLog::to_otel_entry)
+            .collect();
+        self.dirty = true;
+    }
+
+    /// Merge older logs loaded from IndexedDB or server cursor pagination into the 500-line window.
+    pub fn apply_obs_logs_older_items(&mut self, items: Vec<CachedObsLog>, idb_total: Option<u32>) {
+        if self.active_log_query {
+            self.observe.log_window.loading_older = false;
+            return;
+        }
+        let normalized = self.normalize_cached_logs(items);
+        let mut seen: BTreeSet<String> = self.window_obs_logs.iter().map(|l| l.k.clone()).collect();
+        for item in normalized {
+            if seen.insert(item.k.clone()) {
+                self.window_obs_logs.push(item);
+            }
+        }
+        self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+        if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+            let drop_top = self.window_obs_logs.len() - OBS_LOG_WINDOW_CAPACITY;
+            self.window_obs_logs.drain(0..drop_top);
+            self.observe.log_window.window_start_index = self
+                .observe
+                .log_window
+                .window_start_index
+                .saturating_add(u32::try_from(drop_top).unwrap_or(u32::MAX));
+            self.observe.log_window.has_newer = true;
+        }
+        if let Some(total) = idb_total {
+            self.obs_cached_total = total;
+        }
+        self.observe.log_window.loading_older = false;
+        self.observe.logs = self
+            .window_obs_logs
+            .iter()
+            .map(CachedObsLog::to_otel_entry)
+            .collect();
+        self.sync_obs_window_counters();
+    }
+
+    /// Merge newer logs loaded from IndexedDB into the 500-line sliding window.
+    pub fn apply_obs_logs_newer_items(&mut self, items: Vec<CachedObsLog>, idb_total: Option<u32>) {
+        if self.active_log_query {
+            self.observe.log_window.loading_newer = false;
+            return;
+        }
+        let normalized = self.normalize_cached_logs(items);
+        let prev_top = self.window_obs_logs.first().map(|l| l.k.clone());
+        let mut seen: BTreeSet<String> = self.window_obs_logs.iter().map(|l| l.k.clone()).collect();
+        let mut added_above = 0_u32;
+        for item in normalized {
+            if seen.insert(item.k.clone()) {
+                if prev_top.as_ref().is_none_or(|top| &item.k > top) {
+                    added_above = added_above.saturating_add(1);
+                }
+                self.window_obs_logs.push(item);
+            }
+        }
+        self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+        if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+            self.window_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+            self.obs_local_has_older = true;
+        }
+        if let Some(total) = idb_total {
+            self.obs_cached_total = total;
+        }
+        let next_start = self
+            .observe
+            .log_window
+            .window_start_index
+            .saturating_sub(added_above);
+        let at_head = added_above == 0
+            || next_start == 0
+            || self
+                .newest_seen_live_key
+                .as_ref()
+                .is_some_and(|nk| self.window_obs_logs.first().is_some_and(|top| &top.k >= nk));
+        if at_head {
+            self.observe.log_window.window_start_index = 0;
+            self.observe.log_window.has_newer = false;
+            self.observe.log_window.pending_live_count = 0;
+        } else {
+            self.observe.log_window.window_start_index = next_start;
+            self.observe.log_window.has_newer = true;
+            self.observe.log_window.pending_live_count = self
+                .observe
+                .log_window
+                .pending_live_count
+                .saturating_sub(added_above);
+        }
+        self.observe.log_window.loading_newer = false;
+        self.observe.logs = self
+            .window_obs_logs
+            .iter()
+            .map(CachedObsLog::to_otel_entry)
+            .collect();
+        self.sync_obs_window_counters();
+    }
+
+    /// Jump the live window back to the newest `<= 500` entries.
+    pub fn apply_obs_logs_latest_items(
+        &mut self,
+        items: Vec<CachedObsLog>,
+        idb_total: Option<u32>,
+    ) {
+        if self.active_log_query {
+            self.observe.log_window.loading_older = false;
+            self.observe.log_window.loading_newer = false;
+            return;
+        }
+        let normalized = self.normalize_cached_logs(items);
+        self.window_obs_logs.clear();
+        let mut seen = BTreeSet::new();
+        for item in normalized {
+            if seen.insert(item.k.clone()) {
+                self.window_obs_logs.push(item);
+            }
+        }
+        for entry in &self.live_obs_logs {
+            let cached = CachedObsLog::from_otel_entry(entry.clone());
+            if seen.insert(cached.k.clone()) {
+                self.window_obs_logs.push(cached);
+            }
+        }
+        self.window_obs_logs.sort_by(|a, b| b.k.cmp(&a.k));
+        if self.window_obs_logs.len() > OBS_LOG_WINDOW_CAPACITY {
+            self.window_obs_logs.truncate(OBS_LOG_WINDOW_CAPACITY);
+            self.obs_local_has_older = true;
+        }
+        if let Some(total) = idb_total {
+            self.obs_cached_total = total;
+        }
+        self.observe.log_window.window_start_index = 0;
+        self.observe.log_window.has_newer = false;
+        self.observe.log_window.pending_live_count = 0;
+        self.observe.log_window.loading_older = false;
+        self.observe.log_window.loading_newer = false;
+        self.observe.logs = self
+            .window_obs_logs
+            .iter()
+            .map(CachedObsLog::to_otel_entry)
+            .collect();
+        self.sync_obs_window_counters();
     }
 
     fn refresh_live_smartscape(&mut self) {
@@ -4918,6 +5610,7 @@ fn sanitize_view_for_auth(v: &mut ViewModel, auth: &AuthState) -> bool {
     } else {
         if !auth_has_policy(auth, "obs:logs.read") {
             scrubbed |= clear_vec_if(&mut v.observe.logs);
+            scrubbed |= reset_default_if(&mut v.observe.log_window);
         }
         if !auth_has_policy(auth, "obs:traces.read") {
             scrubbed |= clear_vec_if(&mut v.observe.traces);
