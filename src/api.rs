@@ -1164,6 +1164,70 @@ fn parse_m2_fetch(kind: &FetchKind, body: &str) -> Result<Input, String> {
     })
 }
 
+/// Normalize an observability log search query so whitespace-delimited tokens conform to
+/// `mu-observable-hub`'s `validate_safe_filter_token` rules without triggering HTTP 400.
+#[must_use]
+pub fn sanitize_obs_log_search_query(raw: &str) -> String {
+    let mut ascii = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii() {
+            let b = ch as u8;
+            let allowed = b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'_'
+                        | b'.'
+                        | b':'
+                        | b'/'
+                        | b'"'
+                        | b'\''
+                        | b'*'
+                        | b'?'
+                        | b'='
+                        | b'<'
+                        | b'>'
+                        | b'+'
+                        | b'%'
+                        | b'@'
+                        | b'#'
+                        | b'~'
+                        | b'['
+                        | b']'
+                        | b'('
+                        | b')'
+                        | b'!'
+                        | b','
+                );
+            ascii.push(if allowed { ch } else { ' ' });
+        } else {
+            ascii.push(' ');
+        }
+    }
+    let stripped = ascii.replace("/*", " ").replace("*/", " ");
+    let mut collapsed = String::with_capacity(stripped.len());
+    let mut prev_dash = false;
+    for ch in stripped.chars() {
+        if ch == '-' {
+            if !prev_dash {
+                collapsed.push('-');
+                prev_dash = true;
+            }
+        } else {
+            prev_dash = false;
+            collapsed.push(ch);
+        }
+    }
+    let mut out = String::with_capacity(collapsed.len());
+    for tok in collapsed.split_whitespace() {
+        let capped = &tok[..tok.len().min(256)];
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(capped);
+    }
+    out
+}
+
 /// Decode one SSE event. `Ok(None)` for keep-alives or empty snapshots.
 ///
 /// # Errors
@@ -1229,8 +1293,12 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         (StreamId::Cd, "tainted") => Input::Tainted(json::<TaintedDto>(data)?),
         (StreamId::Cd, "lease_expired") => Input::LeaseExpired(json::<LeaseExpiredDto>(data)?),
         (StreamId::Obs, "log_entry") => {
-            let entry = json::<RawObsLogItemDto>(data)?.into_otel_dto();
-            Input::ObsLogEntry(entry)
+            let raw = json::<RawObsLogItemDto>(data)?;
+            if raw.timestamp_unix_nano > 0 || raw.line_no > 0 || raw.dedup_hash > 0 {
+                Input::ObsLogStreamItem(raw.into_cached_log())
+            } else {
+                Input::ObsLogEntry(raw.into_otel_dto())
+            }
         }
         (StreamId::Obs, "problem_opened" | "problem_resolved") => {
             let problem = json::<ProblemDto>(data)?;
@@ -1904,7 +1972,25 @@ pub(crate) mod tests {
         }"#;
         let ev =
             parse_event(StreamId::Obs, "log_entry", sse_entry_json).expect("parse stream event");
-        assert!(matches!(ev, Some(Input::ObsLogEntry(entry)) if entry.service == "mu-sse"));
+        assert!(matches!(
+            ev,
+            Some(Input::ObsLogStreamItem(item))
+                if item.service == "mu-sse" && item.timestamp_unix_nano == 1_700_000_001_000_000_000
+        ));
+
+        let legacy_sse_json = r#"{
+          "timestamp_ms": 1700000001000,
+          "severity": "INFO",
+          "service": "mu-sse-legacy",
+          "trace_id": "tr-sse-0",
+          "message": "Legacy ms-only log entry"
+        }"#;
+        let legacy_ev = parse_event(StreamId::Obs, "log_entry", legacy_sse_json)
+            .expect("parse legacy stream event");
+        assert!(matches!(
+            legacy_ev,
+            Some(Input::ObsLogEntry(entry)) if entry.service == "mu-sse-legacy"
+        ));
     }
 
     #[test]
@@ -2200,5 +2286,49 @@ pub(crate) mod tests {
         assert_eq!(legacy_page.logs[0].timestamp_unix_nano, 1_000_000_000);
         assert_ne!(legacy_page.logs[0].dedup_hash, 0);
         assert!(!legacy_page.has_more);
+    }
+
+    #[test]
+    fn sanitize_obs_log_search_query_normalizes_flags_and_disallowed_tokens() {
+        assert_eq!(sanitize_obs_log_search_query("--check"), "-check");
+        assert_eq!(
+            sanitize_obs_log_search_query("cargo test --all-targets --locked"),
+            "cargo test -all-targets -locked"
+        );
+        assert_eq!(
+            sanitize_obs_log_search_query("svc:muobserve; /*comment*/ foo&bar | $HOME \\ {x} `id`"),
+            "svc:muobserve comment foo bar HOME x id"
+        );
+        assert_eq!(
+            sanitize_obs_log_search_query(";;; /* */ & | $ \\ { } `"),
+            ""
+        );
+        let long = "a".repeat(300);
+        assert_eq!(sanitize_obs_log_search_query(&long).len(), 256);
+    }
+
+    #[test]
+    fn sse_log_entry_with_keyset_meta_preserves_nanos_line_and_server_hash() {
+        let sse_full_json = r#"{
+          "timestamp_unix_nano": 1793858300000123456,
+          "timestamp_ms": 1793858300000,
+          "trace_id": "tr-sse-meta",
+          "span_id": "sp-sse-meta",
+          "severity_text": "ERROR",
+          "service_name": "muobserve-collector",
+          "body": "Sub-ms log",
+          "line_no": 12,
+          "dedup_hash": 987654321
+        }"#;
+        let Some(Input::ObsLogStreamItem(item)) =
+            parse_event(StreamId::Obs, "log_entry", sse_full_json).expect("full sse log")
+        else {
+            panic!("expected ObsLogStreamItem");
+        };
+        assert_eq!(item.timestamp_unix_nano, 1_793_858_300_000_123_456);
+        assert_eq!(item.line_no, 12);
+        assert_eq!(item.dedup_hash, 987_654_321);
+        assert!(item.has_server_hash);
+        assert_eq!(item.cursor(), "1793858300000123456:12:987654321");
     }
 }

@@ -17,7 +17,7 @@ use mu_console_protocol::{
     UiCommand, UiError, WorkerConfig, PROTOCOL_VERSION,
 };
 
-use crate::api::{parse_event, parse_fetch, FetchKind, StreamId};
+use crate::api::{parse_event, parse_fetch, sanitize_obs_log_search_query, FetchKind, StreamId};
 use crate::backoff::Backoff;
 use crate::coalesce::Coalescer;
 use crate::log_cache::{CachedObsLog, OBS_LOG_PAGE_SIZE, OBS_LOG_WINDOW_CAPACITY};
@@ -257,9 +257,8 @@ impl Engine {
                 let filter_q = route
                     .filter
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                    .map(sanitize_obs_log_search_query)
+                    .filter(|s| !s.is_empty());
                 let is_log_subview = matches!(
                     route.subview,
                     SubView::Observability(ObservabilitySubView::Logs)
@@ -700,7 +699,10 @@ impl Engine {
                     && self.store.can_load_older_obs_logs()
                 {
                     if self.store.is_active_log_query() {
-                        if let (Some(query), Some(cursor)) = (
+                        if self.store.has_buffered_older_search_logs() {
+                            self.store.step_search_window_older(OBS_LOG_PAGE_SIZE);
+                            self.flush_view_if_ready(now_ms, &mut fx);
+                        } else if let (Some(query), Some(cursor)) = (
                             self.active_obs_log_query.clone(),
                             self.store.search_next_cursor(),
                         ) {
@@ -732,7 +734,10 @@ impl Engine {
                     && self.store.can_load_newer_obs_logs()
                 {
                     if self.store.is_active_log_query() {
-                        if let Some(query) = self.active_obs_log_query.clone() {
+                        if self.store.can_step_search_window_newer() {
+                            self.store.step_search_window_newer(OBS_LOG_PAGE_SIZE);
+                            self.flush_view_if_ready(now_ms, &mut fx);
+                        } else if let Some(query) = self.active_obs_log_query.clone() {
                             self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
                             self.store.set_obs_loading_newer(true);
                             let gen = self.obs_log_query_gen;
@@ -902,6 +907,36 @@ impl Engine {
         }
     }
 
+    fn fetch_obs_logs_or_sanitized_query(&mut self, filter: Option<&str>, fx: &mut Vec<Effect>) {
+        if let Some(q) = filter
+            .map(sanitize_obs_log_search_query)
+            .filter(|s| !s.is_empty())
+        {
+            if self.active_obs_log_query.as_deref() != Some(q.as_str()) {
+                self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                self.active_obs_log_query = Some(q.clone());
+            }
+            self.fetch(
+                FetchKind::ObsLogsQueryPage {
+                    query: q,
+                    before: None,
+                    limit: OBS_LOG_PAGE_SIZE,
+                    gen: self.obs_log_query_gen,
+                },
+                fx,
+            );
+        } else {
+            if self.active_obs_log_query.is_some() {
+                self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
+                self.active_obs_log_query = None;
+            }
+            self.store.clear_active_log_query();
+            if auth_has_policy(self.store.auth(), "obs:logs.read") {
+                self.fetch(FetchKind::ObsLogs, fx);
+            }
+        }
+    }
+
     fn fetch_subview(&mut self, subview: SubView, filter: Option<&str>, fx: &mut Vec<Effect>) {
         match subview {
             SubView::Dashboard(_) => {
@@ -914,27 +949,7 @@ impl Engine {
             }
             SubView::Ci(CiSubView::QueueLogs) => {
                 self.fetch(FetchKind::CiQueue, fx);
-                if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
-                    let q = q.trim().to_owned();
-                    if self.active_obs_log_query.as_deref() != Some(q.as_str()) {
-                        self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
-                        self.active_obs_log_query = Some(q.clone());
-                    }
-                    self.fetch(
-                        FetchKind::ObsLogsQueryPage {
-                            query: q,
-                            before: None,
-                            limit: OBS_LOG_PAGE_SIZE,
-                            gen: self.obs_log_query_gen,
-                        },
-                        fx,
-                    );
-                } else {
-                    self.store.clear_active_log_query();
-                    if auth_has_policy(self.store.auth(), "obs:logs.read") {
-                        self.fetch(FetchKind::ObsLogs, fx);
-                    }
-                }
+                self.fetch_obs_logs_or_sanitized_query(filter, fx);
                 if let Some(job_id) = self
                     .selected_job_id
                     .or_else(|| self.store.view().ci_jobs.first().map(|j| j.job_id))
@@ -1003,25 +1018,7 @@ impl Engine {
             }
             SubView::Observability(ObservabilitySubView::Logs) => {
                 self.fetch(FetchKind::CiQueue, fx);
-                if let Some(q) = filter.filter(|s| !s.trim().is_empty()) {
-                    let q = q.trim().to_owned();
-                    if self.active_obs_log_query.as_deref() != Some(q.as_str()) {
-                        self.obs_log_query_gen = self.obs_log_query_gen.wrapping_add(1);
-                        self.active_obs_log_query = Some(q.clone());
-                    }
-                    self.fetch(
-                        FetchKind::ObsLogsQueryPage {
-                            query: q,
-                            before: None,
-                            limit: OBS_LOG_PAGE_SIZE,
-                            gen: self.obs_log_query_gen,
-                        },
-                        fx,
-                    );
-                } else {
-                    self.store.clear_active_log_query();
-                    self.fetch(FetchKind::ObsLogs, fx);
-                }
+                self.fetch_obs_logs_or_sanitized_query(filter, fx);
             }
             SubView::Observability(ObservabilitySubView::Metrics) => {
                 self.fetch(FetchKind::ObsMetrics, fx);
@@ -1564,8 +1561,7 @@ impl Engine {
                 match kind {
                     FetchKind::ObsLogsOlder { .. } => self.store.set_obs_loading_older(false),
                     FetchKind::ObsLogsQueryPage { .. } => {
-                        self.store.set_obs_loading_older(false);
-                        self.store.set_obs_loading_newer(false);
+                        self.store.apply_search_logs_error();
                     }
                     _ => {}
                 }
@@ -1648,6 +1644,9 @@ impl Engine {
                         message,
                     })));
                 }
+                if matches!(kind, FetchKind::ObsLogsQueryPage { .. }) {
+                    self.flush_view_if_ready(now_ms, &mut fx);
+                }
                 return fx;
             }
         };
@@ -1657,8 +1656,7 @@ impl Engine {
                 match kind {
                     FetchKind::ObsLogsOlder { .. } => self.store.set_obs_loading_older(false),
                     FetchKind::ObsLogsQueryPage { .. } => {
-                        self.store.set_obs_loading_older(false);
-                        self.store.set_obs_loading_newer(false);
+                        self.store.apply_search_logs_error();
                     }
                     _ => {}
                 }
@@ -1668,6 +1666,9 @@ impl Engine {
                         .apply(Input::SessionRolesError(Some(inline_err)), now_ms);
                 }
                 fx.push(Effect::Post(DataEvent::Error(UiError::Decode(msg))));
+                if matches!(kind, FetchKind::ObsLogsQueryPage { .. }) {
+                    self.flush_view_if_ready(now_ms, &mut fx);
+                }
                 return fx;
             }
         };
