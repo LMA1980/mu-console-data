@@ -1245,6 +1245,7 @@ pub fn parse_event(stream: StreamId, event: &str, data: &str) -> Result<Option<I
         (StreamId::Ci, "node_membership_changed") => {
             Input::NodeMembership(json::<NodeMembershipChangedDto>(data)?)
         }
+        (StreamId::Ci, "repos_changed") => Input::ReposChanged,
         (StreamId::Ci, "queue") => {
             let dto = json::<CiQueueDto>(data)?;
             if dto.active_jobs.is_empty()
