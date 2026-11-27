@@ -140,6 +140,7 @@ pub struct Engine {
     offline_requested: bool,
     selection_gen: u64,
     pending_select: Option<(u64, Selection)>,
+    preferred_repo: Option<Selection>,
     obs_log_query_gen: u64,
     active_obs_log_query: Option<String>,
     last_auth_login: Option<String>,
@@ -173,6 +174,7 @@ impl Engine {
             offline_requested: false,
             selection_gen: 0,
             pending_select: None,
+            preferred_repo: None,
             obs_log_query_gen: 0,
             active_obs_log_query: None,
             last_auth_login: None,
@@ -280,14 +282,25 @@ impl Engine {
                     }
                 }
                 if let Some(repo) = route.repo {
-                    self.select(
-                        Selection {
-                            repo,
-                            submodule: route.submodule,
-                        },
-                        now_ms,
-                        &mut fx,
-                    );
+                    let sel = Selection {
+                        repo,
+                        submodule: route.submodule,
+                    };
+                    if self.mode == Mode::Scenario {
+                        self.preferred_repo = None;
+                        self.select(sel, now_ms, &mut fx);
+                    } else if self.store.has_repos_loaded() {
+                        if let Some(valid) = self.store.validate_selection(&sel) {
+                            self.preferred_repo = None;
+                            self.select(valid, now_ms, &mut fx);
+                        } else if self.store.auth().status == AuthStatus::Active {
+                            self.preferred_repo = None;
+                        } else {
+                            self.preferred_repo = Some(sel);
+                        }
+                    } else {
+                        self.preferred_repo = Some(sel);
+                    }
                 }
                 if self.mode == Mode::Live {
                     if let Some(tid) = route.trace_id {
@@ -297,6 +310,7 @@ impl Engine {
                 }
             }
             UiCommand::SelectRepo { repo, submodule } => {
+                self.preferred_repo = None;
                 self.select(Selection { repo, submodule }, now_ms, &mut fx);
             }
             UiCommand::SelectSubView(subview) => {
@@ -814,6 +828,7 @@ impl Engine {
                 found
             }
         };
+        self.preferred_repo = cfg.preferred_repo.clone();
         self.config = cfg;
         if let Some(sc) = scenario {
             self.mode = Mode::Scenario;
@@ -1246,7 +1261,57 @@ impl Engine {
                 self.fetch_subview(sv, None, fx);
             }
         }
+        if self.store.has_repos_loaded() {
+            self.reconcile_selection(false, now_ms, fx);
+        }
         self.update_conn(now_ms, fx);
+    }
+
+    fn reconcile_selection(&mut self, from_repos_fetch: bool, now_ms: u64, fx: &mut Vec<Effect>) {
+        let mut next: Option<Selection> = None;
+        if let Some(pref) = self.preferred_repo.clone() {
+            if let Some(valid_pref) = self.store.validate_selection(&pref) {
+                self.preferred_repo = None;
+                next = Some(valid_pref);
+            } else if from_repos_fetch && self.store.auth().status == AuthStatus::Active {
+                self.preferred_repo = None;
+            }
+        }
+        if next.is_none() {
+            if let Some(cur) = self.store.selection().cloned() {
+                if let Some(valid_cur) = self.store.validate_selection(&cur) {
+                    next = Some(valid_cur);
+                }
+            }
+        }
+        if next.is_none() {
+            next = self.store.repo_ids().next().cloned().map(|repo| Selection {
+                repo,
+                submodule: None,
+            });
+        }
+        let changed = match next {
+            Some(sel) => self.store.apply(Input::Select(sel), now_ms),
+            None => self.store.apply(Input::ClearSelection, now_ms),
+        };
+        if changed {
+            self.selection_gen = self.selection_gen.wrapping_add(1);
+            if self.mode == Mode::Live && self.store.can_emit_operational_data() {
+                self.fetch_selection(fx);
+                if matches!(self.active_subview, Some(SubView::Cd(_))) {
+                    if let Some(sel) = self.store.selection().cloned() {
+                        self.fetch(
+                            FetchKind::CdRuns {
+                                repo: sel.repo,
+                                ecosystem: None,
+                                limit: 25,
+                            },
+                            fx,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn select(&mut self, sel: Selection, now_ms: u64, fx: &mut Vec<Effect>) {
@@ -1699,19 +1764,7 @@ impl Engine {
         }
         match kind {
             FetchKind::Repos => {
-                let first = self.store.repo_ids().next().cloned();
-                if self.store.selection().is_none() {
-                    if let Some(first) = first {
-                        self.select(
-                            Selection {
-                                repo: first,
-                                submodule: None,
-                            },
-                            now_ms,
-                            &mut fx,
-                        );
-                    }
-                }
+                self.reconcile_selection(true, now_ms, &mut fx);
                 self.update_conn(now_ms, &mut fx);
             }
             FetchKind::CiQueue => {
@@ -1831,6 +1884,7 @@ impl Engine {
                         _ => None,
                     };
                     let is_ingress_changed = matches!(&input, Input::ObsIngressChanged);
+                    let is_repos_changed = matches!(&input, Input::ReposChanged);
                     self.store.apply(input, now_ms);
                     let to_cache = self.store.take_pending_cache_obs_logs();
                     if !to_cache.is_empty() && self.store.can_cache_obs_logs() {
@@ -1838,6 +1892,9 @@ impl Engine {
                     }
                     if is_ingress_changed {
                         self.fetch(FetchKind::ObsIngressOverview, &mut fx);
+                    }
+                    if is_repos_changed {
+                        self.fetch(FetchKind::Repos, &mut fx);
                     }
                     if let Some(id) = unknown {
                         self.on_unknown_deployment(id, &mut fx);

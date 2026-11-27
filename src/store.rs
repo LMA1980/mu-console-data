@@ -97,7 +97,9 @@ pub enum Input {
     RolledBack(RolledBackDto),
     Tainted(TaintedDto),
     LeaseExpired(LeaseExpiredDto),
+    ReposChanged,
     Select(Selection),
+    ClearSelection,
     /// Operator authentication session state (`/api/auth/session` or `/api/auth/redeem` / role actions).
     AuthSession(AuthSessionDto),
     /// Signed-in user's `@user` profile & Passkeys (`GET/PUT /api/auth/profile`).
@@ -234,6 +236,7 @@ pub struct Store {
     /// Offline snapshot shown until live data arrives.
     offline: Option<(u64, ViewModel)>,
     loaded: bool,
+    repos_loaded: bool,
     dirty: bool,
     lease_timer_dirty: bool,
 }
@@ -2139,6 +2142,27 @@ impl Store {
         self.loaded
     }
 
+    /// Whether `/api/repos` (or scenario repos) has been loaded at least once.
+    #[must_use]
+    pub const fn has_repos_loaded(&self) -> bool {
+        self.repos_loaded
+    }
+
+    /// Validate `sel` against the loaded repository catalog, clearing any missing submodule.
+    #[must_use]
+    pub fn validate_selection(&self, sel: &Selection) -> Option<Selection> {
+        let score = self.repos.get(&sel.repo)?;
+        let submodule = sel
+            .submodule
+            .as_ref()
+            .filter(|sub| score.submodules.iter().any(|s| s.path == sub.path))
+            .cloned();
+        Some(Selection {
+            repo: sel.repo.clone(),
+            submodule,
+        })
+    }
+
     #[must_use]
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
@@ -3224,11 +3248,13 @@ impl Store {
                     g.rollback_reason = Some(RollbackReason::LeaseExpired);
                 }
             }),
+            Input::ReposChanged => false,
             Input::Select(sel) => {
                 let changed = self.selection.as_ref() != Some(&sel);
                 self.selection = Some(sel);
                 changed
             }
+            Input::ClearSelection => self.selection.take().is_some(),
             Input::AuthSession(dto) => self.apply_auth_session(dto, now_ms),
             Input::ObsSubsystemStatus(entries) => {
                 self.subsystem_health = SubsystemHealthSummary::from_entries(&entries);
@@ -3747,6 +3773,7 @@ impl Store {
 
     fn repos_loaded(&mut self, list: Vec<RepoDto>) -> bool {
         self.loaded = true;
+        self.repos_loaded = true;
         self.offline = None;
         self.ensure_aux_defaults();
         let mut next = BTreeMap::new();

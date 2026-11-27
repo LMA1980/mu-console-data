@@ -407,6 +407,7 @@ fn deterministic_scenario_player_aliases_stepping_and_speed_control() {
         let cfg = WorkerConfig {
             api_base: String::new(),
             scenario: Some(sc.name().into()),
+            ..WorkerConfig::default()
         };
         let fx = eng.handle(UiCommand::Configure(cfg), 0);
         let expected_conn = if sc.is_offline() {
@@ -440,6 +441,7 @@ fn deterministic_scenario_player_aliases_stepping_and_speed_control() {
         UiCommand::Configure(WorkerConfig {
             api_base: String::new(),
             scenario: Some("cd_gate_rollback".into()),
+            ..WorkerConfig::default()
         }),
         0,
     );
@@ -467,6 +469,7 @@ fn deterministic_scenario_player_aliases_stepping_and_speed_control() {
         UiCommand::Configure(WorkerConfig {
             api_base: String::new(),
             scenario: Some("ci_pr_lifecycle".into()),
+            ..WorkerConfig::default()
         }),
         0,
     );
@@ -507,6 +510,7 @@ fn engine_handles_unknown_scenarios_routes_and_wire_errors() {
         UiCommand::Configure(WorkerConfig {
             api_base: "/proxy".into(),
             scenario: Some("no-such-scenario".into()),
+            ..WorkerConfig::default()
         }),
         0,
     );
@@ -1085,6 +1089,7 @@ fn operator_restart_job_dispatches_post_and_transitions_failed_stages() {
         UiCommand::Configure(WorkerConfig {
             api_base: String::new(),
             scenario: Some("stage-failure".into()),
+            ..WorkerConfig::default()
         }),
         0,
     );
@@ -4266,4 +4271,186 @@ fn obs_logs_active_search_bidirectional_paging_sanitization_and_http_error_clean
     assert_eq!(v_err.observe.log_window.total_matched, Some(0));
     assert!(!v_err.observe.log_window.has_older);
     assert!(!v_err.observe.log_window.has_newer);
+}
+
+#[test]
+fn preferred_repo_hint_validation_deferred_private_and_repos_changed_reconciliation() {
+    let public_only_repos = r#"[
+        {"owner":"LMA1980","repo":"alpha-public","visibility":"public","status":"passing","score":95,"coverage":90.0,"bench_delta":0.0},
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5,"submodules":[{"path":"code/ui","owner":"LMA1980","repo":"beta-ui","pinned_sha":"abc1234"}]}
+    ]"#;
+    let full_repos_with_private = r#"[
+        {"owner":"LMA1980","repo":"alpha-public","visibility":"public","status":"passing","score":95,"coverage":90.0,"bench_delta":0.0},
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5,"submodules":[{"path":"code/ui","owner":"LMA1980","repo":"beta-ui","pinned_sha":"abc1234"}]},
+        {"owner":"LMA1980","repo":"gamma-private","visibility":"private","status":"passing","score":99,"coverage":95.0,"bench_delta":1.0}
+    ]"#;
+    let pruned_repos = r#"[
+        {"owner":"LMA1980","repo":"beta-public","visibility":"public","status":"running","score":80,"coverage":82.0,"bench_delta":0.5,"submodules":[]}
+    ]"#;
+    let anon_public_session = r#"{
+        "authenticated": false,
+        "anonymous_lockdown": false,
+        "active_policies": ["system:status.read", "system:dashboard.read", "ci:repos.public.read", "ci:queue.read"]
+    }"#;
+
+    // 1. Valid preferred_repo selects matching repo + submodule after /api/repos (zero premature fetches).
+    let mut eng = Engine::new(1);
+    let cfg = WorkerConfig::from_query("", "https://console.example.org")
+        .with_preferred_repo(Some("LMA1980/beta-public@code/ui"));
+    let cfg_fx = eng.handle(UiCommand::Configure(cfg), 0);
+    assert!(eng.store().selection().is_none());
+    assert!(!cfg_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(_) | FetchKind::Topology(_) | FetchKind::Deployments(_),
+            ..
+        }
+    )));
+    resolve_operator_session(&mut eng, 5);
+    assert!(eng.store().selection().is_none());
+    let repos_fx = eng.on_fetch(&FetchKind::Repos, Ok(public_only_repos.into()), 10);
+    assert_eq!(
+        eng.store().selection(),
+        Some(&Selection {
+            repo: RepoId::new("LMA1980", "beta-public"),
+            submodule: Some(SubmoduleId {
+                path: "code/ui".into(),
+            }),
+        })
+    );
+    assert!(repos_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(r),
+            ..
+        } if r == &RepoId::new("LMA1980", "beta-public")
+    )));
+
+    // 2. Retired preferred_repo + retired Subscribe(route) trigger ZERO 404 fetches before /api/repos,
+    //    then fall back cleanly to first live repo once Active /api/repos confirms absence.
+    let mut eng_retired = Engine::new(2);
+    let retired_cfg = WorkerConfig::from_query("", "https://console.example.org")
+        .with_preferred_repo(Some("LMA1980/retired-hint"));
+    eng_retired.handle(UiCommand::Configure(retired_cfg), 0);
+    resolve_operator_session(&mut eng_retired, 5);
+    let sub_fx = eng_retired.handle(
+        UiCommand::Subscribe(Route {
+            area: Area::Ci,
+            subview: SubView::Ci(CiSubView::Trainway),
+            repo: Some(RepoId::new("LMA1980", "retired-url")),
+            submodule: None,
+            branch: None,
+            job: None,
+            trace_id: None,
+            filter: None,
+        }),
+        6,
+    );
+    assert!(eng_retired.store().selection().is_none());
+    assert!(!sub_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(_) | FetchKind::Topology(_) | FetchKind::Deployments(_),
+            ..
+        }
+    )));
+    let gen_before = eng_retired.selection_gen();
+    let fx_after = eng_retired.on_fetch(&FetchKind::Repos, Ok(public_only_repos.into()), 10);
+    assert!(eng_retired.selection_gen() > gen_before);
+    assert_eq!(
+        eng_retired.store().selection(),
+        Some(&Selection {
+            repo: RepoId::new("LMA1980", "alpha-public"),
+            submodule: None,
+        })
+    );
+    assert!(!fx_after.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(r) | FetchKind::Topology(r) | FetchKind::Deployments(r),
+            ..
+        } if r.repo == "retired-url" || r.repo == "retired-hint"
+    )));
+
+    // 3. Deferred private preferred_repo survives Anonymous cold boot and activates upon Active login.
+    let mut eng_priv = Engine::new(3);
+    let priv_cfg = WorkerConfig::from_query("", "https://console.example.org")
+        .with_preferred_repo(Some("LMA1980/gamma-private"));
+    eng_priv.handle(UiCommand::Configure(priv_cfg), 0);
+    eng_priv.on_fetch(&FetchKind::AuthSession, Ok(anon_public_session.into()), 5);
+    eng_priv.on_fetch(&FetchKind::Repos, Ok(public_only_repos.into()), 10);
+    assert_eq!(
+        eng_priv.store().selection(),
+        Some(&Selection {
+            repo: RepoId::new("LMA1980", "alpha-public"),
+            submodule: None,
+        })
+    );
+    let auth_active_fx = resolve_operator_session(&mut eng_priv, 20);
+    assert!(auth_active_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
+    let gen_pre_login_repos = eng_priv.selection_gen();
+    let priv_fx = eng_priv.on_fetch(&FetchKind::Repos, Ok(full_repos_with_private.into()), 25);
+    assert!(eng_priv.selection_gen() > gen_pre_login_repos);
+    assert_eq!(
+        eng_priv.store().selection(),
+        Some(&Selection {
+            repo: RepoId::new("LMA1980", "gamma-private"),
+            submodule: None,
+        })
+    );
+    assert!(priv_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(r),
+            ..
+        } if r == &RepoId::new("LMA1980", "gamma-private")
+    )));
+
+    // 4. Live repos_changed SSE triggers FetchKind::Repos and advances away from a pruned repo,
+    //    clears missing submodules, and clears selection to None when catalog becomes empty.
+    let sse_fx = eng_priv.on_stream_chunk(
+        StreamId::Ci,
+        b"event: repos_changed\ndata: {\"reason\":\"pruned\"}\n\n",
+        30,
+    );
+    assert!(sse_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Repos,
+            ..
+        }
+    )));
+    let gen_before_prune = eng_priv.selection_gen();
+    let pruned_fx = eng_priv.on_fetch(&FetchKind::Repos, Ok(pruned_repos.into()), 35);
+    assert!(eng_priv.selection_gen() > gen_before_prune);
+    assert_eq!(
+        eng_priv.store().selection(),
+        Some(&Selection {
+            repo: RepoId::new("LMA1980", "beta-public"),
+            submodule: None,
+        })
+    );
+    assert!(pruned_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(r),
+            ..
+        } if r == &RepoId::new("LMA1980", "beta-public")
+    )));
+
+    let empty_fx = eng_priv.on_fetch(&FetchKind::Repos, Ok("[]".into()), 40);
+    assert!(eng_priv.store().selection().is_none());
+    assert!(!empty_fx.iter().any(|e| matches!(
+        e,
+        Effect::Fetch {
+            kind: FetchKind::Summary(_),
+            ..
+        }
+    )));
 }
